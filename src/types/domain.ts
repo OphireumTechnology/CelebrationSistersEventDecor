@@ -67,11 +67,30 @@ export interface ContractRecord {
   bookingId: string;
   title: string;
   termsSummary: string;
+  documentHash?: string;
   clientSigned: boolean;
   clientSignedBy?: string;
   clientSignedAt?: string;
+  clientSignatureIp?: string;
   staffCountersigned: boolean;
   staffCountersignedBy?: string;
+}
+
+export interface AvailabilityHold {
+  id: string;
+  eventDate: string;
+  venueName: string;
+  clientEmail: string;
+  expiresAt: string;
+  createdAt: string;
+}
+
+export interface BlackoutDate {
+  id: string;
+  date: string;
+  reason: string;
+  createdBy: string;
+  createdAt: string;
 }
 
 export interface PaymentMilestone {
@@ -109,6 +128,7 @@ export interface BookingRecord {
   guestCount: number;
   budgetRange: string;
   status: BookingStatus;
+  architecturalStage?: string;
   notes: string;
   assignedLeadPlanner: string;
   assignedVendorIds: string[];

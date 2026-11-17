@@ -198,7 +198,8 @@
         }
       ],
       "createdAt": "2026-10-10T09:00:00.000Z",
-      "updatedAt": "2026-11-10T10:30:00.000Z"
+      "updatedAt": "2026-11-10T10:30:00.000Z",
+      "architecturalStage": "IN_PLANNING"
     },
     {
       "id": "bkg-102",
@@ -334,7 +335,8 @@
         }
       ],
       "createdAt": "2026-11-08T11:20:00.000Z",
-      "updatedAt": "2026-11-14T09:15:00.000Z"
+      "updatedAt": "2026-11-14T09:15:00.000Z",
+      "architecturalStage": "CONTRACT_SENT"
     },
     {
       "id": "bkg-103",
@@ -425,7 +427,8 @@
       ],
       "messages": [],
       "createdAt": "2026-11-15T11:30:00.000Z",
-      "updatedAt": "2026-11-15T12:00:00.000Z"
+      "updatedAt": "2026-11-15T12:00:00.000Z",
+      "architecturalStage": "QUOTE_SENT"
     }
   ],
   "concepts": [
@@ -726,6 +729,16 @@
   ],
   "auditLogs": [
     {
+      "id": "aud-1794949824299-dp2a",
+      "timestamp": "2026-11-17T21:10:24.299Z",
+      "actorName": "Public Visitor",
+      "actorRole": "guest",
+      "action": "PRIVILEGE_SPOOF_BLOCKED",
+      "targetType": "API",
+      "targetId": "/api/bookings",
+      "details": "Rejected unverified identity/role header"
+    },
+    {
       "id": "aud-1",
       "timestamp": "2026-11-16T09:10:00.000Z",
       "actorName": "Victoria (Managing Director)",
@@ -745,5 +758,7 @@
       "targetId": "aut-1..4",
       "details": "Outbound client email/SMS workflows held in authorized-pause state awaiting owner live activation."
     }
-  ]
+  ],
+  "availabilityHolds": [],
+  "blackoutDates": []
 }

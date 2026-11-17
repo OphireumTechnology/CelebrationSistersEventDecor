@@ -1,11 +1,12 @@
-import { apiFetch } from '../lib/apiClient';
 import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
   ClipboardCheck,
   FileSignature,
+  KeyRound,
   Lock,
+  LogOut,
   Package,
   ShieldCheck,
   Users,
@@ -17,6 +18,7 @@ import {
   type AuditLogEntry,
   type AutomationLog,
   type AutomationWorkflow,
+  type BlackoutDate,
   type BookingRecord,
   type BookingStatus,
   type DesignConceptRecord,
@@ -25,12 +27,16 @@ import {
   type UserSession,
   type VendorRecord,
 } from '../types/domain';
+import { toArchitecturalStage } from '../types/lifecycle';
 import { BrandLogo } from './BrandLogo';
 
 interface PortalsWorkspaceProps {
   currentUser: UserSession;
+  mfaRequired: boolean;
   personas: UserSession[];
-  onSwitchPersona: (user: UserSession) => void;
+  onSwitchPersona: (user: UserSession) => Promise<void>;
+  onVerifyMfa: (code: string) => Promise<{ ok: boolean; error?: string }>;
+  onLogout: () => Promise<void>;
 }
 
 interface AdminOverviewData {
@@ -45,10 +51,18 @@ interface AdminOverviewData {
   automationWorkflows: AutomationWorkflow[];
   automationLogs: AutomationLog[];
   auditLogs: AuditLogEntry[];
+  blackoutDates: BlackoutDate[];
   users: UserSession[];
 }
 
-export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: PortalsWorkspaceProps) {
+export function PortalsWorkspace({
+  currentUser,
+  mfaRequired,
+  personas,
+  onSwitchPersona,
+  onVerifyMfa,
+  onLogout,
+}: PortalsWorkspaceProps) {
   const [bookings, setBookings] = useState<BookingRecord[]>([]);
   const [selectedBookingId, setSelectedBookingId] = useState<string>('');
   const [concepts, setConcepts] = useState<DesignConceptRecord[]>([]);
@@ -60,17 +74,19 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
   const [loading, setLoading] = useState(false);
   const [actionMessage, setActionMessage] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
 
-  // Interactive form states
+  const [mfaCode, setMfaCode] = useState('');
   const [signatureInput, setSignatureInput] = useState(currentUser.name);
   const [portalMessage, setPortalMessage] = useState('');
   const [issueSummary, setIssueSummary] = useState('');
   const [issueSeverity, setIssueSeverity] = useState<'Low' | 'Medium' | 'High'>('Low');
   const [adminTab, setAdminTab] = useState<'bookings' | 'inventory' | 'ai' | 'automation' | 'audit'>('bookings');
 
-  // Quote builder quick state
   const [quoteDesc, setQuoteDesc] = useState('Custom Floral & Production Enhancement');
   const [quotePrice, setQuotePrice] = useState(2500);
   const [quoteDiscount, setQuoteDiscount] = useState(0);
+
+  const [blackoutDate, setBlackoutDate] = useState('2027-07-04');
+  const [blackoutReason, setBlackoutReason] = useState('Independence Day Holiday Studio Closure');
 
   const loadWorkspaceData = useCallback(async () => {
     if (currentUser.role === 'guest') {
@@ -83,13 +99,10 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
     }
 
     setLoading(true);
-    setActionMessage(null);
-    const headers = { 'x-user-id': currentUser.id };
-
     try {
       const [bkgRes, cncRes] = await Promise.all([
-        apiFetch('/api/bookings', { headers }),
-        apiFetch('/api/concepts', { headers }),
+        fetch('/api/bookings', { credentials: 'include' }),
+        fetch('/api/concepts', { credentials: 'include' }),
       ]);
       if (bkgRes.ok) {
         const bkgJson = await bkgRes.json();
@@ -105,21 +118,21 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
       }
 
       if (['vendor', 'staff', 'admin'].includes(currentUser.role)) {
-        const vRes = await apiFetch('/api/vendors', { headers });
+        const vRes = await fetch('/api/vendors', { credentials: 'include' });
         if (vRes.ok) setVendors((await vRes.json()).vendors || []);
       }
 
       if (['staff', 'admin'].includes(currentUser.role)) {
         const [chkRes, invRes] = await Promise.all([
-          apiFetch('/api/staff/checklists', { headers }),
-          apiFetch('/api/inventory', { headers }),
+          fetch('/api/staff/checklists', { credentials: 'include' }),
+          fetch('/api/inventory', { credentials: 'include' }),
         ]);
         if (chkRes.ok) setChecklists((await chkRes.json()).checklists || []);
         if (invRes.ok) setInventory((await invRes.json()).inventory || []);
       }
 
-      if (currentUser.role === 'admin') {
-        const admRes = await apiFetch('/api/admin/overview', { headers });
+      if (currentUser.role === 'admin' && !mfaRequired) {
+        const admRes = await fetch('/api/admin/overview', { credentials: 'include' });
         if (admRes.ok) setAdminData(await admRes.json());
       } else {
         setAdminData(null);
@@ -127,22 +140,36 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
     } finally {
       setLoading(false);
     }
-  }, [currentUser.id, currentUser.role, selectedBookingId]);
+  }, [currentUser.role, mfaRequired, selectedBookingId]);
 
   useEffect(() => {
     setSignatureInput(currentUser.name);
     loadWorkspaceData();
-  }, [currentUser, loadWorkspaceData]);
+  }, [currentUser, mfaRequired, loadWorkspaceData]);
 
   const activeBooking = bookings.find((b) => b.id === selectedBookingId) || bookings[0];
+
+  const handleMfaSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    setActionMessage(null);
+    const result = await onVerifyMfa(mfaCode);
+    if (!result.ok) {
+      setActionMessage({ type: 'err', text: result.error || 'MFA failed.' });
+      return;
+    }
+    setMfaCode('');
+    setActionMessage({ type: 'ok', text: 'Executive MFA verification succeeded.' });
+    await loadWorkspaceData();
+  };
 
   const handleSignContract = async (e: FormEvent) => {
     e.preventDefault();
     if (!activeBooking) return;
     setActionMessage(null);
-    const res = await apiFetch(`/api/bookings/${activeBooking.id}/contract/sign`, {
+    const res = await fetch(`/api/bookings/${activeBooking.id}/contract/sign`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-user-id': currentUser.id },
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
       body: JSON.stringify({ signatureName: signatureInput }),
     });
     const data = await res.json();
@@ -156,9 +183,9 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
 
   const handlePayMilestone = async (paymentId: string) => {
     if (!activeBooking) return;
-    const res = await apiFetch(`/api/bookings/${activeBooking.id}/payments/${paymentId}/pay`, {
+    const res = await fetch(`/api/bookings/${activeBooking.id}/payments/${paymentId}/pay`, {
       method: 'POST',
-      headers: { 'x-user-id': currentUser.id },
+      credentials: 'include',
     });
     const data = await res.json();
     if (!res.ok) {
@@ -171,9 +198,9 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
 
   const handleToggleMilestone = async (milestoneId: string) => {
     if (!activeBooking) return;
-    await apiFetch(`/api/bookings/${activeBooking.id}/milestones/${milestoneId}`, {
+    await fetch(`/api/bookings/${activeBooking.id}/milestones/${milestoneId}`, {
       method: 'PATCH',
-      headers: { 'x-user-id': currentUser.id },
+      credentials: 'include',
     });
     await loadWorkspaceData();
   };
@@ -181,9 +208,10 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
   const handleSendMessage = async (e: FormEvent) => {
     e.preventDefault();
     if (!activeBooking || !portalMessage.trim()) return;
-    await apiFetch(`/api/bookings/${activeBooking.id}/messages`, {
+    await fetch(`/api/bookings/${activeBooking.id}/messages`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-user-id': currentUser.id },
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
       body: JSON.stringify({ text: portalMessage }),
     });
     setPortalMessage('');
@@ -192,9 +220,10 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
 
   const handleTransitionStatus = async (bookingId: string, status: BookingStatus) => {
     setActionMessage(null);
-    const res = await apiFetch(`/api/bookings/${bookingId}/status`, {
+    const res = await fetch(`/api/bookings/${bookingId}/status`, {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json', 'x-user-id': currentUser.id },
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
       body: JSON.stringify({ status }),
     });
     const data = await res.json();
@@ -209,9 +238,10 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
   const handleCreateQuote = async (e: FormEvent) => {
     e.preventDefault();
     if (!activeBooking) return;
-    const res = await apiFetch(`/api/bookings/${activeBooking.id}/quotes`, {
+    const res = await fetch(`/api/bookings/${activeBooking.id}/quotes`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-user-id': currentUser.id },
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
       body: JSON.stringify({
         items: [
           {
@@ -235,19 +265,37 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
     await loadWorkspaceData();
   };
 
+  const handleAddBlackoutDate = async (e: FormEvent) => {
+    e.preventDefault();
+    const res = await fetch('/api/admin/blackout-dates', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ date: blackoutDate, reason: blackoutReason }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      setActionMessage({ type: 'err', text: data.error });
+      return;
+    }
+    setActionMessage({ type: 'ok', text: `Blackout date ${blackoutDate} added.` });
+    await loadWorkspaceData();
+  };
+
   const handleVendorDeliverable = async (vendorId: string, delivId: string, status: 'Pending' | 'In Progress' | 'Completed') => {
-    await apiFetch(`/api/vendors/${vendorId}/deliverables/${delivId}`, {
+    await fetch(`/api/vendors/${vendorId}/deliverables/${delivId}`, {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json', 'x-user-id': currentUser.id },
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
       body: JSON.stringify({ status }),
     });
     await loadWorkspaceData();
   };
 
   const handleToggleChecklistTask = async (chkId: string, taskId: string) => {
-    await apiFetch(`/api/staff/checklists/${chkId}/tasks/${taskId}`, {
+    await fetch(`/api/staff/checklists/${chkId}/tasks/${taskId}`, {
       method: 'PATCH',
-      headers: { 'x-user-id': currentUser.id },
+      credentials: 'include',
     });
     await loadWorkspaceData();
   };
@@ -255,9 +303,10 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
   const handleReportIssue = async (e: FormEvent, chkId: string) => {
     e.preventDefault();
     if (!issueSummary.trim()) return;
-    await apiFetch(`/api/staff/checklists/${chkId}/issues`, {
+    await fetch(`/api/staff/checklists/${chkId}/issues`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-user-id': currentUser.id },
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
       body: JSON.stringify({ summary: issueSummary, severity: issueSeverity }),
     });
     setIssueSummary('');
@@ -265,18 +314,19 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
   };
 
   const handleToggleAutomation = async (wfId: string, nextVal: boolean) => {
-    await apiFetch(`/api/admin/automation/${wfId}`, {
+    await fetch(`/api/admin/automation/${wfId}`, {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json', 'x-user-id': currentUser.id },
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
       body: JSON.stringify({ authorizedEnabled: nextVal }),
     });
     await loadWorkspaceData();
   };
 
   const handleRunAutomation = async (wfId: string) => {
-    await apiFetch(`/api/admin/automation/${wfId}/run`, {
+    await fetch(`/api/admin/automation/${wfId}/run`, {
       method: 'POST',
-      headers: { 'x-user-id': currentUser.id },
+      credentials: 'include',
     });
     await loadWorkspaceData();
   };
@@ -284,13 +334,13 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
   return (
     <div className="bg-[var(--cs-ivory)] min-h-[82vh] py-10 text-[var(--cs-charcoal)]">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 space-y-8">
-        {/* Role Access Bar (Server-Enforced RBAC Verification) */}
+        {/* Cryptographically Signed Session Bar */}
         <div className="bg-white border border-[var(--cs-border)] rounded-lg p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
           <div className="flex items-center gap-3">
             <BrandLogo heightClass="h-10" />
             <div>
               <p className="text-xs font-semibold text-[var(--cs-purple)]">
-                Role-Isolated Workspace · Active Role: {currentUser.role.toUpperCase()}
+                Signed HttpOnly Session · Role: {currentUser.role.toUpperCase()}
               </p>
               <p className="text-xs text-[var(--cs-charcoal-muted)]">
                 {currentUser.name} · {currentUser.organization || 'Public Visitor'}
@@ -299,7 +349,7 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <span className="text-xs text-[var(--cs-charcoal-muted)] mr-1">Switch Portal Account:</span>
+            <span className="text-xs text-[var(--cs-charcoal-muted)] mr-1">Sign In As:</span>
             {personas.map((p) => (
               <button
                 key={p.id}
@@ -314,6 +364,16 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
                 {p.role === 'client' ? `Client (${p.name.split(' ')[0]})` : p.role.toUpperCase()}
               </button>
             ))}
+            {currentUser.role !== 'guest' && (
+              <button
+                type="button"
+                onClick={onLogout}
+                className="px-3 py-1.5 text-xs font-medium text-[var(--cs-charcoal-muted)] hover:text-[var(--cs-purple)] border border-[var(--cs-border)] rounded-md inline-flex items-center gap-1 cursor-pointer"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                Sign Out
+              </button>
+            )}
           </div>
         </div>
 
@@ -341,9 +401,39 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
               Protected Client & Operations Workspaces
             </h2>
             <p className="text-sm text-[var(--cs-charcoal-muted)] max-w-lg mx-auto">
-              Select an authenticated Client, Vendor, Staff Planner, or Executive Director account above to test server-enforced record isolation, contract signing, vendor deliverable tracking, and executive administration.
+              Select an authenticated Client, Vendor, Staff Planner, or Executive Director account above to issue a signed HttpOnly session cookie and access role-isolated records.
             </p>
           </div>
+        ) : currentUser.role === 'admin' && mfaRequired ? (
+          /* Executive MFA Gate */
+          <form
+            onSubmit={handleMfaSubmit}
+            className="bg-white border border-[var(--cs-border)] rounded-lg p-10 max-w-md mx-auto space-y-5 text-center"
+          >
+            <KeyRound className="w-10 h-10 text-[var(--cs-purple)] mx-auto" />
+            <div className="space-y-1.5">
+              <h2 className="font-display text-2xl font-semibold text-[var(--cs-purple)]">
+                Executive MFA Verification Required
+              </h2>
+              <p className="text-xs text-[var(--cs-charcoal-muted)] leading-relaxed">
+                Privileged administrative endpoints require multi-factor verification. Enter the staging verification code (<span className="font-mono font-semibold text-[var(--cs-purple)]">202687</span>) to unlock Executive Administration.
+              </p>
+            </div>
+            <input
+              type="password"
+              required
+              value={mfaCode}
+              onChange={(e) => setMfaCode(e.target.value)}
+              placeholder="Enter 6-digit MFA code"
+              className="w-full px-4 py-2.5 text-sm text-center tracking-widest border border-[var(--cs-border-strong)] rounded-md tabular-nums"
+            />
+            <button
+              type="submit"
+              className="w-full py-2.5 text-xs font-medium text-white bg-[var(--cs-purple)] hover:bg-[var(--cs-purple-hover)] rounded-md cursor-pointer"
+            >
+              Verify & Unlock Executive Portal
+            </button>
+          </form>
         ) : loading && bookings.length === 0 ? (
           <div className="bg-white border border-[var(--cs-border)] rounded-lg p-10 text-center text-sm text-[var(--cs-charcoal-muted)]">
             Loading authorized workspace records...
@@ -378,7 +468,6 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
                 </div>
               </div>
 
-              {/* Client Concept Studio Approvals */}
               {concepts.length > 0 && (
                 <div className="bg-white border border-[var(--cs-border)] rounded-lg p-5 space-y-3">
                   <h3 className="font-display text-base font-semibold text-[var(--cs-purple)]">
@@ -399,7 +488,6 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
 
             {activeBooking && (
               <div className="lg:col-span-8 space-y-6">
-                {/* Event Summary & 13-Stage Progress */}
                 <div className="bg-white border border-[var(--cs-border)] rounded-lg p-6 space-y-5">
                   <div className="flex flex-wrap items-start justify-between gap-4 border-b border-[var(--cs-border)] pb-4">
                     <div>
@@ -413,12 +501,16 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
                         {activeBooking.venueName} ({activeBooking.location}) · Lead Planner: {activeBooking.assignedLeadPlanner}
                       </p>
                     </div>
-                    <span className="px-3 py-1.5 text-xs font-semibold bg-[var(--cs-purple)] text-white rounded-md">
-                      {activeBooking.status}
-                    </span>
+                    <div className="text-right space-y-1">
+                      <span className="inline-block px-3 py-1.5 text-xs font-semibold bg-[var(--cs-purple)] text-white rounded-md">
+                        {activeBooking.status}
+                      </span>
+                      <p className="text-[11px] font-mono text-[var(--cs-charcoal-muted)]">
+                        Stage: {toArchitecturalStage(activeBooking.status, activeBooking.architecturalStage as never)}
+                      </p>
+                    </div>
                   </div>
 
-                  {/* 13 Booking Lifecycle Stages */}
                   <div className="space-y-2">
                     <p className="text-xs font-semibold text-[var(--cs-charcoal)]">Booking & Production Lifecycle</p>
                     <div className="flex flex-wrap gap-1.5 text-[11px]">
@@ -540,6 +632,11 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
                     <p className="text-xs text-[var(--cs-charcoal-muted)] leading-relaxed">
                       {activeBooking.contract.termsSummary}
                     </p>
+                    {activeBooking.contract.documentHash && (
+                      <p className="text-[11px] font-mono text-[var(--cs-charcoal-muted)] break-all">
+                        SHA-256 Digest: {activeBooking.contract.documentHash.slice(0, 24)}...
+                      </p>
+                    )}
                     <div className="text-xs space-y-1 pt-1">
                       <p>
                         Client Signature:{' '}
@@ -578,7 +675,6 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
                     )}
                   </div>
 
-                  {/* Planning Checklist */}
                   <div className="bg-white border border-[var(--cs-border)] rounded-lg p-6 space-y-4">
                     <div className="flex items-center gap-2 text-[var(--cs-purple)]">
                       <ClipboardCheck className="w-4 h-4" />
@@ -610,7 +706,6 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
                   </div>
                 </div>
 
-                {/* Event-Day Schedule & Planner Messaging */}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                   <div className="bg-white border border-[var(--cs-border)] rounded-lg p-6 space-y-3">
                     <h3 className="font-display text-lg font-semibold text-[var(--cs-purple)]">
@@ -666,18 +761,16 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
             )}
           </div>
         ) : currentUser.role === 'vendor' ? (
-          /* VENDOR OPERATIONS PORTAL (Strictly Assignment-Scoped) */
+          /* VENDOR OPERATIONS PORTAL */
           <div className="space-y-6">
             <div className="bg-white border border-[var(--cs-border)] rounded-lg p-6 space-y-4">
-              <div className="flex items-center justify-between">
-                <div>
-                  <h2 className="font-display text-2xl font-semibold text-[var(--cs-purple)]">
-                    Vendor Assignment Workspace
-                  </h2>
-                  <p className="text-xs text-[var(--cs-charcoal-muted)]">
-                    Record-level isolation active: displaying only assigned events and deliverables (client financials redacted).
-                  </p>
-                </div>
+              <div>
+                <h2 className="font-display text-2xl font-semibold text-[var(--cs-purple)]">
+                  Vendor Assignment Workspace
+                </h2>
+                <p className="text-xs text-[var(--cs-charcoal-muted)]">
+                  Record-level isolation active: displaying only assigned events and deliverables (client financials redacted).
+                </p>
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -820,7 +913,6 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
         ) : (
           /* EXECUTIVE ADMINISTRATION DASHBOARD */
           <div className="space-y-6">
-            {/* Executive KPI Strip */}
             {adminData && (
               <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
                 <div className="bg-white border border-[var(--cs-border)] rounded-lg p-5">
@@ -856,7 +948,6 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
               </div>
             )}
 
-            {/* Admin Sub-Navigation */}
             <div className="flex flex-wrap gap-1.5 bg-white border border-[var(--cs-border)] p-1.5 rounded-lg">
               {[
                 { id: 'bookings', label: 'Booking & Quote Oversight', icon: Users },
@@ -907,9 +998,14 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
                               </p>
                               <p className="text-sm font-semibold">{b.eventTitle}</p>
                             </div>
-                            <span className="text-xs font-semibold px-2.5 py-1 bg-white border border-[var(--cs-border)] rounded">
-                              {b.status}
-                            </span>
+                            <div className="text-right">
+                              <span className="text-xs font-semibold px-2.5 py-1 bg-white border border-[var(--cs-border)] rounded">
+                                {b.status}
+                              </span>
+                              <p className="text-[10px] font-mono text-[var(--cs-charcoal-muted)] mt-1">
+                                {toArchitecturalStage(b.status, b.architecturalStage as never)}
+                              </p>
+                            </div>
                           </div>
                           <div className="flex flex-wrap items-center gap-2 text-[11px]">
                             <span className="text-[var(--cs-charcoal-muted)]">
@@ -938,57 +1034,102 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
                   </div>
                 </div>
 
-                {activeBooking && (
+                <div className="lg:col-span-5 space-y-6">
+                  {activeBooking && (
+                    <form
+                      onSubmit={handleCreateQuote}
+                      className="bg-white border border-[var(--cs-border)] rounded-lg p-6 space-y-4"
+                    >
+                      <h3 className="font-display text-xl font-semibold text-[var(--cs-purple)]">
+                        Issue Quotation Version ({activeBooking.referenceCode})
+                      </h3>
+                      <p className="text-xs text-[var(--cs-charcoal-muted)]">
+                        Current quote versions: {activeBooking.quotations.length}
+                      </p>
+                      <div>
+                        <label className="block text-xs font-medium mb-1">Line Item Description</label>
+                        <input
+                          type="text"
+                          required
+                          value={quoteDesc}
+                          onChange={(e) => setQuoteDesc(e.target.value)}
+                          className="w-full px-3 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md"
+                        />
+                      </div>
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <label className="block text-xs font-medium mb-1">Amount ($)</label>
+                          <input
+                            type="number"
+                            min={0}
+                            value={quotePrice}
+                            onChange={(e) => setQuotePrice(Number(e.target.value))}
+                            className="w-full px-3 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md tabular-nums"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs font-medium mb-1">Director Discount ($)</label>
+                          <input
+                            type="number"
+                            min={0}
+                            value={quoteDiscount}
+                            onChange={(e) => setQuoteDiscount(Number(e.target.value))}
+                            className="w-full px-3 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md tabular-nums"
+                          />
+                        </div>
+                      </div>
+                      <button
+                        type="submit"
+                        className="w-full py-2.5 text-xs font-medium text-white bg-[var(--cs-purple)] hover:bg-[var(--cs-purple-hover)] rounded-md cursor-pointer"
+                      >
+                        Publish Itemized Quotation v{activeBooking.quotations.length + 1}
+                      </button>
+                    </form>
+                  )}
+
+                  {/* Studio Blackout Dates Manager */}
                   <form
-                    onSubmit={handleCreateQuote}
-                    className="lg:col-span-5 bg-white border border-[var(--cs-border)] rounded-lg p-6 space-y-4"
+                    onSubmit={handleAddBlackoutDate}
+                    className="bg-white border border-[var(--cs-border)] rounded-lg p-6 space-y-3"
                   >
-                    <h3 className="font-display text-xl font-semibold text-[var(--cs-purple)]">
-                      Issue Quotation Version ({activeBooking.referenceCode})
+                    <h3 className="font-display text-lg font-semibold text-[var(--cs-purple)]">
+                      Studio Blackout Dates
                     </h3>
-                    <p className="text-xs text-[var(--cs-charcoal-muted)]">
-                      Current quote versions: {activeBooking.quotations.length}
-                    </p>
-                    <div>
-                      <label className="block text-xs font-medium mb-1">Line Item Description</label>
+                    <div className="grid grid-cols-2 gap-2">
+                      <input
+                        type="date"
+                        required
+                        value={blackoutDate}
+                        onChange={(e) => setBlackoutDate(e.target.value)}
+                        className="px-3 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md tabular-nums"
+                      />
                       <input
                         type="text"
                         required
-                        value={quoteDesc}
-                        onChange={(e) => setQuoteDesc(e.target.value)}
-                        className="w-full px-3 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md"
+                        value={blackoutReason}
+                        onChange={(e) => setBlackoutReason(e.target.value)}
+                        placeholder="Closure reason"
+                        className="px-3 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md"
                       />
-                    </div>
-                    <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <label className="block text-xs font-medium mb-1">Amount ($)</label>
-                        <input
-                          type="number"
-                          min={0}
-                          value={quotePrice}
-                          onChange={(e) => setQuotePrice(Number(e.target.value))}
-                          className="w-full px-3 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md tabular-nums"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-xs font-medium mb-1">Director Discount ($)</label>
-                        <input
-                          type="number"
-                          min={0}
-                          value={quoteDiscount}
-                          onChange={(e) => setQuoteDiscount(Number(e.target.value))}
-                          className="w-full px-3 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md tabular-nums"
-                        />
-                      </div>
                     </div>
                     <button
                       type="submit"
-                      className="w-full py-2.5 text-xs font-medium text-white bg-[var(--cs-purple)] hover:bg-[var(--cs-purple-hover)] rounded-md cursor-pointer"
+                      className="w-full py-2 text-xs font-medium text-[var(--cs-purple)] border border-[var(--cs-purple)] hover:bg-[var(--cs-purple-soft)] rounded-md cursor-pointer"
                     >
-                      Publish Itemized Quotation v{activeBooking.quotations.length + 1}
+                      Add Studio Blackout Date
                     </button>
+                    {adminData?.blackoutDates && adminData.blackoutDates.length > 0 && (
+                      <div className="pt-2 space-y-1 text-xs text-[var(--cs-charcoal-muted)]">
+                        {adminData.blackoutDates.map((bd) => (
+                          <div key={bd.id} className="flex justify-between">
+                            <span className="tabular-nums font-medium text-[var(--cs-charcoal)]">{bd.date}</span>
+                            <span>{bd.reason}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </form>
-                )}
+                </div>
               </div>
             )}
 

@@ -5,6 +5,8 @@ import type {
   AuditLogEntry,
   AutomationLog,
   AutomationWorkflow,
+  AvailabilityHold,
+  BlackoutDate,
   BookingRecord,
   BookingStatus,
   DesignConceptRecord,
@@ -15,10 +17,13 @@ import type {
   VendorRecord,
 } from '../src/types/domain.ts';
 import { VALID_BOOKING_TRANSITIONS } from '../src/types/domain.ts';
+import { LEGACY_TO_ARCH_STATUS } from '../src/types/lifecycle.ts';
 
 export interface DatabaseSchema {
   users: UserSession[];
   bookings: BookingRecord[];
+  availabilityHolds: AvailabilityHold[];
+  blackoutDates: BlackoutDate[];
   concepts: DesignConceptRecord[];
   vendors: VendorRecord[];
   staffChecklists: StaffChecklistRecord[];
@@ -29,8 +34,12 @@ export interface DatabaseSchema {
   auditLogs: AuditLogEntry[];
 }
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
-const DB_PATH = path.resolve(DATA_DIR, 'db.json');
+function getDbPath(): string {
+  if (process.env.CS_DB_PATH) {
+    return path.resolve(process.env.CS_DB_PATH);
+  }
+  return path.resolve(process.cwd(), 'data', 'db.json');
+}
 
 function buildInitialSeed(): DatabaseSchema {
   return {
@@ -427,25 +436,46 @@ function buildInitialSeed(): DatabaseSchema {
         details: 'Outbound client email/SMS workflows held in authorized-pause state awaiting owner live activation.',
       },
     ],
+    availabilityHolds: [],
+    blackoutDates: [
+      {
+        id: 'blk-1',
+        date: '2026-12-25',
+        reason: 'Holiday Studio Closure',
+        createdBy: 'Victoria & Simone (Managing Sisters)',
+        createdAt: '2026-10-01T09:00:00.000Z',
+      },
+    ],
   };
 }
 
 let writeLock: Promise<void> = Promise.resolve();
 
-async function ensureDbFile(): Promise<void> {
-  await fs.mkdir(DATA_DIR, { recursive: true });
+async function ensureDbFile(): Promise<string> {
+  const dbPath = getDbPath();
+  await fs.mkdir(path.dirname(dbPath), { recursive: true });
   try {
-    await fs.access(DB_PATH);
+    await fs.access(dbPath);
   } catch {
     const seed = buildInitialSeed();
-    await fs.writeFile(DB_PATH, JSON.stringify(seed, null, 2), 'utf8');
+    await fs.writeFile(dbPath, JSON.stringify(seed, null, 2), 'utf8');
   }
+  return dbPath;
 }
 
 export async function readDb(): Promise<DatabaseSchema> {
-  await ensureDbFile();
-  const raw = await fs.readFile(DB_PATH, 'utf8');
-  return JSON.parse(raw) as DatabaseSchema;
+  const dbPath = await ensureDbFile();
+  const raw = await fs.readFile(dbPath, 'utf8');
+  const parsed = JSON.parse(raw) as DatabaseSchema;
+  // Backward-compatible backfill for Phase 1 records
+  parsed.availabilityHolds = parsed.availabilityHolds || [];
+  parsed.blackoutDates = parsed.blackoutDates || [];
+  for (const b of parsed.bookings || []) {
+    if (!b.architecturalStage) {
+      b.architecturalStage = LEGACY_TO_ARCH_STATUS[b.status] ?? 'INQUIRY';
+    }
+  }
+  return parsed;
 }
 
 export async function withTransaction<T>(fn: (db: DatabaseSchema) => Promise<T> | T): Promise<T> {
@@ -456,11 +486,12 @@ export async function withTransaction<T>(fn: (db: DatabaseSchema) => Promise<T> 
   });
   await prevLock;
   try {
+    const dbPath = await ensureDbFile();
     const db = await readDb();
     const result = await fn(db);
-    const tmpPath = `${DB_PATH}.${Date.now()}.tmp`;
+    const tmpPath = `${dbPath}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}.tmp`;
     await fs.writeFile(tmpPath, JSON.stringify(db, null, 2), 'utf8');
-    await fs.rename(tmpPath, DB_PATH);
+    await fs.rename(tmpPath, dbPath);
     return result;
   } finally {
     release();

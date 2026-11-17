@@ -1,4 +1,3 @@
-import { apiFetch } from '../lib/apiClient';
 import { useEffect, useState, type FormEvent } from 'react';
 import {
   AlertCircle,
@@ -79,9 +78,13 @@ export function AIStudioWorkspace({ currentUser, onOpenBookingPrefilled }: AIStu
 
   useEffect(() => {
     const loadConcepts = async () => {
+      if (currentUser.role === 'guest') {
+        setConcepts([]);
+        return;
+      }
       try {
-        const res = await apiFetch('/api/concepts', {
-          headers: { 'x-user-id': currentUser.id },
+        const res = await fetch('/api/concepts', {
+          credentials: 'include',
         });
         if (!res.ok) return;
         const data = await res.json();
@@ -94,7 +97,7 @@ export function AIStudioWorkspace({ currentUser, onOpenBookingPrefilled }: AIStu
       }
     };
     loadConcepts();
-  }, [currentUser.id, selectedConceptId]);
+  }, [currentUser.id, currentUser.role, selectedConceptId]);
 
   const sendConciergeMessage = async (textToSend: string) => {
     const trimmed = textToSend.trim();
@@ -107,12 +110,12 @@ export function AIStudioWorkspace({ currentUser, onOpenBookingPrefilled }: AIStu
     setChatLoading(true);
 
     try {
-      const res = await apiFetch('/api/ai/concierge', {
+      const res = await fetch('/api/ai/concierge', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-user-id': currentUser.id,
         },
+        credentials: 'include',
         body: JSON.stringify({
           sessionId,
           clientName: currentUser.role !== 'guest' ? currentUser.name : undefined,
@@ -145,12 +148,12 @@ export function AIStudioWorkspace({ currentUser, onOpenBookingPrefilled }: AIStu
     setConceptError(null);
 
     try {
-      const res = await apiFetch('/api/ai/concept-studio', {
+      const res = await fetch('/api/ai/concept-studio', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-user-id': currentUser.id,
         },
+        credentials: 'include',
         body: JSON.stringify({
           conceptId: reviseExisting && selectedConceptId ? selectedConceptId : undefined,
           eventType: conceptEventType,
@@ -180,9 +183,9 @@ export function AIStudioWorkspace({ currentUser, onOpenBookingPrefilled }: AIStu
 
   const handleApproveConcept = async (conceptId: string) => {
     try {
-      const res = await apiFetch(`/api/concepts/${conceptId}/approve`, {
+      const res = await fetch(`/api/concepts/${conceptId}/approve`, {
         method: 'POST',
-        headers: { 'x-user-id': currentUser.id },
+        credentials: 'include',
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Approval failed.');

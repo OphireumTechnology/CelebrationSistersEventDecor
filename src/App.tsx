@@ -1,4 +1,3 @@
-import { apiFetch, isBackendConfigured } from './lib/apiClient';
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -28,6 +27,7 @@ export default function App() {
 
   const [personas, setPersonas] = useState<UserSession[]>([]);
   const [currentUser, setCurrentUser] = useState<UserSession>(DEFAULT_GUEST);
+  const [mfaRequired, setMfaRequired] = useState(false);
 
   const [bookingModalOpen, setBookingModalOpen] = useState(false);
   const [bookingPrefill, setBookingPrefill] = useState<{
@@ -39,22 +39,64 @@ export default function App() {
   }>({});
 
   useEffect(() => {
-    const loadPersonas = async () => {
+    const initAuth = async () => {
       try {
-        const res = await apiFetch('/api/auth/personas');
-        if (!res.ok) return;
-        const data = await res.json();
-        const list: UserSession[] = data.personas || [];
-        setPersonas(list);
-        if (list.length > 0) {
-          setCurrentUser(list[0]); // Default authenticated client demo session when entering Portals
+        const [personasRes, sessionRes] = await Promise.all([
+          fetch('/api/auth/personas', { credentials: 'include' }),
+          fetch('/api/auth/session', { credentials: 'include' }),
+        ]);
+        if (personasRes.ok) {
+          const pData = await personasRes.json();
+          setPersonas(pData.personas || []);
+        }
+        if (sessionRes.ok) {
+          const sData = await sessionRes.json();
+          if (sData.user) {
+            setCurrentUser(sData.user);
+            setMfaRequired(Boolean(sData.mfaRequired));
+          }
         }
       } catch {
         // Keep guest fallback if offline
       }
     };
-    loadPersonas();
+    initAuth();
   }, []);
+
+  const handleSwitchPersona = async (user: UserSession) => {
+    const res = await fetch('/api/auth/switch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ userId: user.id }),
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    setCurrentUser(data.user);
+    setMfaRequired(Boolean(data.mfaRequired));
+  };
+
+  const handleVerifyMfa = async (code: string): Promise<{ ok: boolean; error?: string }> => {
+    const res = await fetch('/api/auth/mfa/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ code }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      return { ok: false, error: data.error || 'MFA verification failed.' };
+    }
+    setMfaRequired(false);
+    setCurrentUser(data.user);
+    return { ok: true };
+  };
+
+  const handleLogout = async () => {
+    await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
+    setCurrentUser(DEFAULT_GUEST);
+    setMfaRequired(false);
+  };
 
   const openBooking = (serviceId?: string) => {
     setBookingPrefill(serviceId ? { serviceId } : {});
@@ -80,11 +122,6 @@ export default function App() {
 
   return (
     <div className="min-h-screen flex flex-col bg-white text-[var(--cs-charcoal)]">
-      {!isBackendConfigured && (
-        <div role="status" className="bg-[var(--cs-ivory)] border-b border-[var(--cs-border)] px-4 py-2 text-center text-xs text-[var(--cs-charcoal)]">
-          Our portfolio is available to explore. Online booking, AI consultations, and private portals will open when secure hosting is connected.
-        </div>
-      )}
       <LuxuryHeader
         activeRoute={activeRoute}
         onNavigate={handleNavigate}
@@ -122,8 +159,11 @@ export default function App() {
         {activeRoute === 'portals' && (
           <PortalsWorkspace
             currentUser={currentUser}
+            mfaRequired={mfaRequired}
             personas={personas}
-            onSwitchPersona={(user) => setCurrentUser(user)}
+            onSwitchPersona={handleSwitchPersona}
+            onVerifyMfa={handleVerifyMfa}
+            onLogout={handleLogout}
           />
         )}
       </main>
