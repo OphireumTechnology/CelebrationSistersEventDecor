@@ -7,6 +7,9 @@ export const SESSION_COOKIE_NAME = 'cs_session';
 const EPHEMERAL_FALLBACK_SECRET = crypto.randomBytes(32).toString('hex');
 
 function getSessionSecret(): string {
+  if (process.env.NODE_ENV === 'production' && !process.env.SESSION_SECRET) {
+    throw new Error('SESSION_SECRET is required in production');
+  }
   return process.env.SESSION_SECRET || EPHEMERAL_FALLBACK_SECRET;
 }
 
@@ -168,7 +171,8 @@ export function resolveAuthenticatedContext(
 }
 
 export function verifyAdminMfaCode(code: string): boolean {
-  const expected = process.env.ADMIN_MFA_PASSCODE || '202687';
+  const expected = process.env.ADMIN_MFA_PASSCODE;
+  if (!expected) return false;
   const providedBuf = Buffer.from(code.trim(), 'utf8');
   const expectedBuf = Buffer.from(expected, 'utf8');
   if (providedBuf.length !== expectedBuf.length) return false;
