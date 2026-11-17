@@ -1,3 +1,4 @@
+import { apiFetch } from './lib/apiClient';
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -40,7 +41,7 @@ export default function App() {
   useEffect(() => {
     const loadPersonas = async () => {
       try {
-        const res = await fetch('/api/auth/personas');
+        const res = await apiFetch('/api/auth/personas');
         if (!res.ok) return;
         const data = await res.json();
         const list: UserSession[] = data.personas || [];
