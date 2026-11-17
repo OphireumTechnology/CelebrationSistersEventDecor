@@ -1,3 +1,4 @@
+import { apiFetch } from '../lib/apiClient';
 import { useEffect, useState, type FormEvent } from 'react';
 import {
   AlertCircle,
@@ -79,7 +80,7 @@ export function AIStudioWorkspace({ currentUser, onOpenBookingPrefilled }: AIStu
   useEffect(() => {
     const loadConcepts = async () => {
       try {
-        const res = await fetch('/api/concepts', {
+        const res = await apiFetch('/api/concepts', {
           headers: { 'x-user-id': currentUser.id },
         });
         if (!res.ok) return;
@@ -106,7 +107,7 @@ export function AIStudioWorkspace({ currentUser, onOpenBookingPrefilled }: AIStu
     setChatLoading(true);
 
     try {
-      const res = await fetch('/api/ai/concierge', {
+      const res = await apiFetch('/api/ai/concierge', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -144,7 +145,7 @@ export function AIStudioWorkspace({ currentUser, onOpenBookingPrefilled }: AIStu
     setConceptError(null);
 
     try {
-      const res = await fetch('/api/ai/concept-studio', {
+      const res = await apiFetch('/api/ai/concept-studio', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -179,7 +180,7 @@ export function AIStudioWorkspace({ currentUser, onOpenBookingPrefilled }: AIStu
 
   const handleApproveConcept = async (conceptId: string) => {
     try {
-      const res = await fetch(`/api/concepts/${conceptId}/approve`, {
+      const res = await apiFetch(`/api/concepts/${conceptId}/approve`, {
         method: 'POST',
         headers: { 'x-user-id': currentUser.id },
       });
