@@ -385,21 +385,29 @@ export function PortalsWorkspace({
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <span className="text-xs text-[var(--cs-charcoal-muted)] mr-1">Sign In As:</span>
-            {personas.map((p) => (
-              <button
-                key={p.id}
-                type="button"
-                onClick={() => onSwitchPersona(p)}
-                className={`px-3 py-1.5 text-xs font-medium rounded-md border transition-colors whitespace-nowrap cursor-pointer ${
-                  currentUser.id === p.id
-                    ? 'bg-[var(--cs-purple)] text-white border-[var(--cs-purple)]'
-                    : 'bg-white text-[var(--cs-charcoal)] border-[var(--cs-border-strong)] hover:border-[var(--cs-purple)]'
-                }`}
-              >
-                {p.role === 'client' ? `Client (${p.name.split(' ')[0]})` : p.role.toUpperCase()}
-              </button>
-            ))}
+            {personas.length > 0 ? (
+              <>
+                <span className="text-xs text-[var(--cs-charcoal-muted)] mr-1">Sign In As:</span>
+                {personas.map((p) => (
+                  <button
+                    key={p.id}
+                    type="button"
+                    onClick={() => onSwitchPersona(p)}
+                    className={`px-3 py-1.5 text-xs font-medium rounded-md border transition-colors whitespace-nowrap cursor-pointer ${
+                      currentUser.id === p.id
+                        ? 'bg-[var(--cs-purple)] text-white border-[var(--cs-purple)]'
+                        : 'bg-white text-[var(--cs-charcoal)] border-[var(--cs-border-strong)] hover:border-[var(--cs-purple)]'
+                    }`}
+                  >
+                    {p.role === 'client' ? `Client (${p.name.split(' ')[0]})` : p.role.toUpperCase()}
+                  </button>
+                ))}
+              </>
+            ) : (
+              <span className="text-xs text-[var(--cs-charcoal-muted)]">
+                Demonstration switching disabled · Authenticated portal login required
+              </span>
+            )}
             {currentUser.role !== 'guest' && (
               <button
                 type="button"
@@ -464,7 +472,7 @@ export function PortalsWorkspace({
                 Executive MFA Verification Required
               </h2>
               <p className="text-xs text-[var(--cs-charcoal-muted)] leading-relaxed">
-                Privileged administrative endpoints require multi-factor verification. Enter the staging verification code (<span className="font-mono font-semibold text-[var(--cs-purple)]">202687</span>) to unlock Executive Administration.
+                Privileged administrative endpoints require multi-factor verification. Enter your executive director MFA verification code configured on the server to unlock Executive Administration.
               </p>
             </div>
             <input

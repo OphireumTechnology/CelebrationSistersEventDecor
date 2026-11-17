@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { z } from 'zod';
 import {
@@ -36,8 +37,12 @@ export function createApp(options: CreateAppOptions = {}) {
 
   app.use(express.json({ limit: '1mb' }));
 
-  // Security headers (OWASP ASVS aligned)
-  app.use((_req: Request, res: Response, next: NextFunction) => {
+  // Security headers (OWASP ASVS aligned) & request correlation IDs
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    const incomingId = req.header('x-request-id');
+    const requestId =
+      incomingId && /^[a-zA-Z0-9_-]{8,64}$/.test(incomingId) ? incomingId : crypto.randomUUID();
+    res.setHeader('X-Request-Id', requestId);
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
     res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
@@ -86,6 +91,28 @@ export function createApp(options: CreateAppOptions = {}) {
   }
 
   // Health & Infrastructure Readiness
+  app.get('/health', (_req: Request, res: Response) => {
+    res.status(200).json({
+      ok: true,
+      status: 'alive',
+      service: 'Celebration Sisters Event Decor Platform',
+      requestId: res.getHeader('X-Request-Id'),
+      timestamp: new Date().toISOString(),
+    });
+  });
+
+  app.get('/ready', (_req: Request, res: Response) => {
+    const persistence = getPersistenceStatus();
+    const ai = getGeminiConfigStatus();
+    res.status(persistence.ready ? 200 : 503).json({
+      ok: persistence.ready,
+      persistence,
+      ai: { model: ai.model, configured: ai.configured },
+      requestId: res.getHeader('X-Request-Id'),
+      timestamp: new Date().toISOString(),
+    });
+  });
+
   app.get('/api/health', (_req: Request, res: Response) => {
     const persistence = getPersistenceStatus();
     const ai = getGeminiConfigStatus();
@@ -94,12 +121,16 @@ export function createApp(options: CreateAppOptions = {}) {
       service: 'Celebration Sisters Event Decor Platform',
       persistence,
       ai: { model: ai.model, configured: ai.configured, timeoutMs: ai.timeoutMs },
+      requestId: res.getHeader('X-Request-Id'),
       timestamp: new Date().toISOString(),
     });
   });
 
   // Authentication & Signed Session Management
   app.get('/api/auth/personas', async (_req: Request, res: Response) => {
+    if (process.env.NODE_ENV === 'production') {
+      return res.status(404).json({ error: 'Demo personas are unavailable in production.' });
+    }
     const db = await readDb();
     res.json({ personas: db.users });
   });
@@ -114,7 +145,10 @@ export function createApp(options: CreateAppOptions = {}) {
     });
   });
 
-  app.post('/api/auth/switch', async (req: Request, res: Response) => {
+  app.post('/api/auth/switch', rateLimit(20, 60_000), async (req: Request, res: Response) => {
+    if (process.env.NODE_ENV === 'production') {
+      return res.status(404).json({ error: 'Demo account switching is unavailable in production.' });
+    }
     const parsed = z.object({ userId: z.string().min(1) }).safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({ error: 'Valid userId is required.' });
@@ -142,7 +176,7 @@ export function createApp(options: CreateAppOptions = {}) {
     });
   });
 
-  app.post('/api/auth/mfa/verify', async (req: Request, res: Response) => {
+  app.post('/api/auth/mfa/verify', rateLimit(10, 60_000), async (req: Request, res: Response) => {
     const { ctx } = await getAuth(req);
     if (ctx.session.role === 'guest') {
       return res.status(401).json({ error: 'Sign in before verifying MFA.' });
@@ -341,7 +375,10 @@ export function createApp(options: CreateAppOptions = {}) {
         const refCode = `CS-2026-0${nextNum}`;
         const id = `bkg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
         const initialStatus: BookingStatus = input.requestConsultation ? 'Consultation Requested' : 'Inquiry';
-        const clientId = ctx.session.role === 'client' ? ctx.session.id : 'user-client-camille';
+        const clientId =
+          ctx.session.role === 'client'
+            ? ctx.session.id
+            : `lead:${sha256Hex(input.clientEmail.trim().toLowerCase()).slice(0, 12)}`;
         const termsSummary = `Preliminary production framework for ${input.eventTitle} on ${input.eventDate} at ${input.venueName}. Final itemized quotation required prior to execution.`;
 
         const newBooking: BookingRecord = {
@@ -862,7 +899,12 @@ export function createApp(options: CreateAppOptions = {}) {
         const newConcept = {
           id: `cnc-${Date.now()}`,
           bookingId: parsed.data.bookingId || 'bkg-101',
-          clientId: ctx.session.role === 'client' ? ctx.session.id : 'user-client-camille',
+          clientId:
+            ctx.session.role === 'client'
+              ? ctx.session.id
+              : ctx.session.role === 'guest'
+                ? 'public-concierge-preview'
+                : ctx.session.id,
           title: `${proposal.themeName} Concept`,
           eventType: parsed.data.eventType,
           currentVersion: 1,

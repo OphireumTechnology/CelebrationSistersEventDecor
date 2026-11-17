@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { signSessionToken } from '../server/auth.ts';
 import { createApp } from '../server/app.ts';
 
 async function startIsolatedServer() {
@@ -118,6 +119,8 @@ test('enforces vendor assignment scoping and redacts financial fields', async ()
 });
 
 test('enforces Executive Admin MFA verification before granting admin dashboard access', async () => {
+  const priorCode = process.env.ADMIN_MFA_PASSCODE;
+  process.env.ADMIN_MFA_PASSCODE = '202687';
   const { baseUrl, cleanup } = await startIsolatedServer();
   try {
     const preMfaToken = await loginAs(baseUrl, 'user-admin-director');
@@ -157,6 +160,90 @@ test('enforces Executive Admin MFA verification before granting admin dashboard 
     });
     assert.equal(allowedRes.status, 200);
   } finally {
+    await cleanup();
+    if (priorCode === undefined) delete process.env.ADMIN_MFA_PASSCODE;
+    else process.env.ADMIN_MFA_PASSCODE = priorCode;
+  }
+});
+
+test('disables demo personas and switching in production, requires SESSION_SECRET, and isolates public leads from existing clients', async () => {
+  const priorEnv = process.env.NODE_ENV;
+  const priorSecret = process.env.SESSION_SECRET;
+  const priorDbUrl = process.env.DATABASE_URL;
+  const { baseUrl, cleanup } = await startIsolatedServer();
+
+  try {
+    // Public guest inquiry must NOT inherit user-client-camille ownership
+    const guestBookingRes = await fetch(`${baseUrl}/api/bookings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        clientName: 'Stranger Inquiry',
+        clientEmail: 'stranger@example.com',
+        clientPhone: '(803) 555-0188',
+        eventTitle: 'Private Gala Inquiry',
+        eventType: 'Corporate Events',
+        serviceDivisionIds: ['corporate-events'],
+        eventDate: '2027-08-14',
+        location: 'Columbia, SC',
+        venueName: 'Foundry Hall',
+        guestCount: 90,
+        budgetRange: '$15,000 – $25,000',
+      }),
+    });
+    assert.equal(guestBookingRes.status, 201);
+    const createdLead = (await guestBookingRes.json()) as { booking: { id: string; clientId: string } };
+    assert.notEqual(createdLead.booking.clientId, 'user-client-camille');
+    assert.ok(createdLead.booking.clientId.startsWith('lead:'));
+
+    const camilleToken = await loginAs(baseUrl, 'user-client-camille');
+    const camilleListRes = await fetch(`${baseUrl}/api/bookings`, {
+      headers: { Authorization: `Bearer ${camilleToken}` },
+    });
+    const camilleList = (await camilleListRes.json()) as { bookings: { id: string }[] };
+    assert.equal(camilleList.bookings.some((b) => b.id === createdLead.booking.id), false);
+
+    // Health liveness probe
+    const healthRes = await fetch(`${baseUrl}/health`);
+    assert.equal(healthRes.status, 200);
+    assert.ok(healthRes.headers.get('x-request-id'));
+
+    // Production guards
+    process.env.NODE_ENV = 'production';
+    delete process.env.SESSION_SECRET;
+    delete process.env.DATABASE_URL;
+
+    const prodPersonas = await fetch(`${baseUrl}/api/auth/personas`);
+    assert.equal(prodPersonas.status, 404);
+
+    const prodSwitch = await fetch(`${baseUrl}/api/auth/switch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: 'user-admin-director' }),
+    });
+    assert.equal(prodSwitch.status, 404);
+
+    const prodReady = await fetch(`${baseUrl}/ready`);
+    assert.equal(prodReady.status, 503);
+
+    assert.throws(
+      () =>
+        signSessionToken({
+          userId: 'user-admin-director',
+          role: 'admin',
+          mfaVerified: false,
+          issuedAt: Date.now(),
+          expiresAt: Date.now() + 60_000,
+        }),
+      /SESSION_SECRET is required in production/,
+    );
+  } finally {
+    if (priorEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = priorEnv;
+    if (priorSecret === undefined) delete process.env.SESSION_SECRET;
+    else process.env.SESSION_SECRET = priorSecret;
+    if (priorDbUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = priorDbUrl;
     await cleanup();
   }
 });

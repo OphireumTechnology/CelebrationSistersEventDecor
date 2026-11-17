@@ -7,6 +7,9 @@ export const SESSION_COOKIE_NAME = 'cs_session';
 const EPHEMERAL_FALLBACK_SECRET = crypto.randomBytes(32).toString('hex');
 
 function getSessionSecret(): string {
+  if (process.env.NODE_ENV === 'production' && !process.env.SESSION_SECRET) {
+    throw new Error('SESSION_SECRET is required in production');
+  }
   return process.env.SESSION_SECRET || EPHEMERAL_FALLBACK_SECRET;
 }
 
@@ -83,11 +86,12 @@ export function parseCookies(req: Request): Record<string, string> {
 
 export function setSessionCookie(res: Response, token: string): void {
   const isProd = process.env.NODE_ENV === 'production';
+  const sameSite = isProd && process.env.CROSS_ORIGIN_COOKIES === 'true' ? 'SameSite=None' : 'SameSite=Lax';
   const flags = [
     `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
     'Path=/',
     'HttpOnly',
-    'SameSite=Lax',
+    sameSite,
     `Max-Age=${60 * 60 * 8}`,
   ];
   if (isProd) {
@@ -97,7 +101,13 @@ export function setSessionCookie(res: Response, token: string): void {
 }
 
 export function clearSessionCookie(res: Response): void {
-  res.setHeader('Set-Cookie', `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+  const isProd = process.env.NODE_ENV === 'production';
+  const sameSite = isProd && process.env.CROSS_ORIGIN_COOKIES === 'true' ? 'SameSite=None' : 'SameSite=Lax';
+  const flags = [`${SESSION_COOKIE_NAME}=`, 'Path=/', 'HttpOnly', sameSite, 'Max-Age=0'];
+  if (isProd) {
+    flags.push('Secure');
+  }
+  res.setHeader('Set-Cookie', flags.join('; '));
 }
 
 export const GUEST_USER: UserSession = {
@@ -168,7 +178,8 @@ export function resolveAuthenticatedContext(
 }
 
 export function verifyAdminMfaCode(code: string): boolean {
-  const expected = process.env.ADMIN_MFA_PASSCODE || '202687';
+  const expected = process.env.ADMIN_MFA_PASSCODE;
+  if (!expected) return false;
   const providedBuf = Buffer.from(code.trim(), 'utf8');
   const expectedBuf = Buffer.from(expected, 'utf8');
   if (providedBuf.length !== expectedBuf.length) return false;
