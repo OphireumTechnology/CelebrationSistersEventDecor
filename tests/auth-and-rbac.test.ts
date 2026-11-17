@@ -118,6 +118,8 @@ test('enforces vendor assignment scoping and redacts financial fields', async ()
 });
 
 test('enforces Executive Admin MFA verification before granting admin dashboard access', async () => {
+  const priorCode = process.env.ADMIN_MFA_PASSCODE;
+  process.env.ADMIN_MFA_PASSCODE = '202687';
   const { baseUrl, cleanup } = await startIsolatedServer();
   try {
     const preMfaToken = await loginAs(baseUrl, 'user-admin-director');
@@ -158,5 +160,7 @@ test('enforces Executive Admin MFA verification before granting admin dashboard 
     assert.equal(allowedRes.status, 200);
   } finally {
     await cleanup();
+    if (priorCode === undefined) delete process.env.ADMIN_MFA_PASSCODE;
+    else process.env.ADMIN_MFA_PASSCODE = priorCode;
   }
 });
