@@ -1,3 +1,4 @@
+import { apiFetch } from '../lib/apiClient';
 import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import {
   AlertTriangle,
@@ -87,8 +88,8 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
 
     try {
       const [bkgRes, cncRes] = await Promise.all([
-        fetch('/api/bookings', { headers }),
-        fetch('/api/concepts', { headers }),
+        apiFetch('/api/bookings', { headers }),
+        apiFetch('/api/concepts', { headers }),
       ]);
       if (bkgRes.ok) {
         const bkgJson = await bkgRes.json();
@@ -104,21 +105,21 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
       }
 
       if (['vendor', 'staff', 'admin'].includes(currentUser.role)) {
-        const vRes = await fetch('/api/vendors', { headers });
+        const vRes = await apiFetch('/api/vendors', { headers });
         if (vRes.ok) setVendors((await vRes.json()).vendors || []);
       }
 
       if (['staff', 'admin'].includes(currentUser.role)) {
         const [chkRes, invRes] = await Promise.all([
-          fetch('/api/staff/checklists', { headers }),
-          fetch('/api/inventory', { headers }),
+          apiFetch('/api/staff/checklists', { headers }),
+          apiFetch('/api/inventory', { headers }),
         ]);
         if (chkRes.ok) setChecklists((await chkRes.json()).checklists || []);
         if (invRes.ok) setInventory((await invRes.json()).inventory || []);
       }
 
       if (currentUser.role === 'admin') {
-        const admRes = await fetch('/api/admin/overview', { headers });
+        const admRes = await apiFetch('/api/admin/overview', { headers });
         if (admRes.ok) setAdminData(await admRes.json());
       } else {
         setAdminData(null);
@@ -139,7 +140,7 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
     e.preventDefault();
     if (!activeBooking) return;
     setActionMessage(null);
-    const res = await fetch(`/api/bookings/${activeBooking.id}/contract/sign`, {
+    const res = await apiFetch(`/api/bookings/${activeBooking.id}/contract/sign`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-user-id': currentUser.id },
       body: JSON.stringify({ signatureName: signatureInput }),
@@ -155,7 +156,7 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
 
   const handlePayMilestone = async (paymentId: string) => {
     if (!activeBooking) return;
-    const res = await fetch(`/api/bookings/${activeBooking.id}/payments/${paymentId}/pay`, {
+    const res = await apiFetch(`/api/bookings/${activeBooking.id}/payments/${paymentId}/pay`, {
       method: 'POST',
       headers: { 'x-user-id': currentUser.id },
     });
@@ -170,7 +171,7 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
 
   const handleToggleMilestone = async (milestoneId: string) => {
     if (!activeBooking) return;
-    await fetch(`/api/bookings/${activeBooking.id}/milestones/${milestoneId}`, {
+    await apiFetch(`/api/bookings/${activeBooking.id}/milestones/${milestoneId}`, {
       method: 'PATCH',
       headers: { 'x-user-id': currentUser.id },
     });
@@ -180,7 +181,7 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
   const handleSendMessage = async (e: FormEvent) => {
     e.preventDefault();
     if (!activeBooking || !portalMessage.trim()) return;
-    await fetch(`/api/bookings/${activeBooking.id}/messages`, {
+    await apiFetch(`/api/bookings/${activeBooking.id}/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-user-id': currentUser.id },
       body: JSON.stringify({ text: portalMessage }),
@@ -191,7 +192,7 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
 
   const handleTransitionStatus = async (bookingId: string, status: BookingStatus) => {
     setActionMessage(null);
-    const res = await fetch(`/api/bookings/${bookingId}/status`, {
+    const res = await apiFetch(`/api/bookings/${bookingId}/status`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json', 'x-user-id': currentUser.id },
       body: JSON.stringify({ status }),
@@ -208,7 +209,7 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
   const handleCreateQuote = async (e: FormEvent) => {
     e.preventDefault();
     if (!activeBooking) return;
-    const res = await fetch(`/api/bookings/${activeBooking.id}/quotes`, {
+    const res = await apiFetch(`/api/bookings/${activeBooking.id}/quotes`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-user-id': currentUser.id },
       body: JSON.stringify({
@@ -235,7 +236,7 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
   };
 
   const handleVendorDeliverable = async (vendorId: string, delivId: string, status: 'Pending' | 'In Progress' | 'Completed') => {
-    await fetch(`/api/vendors/${vendorId}/deliverables/${delivId}`, {
+    await apiFetch(`/api/vendors/${vendorId}/deliverables/${delivId}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json', 'x-user-id': currentUser.id },
       body: JSON.stringify({ status }),
@@ -244,7 +245,7 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
   };
 
   const handleToggleChecklistTask = async (chkId: string, taskId: string) => {
-    await fetch(`/api/staff/checklists/${chkId}/tasks/${taskId}`, {
+    await apiFetch(`/api/staff/checklists/${chkId}/tasks/${taskId}`, {
       method: 'PATCH',
       headers: { 'x-user-id': currentUser.id },
     });
@@ -254,7 +255,7 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
   const handleReportIssue = async (e: FormEvent, chkId: string) => {
     e.preventDefault();
     if (!issueSummary.trim()) return;
-    await fetch(`/api/staff/checklists/${chkId}/issues`, {
+    await apiFetch(`/api/staff/checklists/${chkId}/issues`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-user-id': currentUser.id },
       body: JSON.stringify({ summary: issueSummary, severity: issueSeverity }),
@@ -264,7 +265,7 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
   };
 
   const handleToggleAutomation = async (wfId: string, nextVal: boolean) => {
-    await fetch(`/api/admin/automation/${wfId}`, {
+    await apiFetch(`/api/admin/automation/${wfId}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json', 'x-user-id': currentUser.id },
       body: JSON.stringify({ authorizedEnabled: nextVal }),
@@ -273,7 +274,7 @@ export function PortalsWorkspace({ currentUser, personas, onSwitchPersona }: Por
   };
 
   const handleRunAutomation = async (wfId: string) => {
-    await fetch(`/api/admin/automation/${wfId}/run`, {
+    await apiFetch(`/api/admin/automation/${wfId}/run`, {
       method: 'POST',
       headers: { 'x-user-id': currentUser.id },
     });

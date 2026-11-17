@@ -1,3 +1,4 @@
+import { apiFetch } from '../lib/apiClient';
 import { useState, type FormEvent } from 'react';
 import { CalendarCheck, CheckCircle2, X } from 'lucide-react';
 import { SERVICE_DIVISIONS } from '../data/brandCatalog';
@@ -58,7 +59,7 @@ export function ConsultationModal({
     setCheckingAvail(true);
     setError(null);
     try {
-      const res = await fetch(
+      const res = await apiFetch(
         `/api/availability?date=${encodeURIComponent(eventDate)}&venue=${encodeURIComponent(venueName)}`,
       );
       const data = await res.json();
@@ -77,7 +78,7 @@ export function ConsultationModal({
     setSubmitting(true);
     setError(null);
     try {
-      const res = await fetch('/api/bookings', {
+      const res = await apiFetch('/api/bookings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

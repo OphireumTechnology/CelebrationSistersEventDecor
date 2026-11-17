@@ -35,13 +35,13 @@ export interface PortfolioItem {
   isVerifiedPortfolioPhoto: true;
 }
 
-export const OFFICIAL_LOGO_SRC = '/assets/celebration-sisters-logo.png';
+export const OFFICIAL_LOGO_SRC = `${import.meta.env.BASE_URL}assets/celebration-sisters-logo.png`;
 
-export const HERO_BALLROOM_IMAGE = '/src/assets/images/hero_luxury_ballroom_1794948632249.jpg';
-export const IMG_WEDDING_FLORAL = '/src/assets/images/service_wedding_floral_1794948632464.jpg';
-export const IMG_MILESTONE_SOIREE = '/src/assets/images/service_milestone_soiree_1794948632179.jpg';
-export const IMG_CORPORATE_GALA = '/src/assets/images/service_corporate_gala_1794948633026.jpg';
-export const IMG_LOUNGE_LIGHTING = '/src/assets/images/service_lounge_lighting_1794948633528.jpg';
+export const HERO_BALLROOM_IMAGE = `${import.meta.env.BASE_URL}src/assets/images/hero_luxury_ballroom_1794948632249.jpg`;
+export const IMG_WEDDING_FLORAL = `${import.meta.env.BASE_URL}src/assets/images/service_wedding_floral_1794948632464.jpg`;
+export const IMG_MILESTONE_SOIREE = `${import.meta.env.BASE_URL}src/assets/images/service_milestone_soiree_1794948632179.jpg`;
+export const IMG_CORPORATE_GALA = `${import.meta.env.BASE_URL}src/assets/images/service_corporate_gala_1794948633026.jpg`;
+export const IMG_LOUNGE_LIGHTING = `${import.meta.env.BASE_URL}src/assets/images/service_lounge_lighting_1794948633528.jpg`;
 
 export const SERVICE_DIVISIONS: ServiceDivision[] = [
   {

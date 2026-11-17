@@ -6,6 +6,9 @@ import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
   return {
+    // GitHub Pages hosts this project below a repository subpath.
+    // Keep root-relative paths in local development and backend deployments.
+    base: process.env.GITHUB_PAGES === 'true' ? '/CelebrationSistersEventDecor/' : '/',
     plugins: [
       react(),
       tailwindcss(),
