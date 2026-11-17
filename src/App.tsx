@@ -1,4 +1,4 @@
-import { apiFetch } from './lib/apiClient';
+import { apiFetch, isBackendConfigured } from './lib/apiClient';
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -80,6 +80,11 @@ export default function App() {
 
   return (
     <div className="min-h-screen flex flex-col bg-white text-[var(--cs-charcoal)]">
+      {!isBackendConfigured && (
+        <div role="status" className="bg-[var(--cs-ivory)] border-b border-[var(--cs-border)] px-4 py-2 text-center text-xs text-[var(--cs-charcoal)]">
+          Our portfolio is available to explore. Online booking, AI consultations, and private portals will open when secure hosting is connected.
+        </div>
+      )}
       <LuxuryHeader
         activeRoute={activeRoute}
         onNavigate={handleNavigate}
