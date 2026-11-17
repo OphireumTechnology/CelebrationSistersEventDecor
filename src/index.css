@@ -1,0 +1,60 @@
+@import "tailwindcss";
+
+:root {
+  --cs-purple: #4B2087;
+  --cs-purple-hover: #3B176D;
+  --cs-purple-soft: #F4EFFA;
+  --cs-gold: #B99045;
+  --cs-gold-muted: #9C7835;
+  --cs-gold-soft: #FBF8F1;
+  --cs-white: #FFFFFF;
+  --cs-ivory: #FAF8F4;
+  --cs-charcoal: #292929;
+  --cs-charcoal-muted: #595550;
+  --cs-taupe: #B8A79A;
+  --cs-border: #E8E1D6;
+  --cs-border-strong: #D4C8B8;
+
+  --font-display: "Playfair Display", Georgia, Cambria, "Times New Roman", serif;
+  --font-sans: "Montserrat", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+    font-family: var(--font-sans);
+    color: var(--cs-charcoal);
+    background-color: var(--cs-white);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  h1, h2, h3, h4, .font-display {
+    font-family: var(--font-display);
+    text-wrap: balance;
+  }
+
+  button, a, input, select, textarea {
+    font-family: var(--font-sans);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--cs-purple);
+    outline-offset: 2px;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
