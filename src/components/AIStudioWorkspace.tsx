@@ -10,6 +10,7 @@ import {
   UserCheck,
 } from 'lucide-react';
 import { SERVICE_DIVISIONS } from '../data/brandCatalog';
+import { apiFetch, isBackendConfigured } from '../lib/apiClient';
 import type { DesignConceptRecord, UserSession } from '../types/domain';
 
 interface AIStudioWorkspaceProps {
@@ -83,7 +84,7 @@ export function AIStudioWorkspace({ currentUser, onOpenBookingPrefilled }: AIStu
         return;
       }
       try {
-        const res = await fetch('/api/concepts', {
+        const res = await apiFetch('/api/concepts', {
           credentials: 'include',
         });
         if (!res.ok) return;
@@ -110,7 +111,7 @@ export function AIStudioWorkspace({ currentUser, onOpenBookingPrefilled }: AIStu
     setChatLoading(true);
 
     try {
-      const res = await fetch('/api/ai/concierge', {
+      const res = await apiFetch('/api/ai/concierge', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -148,7 +149,7 @@ export function AIStudioWorkspace({ currentUser, onOpenBookingPrefilled }: AIStu
     setConceptError(null);
 
     try {
-      const res = await fetch('/api/ai/concept-studio', {
+      const res = await apiFetch('/api/ai/concept-studio', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -183,7 +184,7 @@ export function AIStudioWorkspace({ currentUser, onOpenBookingPrefilled }: AIStu
 
   const handleApproveConcept = async (conceptId: string) => {
     try {
-      const res = await fetch(`/api/concepts/${conceptId}/approve`, {
+      const res = await apiFetch(`/api/concepts/${conceptId}/approve`, {
         method: 'POST',
         credentials: 'include',
       });
@@ -239,6 +240,18 @@ export function AIStudioWorkspace({ currentUser, onOpenBookingPrefilled }: AIStu
             </button>
           </div>
         </div>
+
+        {!isBackendConfigured && (
+          <div className="p-4 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-900 flex items-start gap-2.5">
+            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-amber-700" />
+            <div>
+              <p className="font-semibold">Interactive AI Studio Requires Hosted Backend Connection</p>
+              <p className="mt-0.5 leading-relaxed">
+                This static preview showcases the Celebration Sisters design experience. Connect your secure HTTPS backend via <code className="font-mono">VITE_API_BASE_URL</code> or contact our Columbia studio directly to start a live AI planning session.
+              </p>
+            </div>
+          </div>
+        )}
 
         {activeTab === 'concierge' ? (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">

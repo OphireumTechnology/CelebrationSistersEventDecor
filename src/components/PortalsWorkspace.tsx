@@ -27,6 +27,7 @@ import {
   type UserSession,
   type VendorRecord,
 } from '../types/domain';
+import { apiFetch, isBackendConfigured } from '../lib/apiClient';
 import { toArchitecturalStage } from '../types/lifecycle';
 import { BrandLogo } from './BrandLogo';
 
@@ -101,8 +102,8 @@ export function PortalsWorkspace({
     setLoading(true);
     try {
       const [bkgRes, cncRes] = await Promise.all([
-        fetch('/api/bookings', { credentials: 'include' }),
-        fetch('/api/concepts', { credentials: 'include' }),
+        apiFetch('/api/bookings', { credentials: 'include' }),
+        apiFetch('/api/concepts', { credentials: 'include' }),
       ]);
       if (bkgRes.ok) {
         const bkgJson = await bkgRes.json();
@@ -118,21 +119,21 @@ export function PortalsWorkspace({
       }
 
       if (['vendor', 'staff', 'admin'].includes(currentUser.role)) {
-        const vRes = await fetch('/api/vendors', { credentials: 'include' });
+        const vRes = await apiFetch('/api/vendors', { credentials: 'include' });
         if (vRes.ok) setVendors((await vRes.json()).vendors || []);
       }
 
       if (['staff', 'admin'].includes(currentUser.role)) {
         const [chkRes, invRes] = await Promise.all([
-          fetch('/api/staff/checklists', { credentials: 'include' }),
-          fetch('/api/inventory', { credentials: 'include' }),
+          apiFetch('/api/staff/checklists', { credentials: 'include' }),
+          apiFetch('/api/inventory', { credentials: 'include' }),
         ]);
         if (chkRes.ok) setChecklists((await chkRes.json()).checklists || []);
         if (invRes.ok) setInventory((await invRes.json()).inventory || []);
       }
 
       if (currentUser.role === 'admin' && !mfaRequired) {
-        const admRes = await fetch('/api/admin/overview', { credentials: 'include' });
+        const admRes = await apiFetch('/api/admin/overview', { credentials: 'include' });
         if (admRes.ok) setAdminData(await admRes.json());
       } else {
         setAdminData(null);
@@ -166,7 +167,7 @@ export function PortalsWorkspace({
     e.preventDefault();
     if (!activeBooking) return;
     setActionMessage(null);
-    const res = await fetch(`/api/bookings/${activeBooking.id}/contract/sign`, {
+    const res = await apiFetch(`/api/bookings/${activeBooking.id}/contract/sign`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
@@ -174,7 +175,7 @@ export function PortalsWorkspace({
     });
     const data = await res.json();
     if (!res.ok) {
-      setActionMessage({ type: 'err', text: data.error });
+      setActionMessage({ type: 'err', text: data.error || 'Unable to record signature.' });
       return;
     }
     setActionMessage({ type: 'ok', text: `Digital signature recorded for ${activeBooking.referenceCode}.` });
@@ -183,13 +184,13 @@ export function PortalsWorkspace({
 
   const handlePayMilestone = async (paymentId: string) => {
     if (!activeBooking) return;
-    const res = await fetch(`/api/bookings/${activeBooking.id}/payments/${paymentId}/pay`, {
+    const res = await apiFetch(`/api/bookings/${activeBooking.id}/payments/${paymentId}/pay`, {
       method: 'POST',
       credentials: 'include',
     });
     const data = await res.json();
     if (!res.ok) {
-      setActionMessage({ type: 'err', text: data.error });
+      setActionMessage({ type: 'err', text: data.error || 'Unable to record payment.' });
       return;
     }
     setActionMessage({ type: 'ok', text: 'Staging payment milestone recorded.' });
@@ -198,29 +199,39 @@ export function PortalsWorkspace({
 
   const handleToggleMilestone = async (milestoneId: string) => {
     if (!activeBooking) return;
-    await fetch(`/api/bookings/${activeBooking.id}/milestones/${milestoneId}`, {
+    const res = await apiFetch(`/api/bookings/${activeBooking.id}/milestones/${milestoneId}`, {
       method: 'PATCH',
       credentials: 'include',
     });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      setActionMessage({ type: 'err', text: data.error || 'Unable to update milestone.' });
+      return;
+    }
     await loadWorkspaceData();
   };
 
   const handleSendMessage = async (e: FormEvent) => {
     e.preventDefault();
     if (!activeBooking || !portalMessage.trim()) return;
-    await fetch(`/api/bookings/${activeBooking.id}/messages`, {
+    const res = await apiFetch(`/api/bookings/${activeBooking.id}/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
       body: JSON.stringify({ text: portalMessage }),
     });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      setActionMessage({ type: 'err', text: data.error || 'Unable to send message.' });
+      return;
+    }
     setPortalMessage('');
     await loadWorkspaceData();
   };
 
   const handleTransitionStatus = async (bookingId: string, status: BookingStatus) => {
     setActionMessage(null);
-    const res = await fetch(`/api/bookings/${bookingId}/status`, {
+    const res = await apiFetch(`/api/bookings/${bookingId}/status`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
@@ -228,7 +239,7 @@ export function PortalsWorkspace({
     });
     const data = await res.json();
     if (!res.ok) {
-      setActionMessage({ type: 'err', text: data.error });
+      setActionMessage({ type: 'err', text: data.error || 'Status transition rejected.' });
       return;
     }
     setActionMessage({ type: 'ok', text: `Booking status transitioned to "${status}".` });
@@ -238,7 +249,7 @@ export function PortalsWorkspace({
   const handleCreateQuote = async (e: FormEvent) => {
     e.preventDefault();
     if (!activeBooking) return;
-    const res = await fetch(`/api/bookings/${activeBooking.id}/quotes`, {
+    const res = await apiFetch(`/api/bookings/${activeBooking.id}/quotes`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
@@ -258,7 +269,7 @@ export function PortalsWorkspace({
     });
     const data = await res.json();
     if (!res.ok) {
-      setActionMessage({ type: 'err', text: data.error });
+      setActionMessage({ type: 'err', text: data.error || 'Unable to publish quotation.' });
       return;
     }
     setActionMessage({ type: 'ok', text: `Issued updated quotation for ${activeBooking.referenceCode}.` });
@@ -267,7 +278,7 @@ export function PortalsWorkspace({
 
   const handleAddBlackoutDate = async (e: FormEvent) => {
     e.preventDefault();
-    const res = await fetch('/api/admin/blackout-dates', {
+    const res = await apiFetch('/api/admin/blackout-dates', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
@@ -275,7 +286,7 @@ export function PortalsWorkspace({
     });
     const data = await res.json();
     if (!res.ok) {
-      setActionMessage({ type: 'err', text: data.error });
+      setActionMessage({ type: 'err', text: data.error || 'Unable to add blackout date.' });
       return;
     }
     setActionMessage({ type: 'ok', text: `Blackout date ${blackoutDate} added.` });
@@ -283,51 +294,76 @@ export function PortalsWorkspace({
   };
 
   const handleVendorDeliverable = async (vendorId: string, delivId: string, status: 'Pending' | 'In Progress' | 'Completed') => {
-    await fetch(`/api/vendors/${vendorId}/deliverables/${delivId}`, {
+    const res = await apiFetch(`/api/vendors/${vendorId}/deliverables/${delivId}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
       body: JSON.stringify({ status }),
     });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      setActionMessage({ type: 'err', text: data.error || 'Unable to update deliverable.' });
+      return;
+    }
     await loadWorkspaceData();
   };
 
   const handleToggleChecklistTask = async (chkId: string, taskId: string) => {
-    await fetch(`/api/staff/checklists/${chkId}/tasks/${taskId}`, {
+    const res = await apiFetch(`/api/staff/checklists/${chkId}/tasks/${taskId}`, {
       method: 'PATCH',
       credentials: 'include',
     });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      setActionMessage({ type: 'err', text: data.error || 'Unable to update checklist task.' });
+      return;
+    }
     await loadWorkspaceData();
   };
 
   const handleReportIssue = async (e: FormEvent, chkId: string) => {
     e.preventDefault();
     if (!issueSummary.trim()) return;
-    await fetch(`/api/staff/checklists/${chkId}/issues`, {
+    const res = await apiFetch(`/api/staff/checklists/${chkId}/issues`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
       body: JSON.stringify({ summary: issueSummary, severity: issueSeverity }),
     });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      setActionMessage({ type: 'err', text: data.error || 'Unable to report issue.' });
+      return;
+    }
     setIssueSummary('');
     await loadWorkspaceData();
   };
 
   const handleToggleAutomation = async (wfId: string, nextVal: boolean) => {
-    await fetch(`/api/admin/automation/${wfId}`, {
+    const res = await apiFetch(`/api/admin/automation/${wfId}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
       body: JSON.stringify({ authorizedEnabled: nextVal }),
     });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      setActionMessage({ type: 'err', text: data.error || 'Unable to update workflow authorization.' });
+      return;
+    }
     await loadWorkspaceData();
   };
 
   const handleRunAutomation = async (wfId: string) => {
-    await fetch(`/api/admin/automation/${wfId}/run`, {
+    const res = await apiFetch(`/api/admin/automation/${wfId}/run`, {
       method: 'POST',
       credentials: 'include',
     });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      setActionMessage({ type: 'err', text: data.error || 'Unable to trigger workflow.' });
+      return;
+    }
     await loadWorkspaceData();
   };
 
@@ -376,6 +412,18 @@ export function PortalsWorkspace({
             )}
           </div>
         </div>
+
+        {!isBackendConfigured && (
+          <div className="p-4 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-900 flex items-start gap-2.5">
+            <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-700" />
+            <div>
+              <p className="font-semibold">Backend Connection Required for Protected Portal Sessions</p>
+              <p className="mt-0.5 leading-relaxed">
+                Static GitHub Pages hosting cannot issue signed HttpOnly authentication cookies or access private records. Connect your HTTPS API backend via <code className="font-mono">VITE_API_BASE_URL</code> to enable client, vendor, staff, and executive portals.
+              </p>
+            </div>
+          </div>
+        )}
 
         {actionMessage && (
           <div

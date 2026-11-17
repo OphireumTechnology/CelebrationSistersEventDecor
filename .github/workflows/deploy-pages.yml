@@ -26,8 +26,10 @@ jobs:
           node-version: '24'
       - name: Install dependencies
         run: npm install --no-audit --no-fund
-      - name: Verify TypeScript
+      - name: Verify TypeScript and linter
         run: npm run lint
+      - name: Run automated regression tests
+        run: npm test
       - name: Build static frontend
         run: npm run build
         env:
@@ -35,6 +37,8 @@ jobs:
       - name: Validate compiled entrypoint
         run: |
           test -f dist/index.html
+          test -f dist/assets/celebration-sisters-logo.png
+          test -d dist/src/assets/images
           if grep -q 'src="/src/main.tsx"' dist/index.html; then
             echo "Uncompiled Vite development entrypoint detected" >&2
             exit 1

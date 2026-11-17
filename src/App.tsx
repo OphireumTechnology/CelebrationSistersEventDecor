@@ -12,6 +12,7 @@ import { PortfolioAndAboutView } from './components/PortfolioAndAboutView';
 import { PortalsWorkspace } from './components/PortalsWorkspace';
 import { PublicHomeView } from './components/PublicHomeView';
 import { ServiceDivisionCatalog } from './components/ServiceDivisionCatalog';
+import { apiFetch } from './lib/apiClient';
 import type { UserSession } from './types/domain';
 
 const DEFAULT_GUEST: UserSession = {
@@ -42,8 +43,8 @@ export default function App() {
     const initAuth = async () => {
       try {
         const [personasRes, sessionRes] = await Promise.all([
-          fetch('/api/auth/personas', { credentials: 'include' }),
-          fetch('/api/auth/session', { credentials: 'include' }),
+          apiFetch('/api/auth/personas', { credentials: 'include' }),
+          apiFetch('/api/auth/session', { credentials: 'include' }),
         ]);
         if (personasRes.ok) {
           const pData = await personasRes.json();
@@ -64,7 +65,7 @@ export default function App() {
   }, []);
 
   const handleSwitchPersona = async (user: UserSession) => {
-    const res = await fetch('/api/auth/switch', {
+    const res = await apiFetch('/api/auth/switch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
@@ -77,7 +78,7 @@ export default function App() {
   };
 
   const handleVerifyMfa = async (code: string): Promise<{ ok: boolean; error?: string }> => {
-    const res = await fetch('/api/auth/mfa/verify', {
+    const res = await apiFetch('/api/auth/mfa/verify', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
@@ -93,7 +94,7 @@ export default function App() {
   };
 
   const handleLogout = async () => {
-    await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
+    await apiFetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
     setCurrentUser(DEFAULT_GUEST);
     setMfaRequired(false);
   };

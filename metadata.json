@@ -2,5 +2,7 @@
   "name": "Celebration Sisters Event Decor",
   "description": "Luxury event planning, decoration, coordination, AI consultation, and enterprise operations platform based in Columbia, South Carolina.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }
