@@ -100,6 +100,9 @@ export function createApp(options: CreateAppOptions = {}) {
 
   // Authentication & Signed Session Management
   app.get('/api/auth/personas', async (_req: Request, res: Response) => {
+    if (process.env.NODE_ENV === 'production') {
+      return res.status(404).json({ error: 'Demo personas are unavailable.' });
+    }
     const db = await readDb();
     res.json({ personas: db.users });
   });
@@ -115,6 +118,9 @@ export function createApp(options: CreateAppOptions = {}) {
   });
 
   app.post('/api/auth/switch', async (req: Request, res: Response) => {
+    if (process.env.NODE_ENV === 'production') {
+      return res.status(404).json({ error: 'Demo account switching is unavailable.' });
+    }
     const parsed = z.object({ userId: z.string().min(1) }).safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({ error: 'Valid userId is required.' });
