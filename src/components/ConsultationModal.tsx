@@ -1,5 +1,5 @@
 import { apiFetch } from '../lib/apiClient';
-import { useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import { CalendarCheck, CheckCircle2, X } from 'lucide-react';
 import { SERVICE_DIVISIONS } from '../data/brandCatalog';
 import { BrandLogo } from './BrandLogo';
@@ -33,7 +33,7 @@ export function ConsultationModal({
   const [selectedDivisions, setSelectedDivisions] = useState<string[]>(
     initialServiceId ? [initialServiceId] : ['wedding-planning'],
   );
-  const [eventDate, setEventDate] = useState('2027-04-17');
+  const [eventDate, setEventDate] = useState('');
   const [location, setLocation] = useState(initialLocation || 'Columbia, SC');
   const [venueName, setVenueName] = useState('');
   const [guestCount, setGuestCount] = useState(initialGuestCount || 120);
@@ -46,6 +46,29 @@ export function ConsultationModal({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmedRef, setConfirmedRef] = useState<string | null>(null);
+
+  // Reinitialize request details whenever a new consultation is opened.
+  useEffect(() => {
+    if (!open) return;
+    setClientName('');
+    setClientEmail('');
+    setClientPhone('');
+    setEventTitle('');
+    setEventType(initialEventType || SERVICE_DIVISIONS[0].title);
+    setSelectedDivisions(initialServiceId ? [initialServiceId] : ['wedding-planning']);
+    setEventDate('');
+    setLocation(initialLocation || 'Columbia, SC');
+    setVenueName('');
+    setGuestCount(initialGuestCount || 120);
+    setBudgetRange('$15,000 – $25,000');
+    setNotes(initialNotes || '');
+    setAvailabilityMsg(null);
+    setIsAvailable(null);
+    setCheckingAvail(false);
+    setSubmitting(false);
+    setError(null);
+    setConfirmedRef(null);
+  }, [open, initialServiceId, initialEventType, initialLocation, initialGuestCount, initialNotes]);
 
   if (!open) return null;
 
@@ -237,7 +260,11 @@ export function ConsultationModal({
                   required
                   type="date"
                   value={eventDate}
-                  onChange={(e) => setEventDate(e.target.value)}
+                  onChange={(e) => {
+                    setEventDate(e.target.value);
+                    setIsAvailable(null);
+                    setAvailabilityMsg(null);
+                  }}
                   className="w-full px-3.5 py-2.5 text-sm border border-[var(--cs-border-strong)] rounded-md tabular-nums"
                 />
               </div>
@@ -247,7 +274,11 @@ export function ConsultationModal({
                   required
                   type="text"
                   value={venueName}
-                  onChange={(e) => setVenueName(e.target.value)}
+                  onChange={(e) => {
+                    setVenueName(e.target.value);
+                    setIsAvailable(null);
+                    setAvailabilityMsg(null);
+                  }}
                   placeholder="Lace House Gardens"
                   className="w-full px-3.5 py-2.5 text-sm border border-[var(--cs-border-strong)] rounded-md"
                 />
