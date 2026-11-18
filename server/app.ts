@@ -3,24 +3,36 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import { z } from 'zod';
 import {
   BOOKING_STATUSES,
+  type AuthSecurityEvent,
   type BookingRecord,
   type BookingStatus,
 } from '../src/types/domain.ts';
 import { LEGACY_TO_ARCH_STATUS } from '../src/types/lifecycle.ts';
 import {
   clearSessionCookie,
-  resolveAuthenticatedContext,
+  resolveAuthenticatedContextAsync,
   setSessionCookie,
   sha256Hex,
   signSessionToken,
   verifyAdminMfaCode,
+  type AuthenticatedContext,
 } from './auth.ts';
+import {
+  corsAllowlistMiddleware,
+  getAllowedOrigins,
+  hasPlanningClearance,
+  isCsrfOriginValid,
+  requireActiveAccount,
+  requireAdminWithMfa,
+  requireRoles,
+} from './authz.ts';
 import { generateConceptProposal, getGeminiConfigStatus, runConciergeTurn } from './gemini.ts';
+import { getIdentityProviderStatus, type VerifyProviderTokenOptions } from './identityProvider.ts';
 import { getPersistenceStatus } from './repositories/postgresRepository.ts';
 import {
   appendAudit,
+  appendSecurityEvent,
   canTransitionBookingStatus,
-  hasRole,
   isAuthorizedForBooking,
   readDb,
   sanitizeBookingForRole,
@@ -29,6 +41,7 @@ import {
 
 export interface CreateAppOptions {
   enableRateLimit?: boolean;
+  providerVerifyOptions?: VerifyProviderTokenOptions;
 }
 
 export function createApp(options: CreateAppOptions = {}) {
@@ -49,6 +62,9 @@ export function createApp(options: CreateAppOptions = {}) {
     res.setHeader('Cache-Control', 'no-store');
     next();
   });
+
+  // Explicit credentialed CORS allowlist (GitHub Pages -> Railway)
+  app.use(corsAllowlistMiddleware());
 
   const rateBucket = new Map<string, { count: number; resetAt: number }>();
   function rateLimit(maxRequests: number, windowMs: number) {
@@ -71,23 +87,52 @@ export function createApp(options: CreateAppOptions = {}) {
 
   async function getAuth(req: Request) {
     const db = await readDb();
-    const ctx = resolveAuthenticatedContext(req, db.users);
+    const ctx = await resolveAuthenticatedContextAsync(req, db.users, options.providerVerifyOptions);
     return { db, ctx };
   }
 
-  function requireAdminMfa(ctx: ReturnType<typeof resolveAuthenticatedContext>, res: Response): boolean {
-    if (ctx.session.role !== 'admin') {
-      res.status(403).json({ error: 'Executive director clearance required.' });
-      return false;
-    }
-    if (!ctx.mfaVerified) {
-      res.status(403).json({
-        error: 'MFA_REQUIRED: Executive director session requires multi-factor verification before accessing administrative controls.',
-        mfaRequired: true,
+  async function logSecurityIncident(
+    ctx: AuthenticatedContext,
+    eventType: AuthSecurityEvent['eventType'],
+    target: string,
+    details: string,
+  ) {
+    await withTransaction((wdb) => {
+      appendSecurityEvent(wdb, {
+        eventType,
+        userId: ctx.session.id !== 'guest-public' ? ctx.session.id : undefined,
+        outcome: 'denied',
+        details: `${target}: ${details}`,
       });
-      return false;
+    });
+  }
+
+  // Cookie-authenticated state-changing request CSRF Origin/Referer protection
+  app.use('/api', async (req: Request, res: Response, next: NextFunction) => {
+    if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method.toUpperCase())) {
+      return next();
     }
-    return true;
+    const { ctx } = await getAuth(req);
+    if (!isCsrfOriginValid(req, ctx.authMethod)) {
+      await withTransaction((wdb) => {
+        appendSecurityEvent(wdb, {
+          eventType: 'CSRF_REJECTED',
+          userId: ctx.session.id !== 'guest-public' ? ctx.session.id : undefined,
+          outcome: 'denied',
+          details: `Rejected cookie-authenticated ${req.method} ${req.path} from untrusted origin/referer`,
+        });
+        appendAudit(wdb, ctx.session, 'CSRF_ORIGIN_REJECTED', 'API', req.path, 'Cross-site cookie mutation rejected');
+      });
+      return res.status(403).json({
+        error: 'Cross-site state-changing request rejected by CSRF origin policy.',
+        code: 'CSRF_ORIGIN_REJECTED',
+      });
+    }
+    return next();
+  });
+
+  function requireAdminMfa(ctx: AuthenticatedContext, res: Response): boolean {
+    return requireAdminWithMfa(ctx, res);
   }
 
   // Health & Infrastructure Readiness
@@ -104,9 +149,11 @@ export function createApp(options: CreateAppOptions = {}) {
   app.get('/ready', (_req: Request, res: Response) => {
     const persistence = getPersistenceStatus();
     const ai = getGeminiConfigStatus();
+    const auth = getIdentityProviderStatus();
     res.status(persistence.ready ? 200 : 503).json({
       ok: persistence.ready,
       persistence,
+      auth,
       ai: { model: ai.model, configured: ai.configured },
       requestId: res.getHeader('X-Request-Id'),
       timestamp: new Date().toISOString(),
@@ -116,10 +163,12 @@ export function createApp(options: CreateAppOptions = {}) {
   app.get('/api/health', (_req: Request, res: Response) => {
     const persistence = getPersistenceStatus();
     const ai = getGeminiConfigStatus();
+    const auth = getIdentityProviderStatus();
     res.status(persistence.ready ? 200 : 503).json({
       ok: persistence.ready,
       service: 'Celebration Sisters Event Decor Platform',
       persistence,
+      auth,
       ai: { model: ai.model, configured: ai.configured, timeoutMs: ai.timeoutMs },
       requestId: res.getHeader('X-Request-Id'),
       timestamp: new Date().toISOString(),
@@ -127,6 +176,15 @@ export function createApp(options: CreateAppOptions = {}) {
   });
 
   // Authentication & Signed Session Management
+  app.get('/api/auth/config', (_req: Request, res: Response) => {
+    const identity = getIdentityProviderStatus();
+    res.json({
+      ...identity,
+      viteSupabaseConfigured: Boolean(process.env.VITE_SUPABASE_URL && process.env.VITE_SUPABASE_ANON_KEY),
+      allowedOriginsCount: getAllowedOrigins().length,
+    });
+  });
+
   app.get('/api/auth/personas', async (_req: Request, res: Response) => {
     if (process.env.NODE_ENV === 'production') {
       return res.status(404).json({ error: 'Demo personas are unavailable in production.' });
@@ -137,10 +195,21 @@ export function createApp(options: CreateAppOptions = {}) {
 
   app.get('/api/auth/session', async (req: Request, res: Response) => {
     const { ctx } = await getAuth(req);
+    if (ctx.spoofAttemptDetected) {
+      await logSecurityIncident(
+        ctx,
+        req.header('authorization') ? 'TOKEN_REJECTED' : 'SPOOF_ATTEMPT',
+        '/api/auth/session',
+        'Rejected invalid token or spoofed identity headers',
+      );
+    }
     res.json({
       user: ctx.session,
       mfaVerified: ctx.mfaVerified,
       mfaRequired: ctx.session.role === 'admin' && !ctx.mfaVerified,
+      emailVerified: ctx.emailVerified,
+      accountStatus: ctx.accountStatus,
+      aal: ctx.aal,
       authMethod: ctx.authMethod,
     });
   });
@@ -157,6 +226,12 @@ export function createApp(options: CreateAppOptions = {}) {
     const user = db.users.find((u) => u.id === parsed.data.userId);
     if (!user) {
       return res.status(404).json({ error: 'Account not found.' });
+    }
+    if (user.accountStatus === 'suspended' || user.accountStatus === 'deactivated') {
+      return res.status(403).json({
+        error: 'This account is suspended or deactivated.',
+        code: 'ACCOUNT_SUSPENDED',
+      });
     }
 
     const token = signSessionToken({
@@ -178,13 +253,17 @@ export function createApp(options: CreateAppOptions = {}) {
 
   app.post('/api/auth/mfa/verify', rateLimit(10, 60_000), async (req: Request, res: Response) => {
     const { ctx } = await getAuth(req);
-    if (ctx.session.role === 'guest') {
-      return res.status(401).json({ error: 'Sign in before verifying MFA.' });
-    }
+    if (!requireActiveAccount(ctx, res)) return;
     const parsed = z.object({ code: z.string().min(4) }).safeParse(req.body);
     if (!parsed.success || !verifyAdminMfaCode(parsed.data.code)) {
       await withTransaction((db) => {
         appendAudit(db, ctx.session, 'MFA_VERIFICATION_FAILED', 'AuthSession', ctx.session.id, 'Invalid MFA code entered');
+        appendSecurityEvent(db, {
+          eventType: 'MFA_FAILED',
+          userId: ctx.session.id,
+          outcome: 'denied',
+          details: 'Invalid director MFA verification code entered',
+        });
       });
       return res.status(403).json({ error: 'Invalid director MFA verification code.' });
     }
@@ -199,13 +278,30 @@ export function createApp(options: CreateAppOptions = {}) {
     setSessionCookie(res, token);
     await withTransaction((db) => {
       appendAudit(db, ctx.session, 'MFA_VERIFIED', 'AuthSession', ctx.session.id, 'Privileged MFA verified');
+      appendSecurityEvent(db, {
+        eventType: 'MFA_VERIFIED',
+        userId: ctx.session.id,
+        outcome: 'allowed',
+        details: 'Privileged MFA verified',
+      });
     });
 
     res.json({ user: ctx.session, token, mfaVerified: true, mfaRequired: false });
   });
 
-  app.post('/api/auth/logout', (_req: Request, res: Response) => {
+  app.post('/api/auth/logout', async (req: Request, res: Response) => {
+    const { ctx } = await getAuth(req);
     clearSessionCookie(res);
+    if (ctx.session.role !== 'guest') {
+      await withTransaction((db) => {
+        appendSecurityEvent(db, {
+          eventType: 'LOGOUT',
+          userId: ctx.session.id,
+          outcome: 'allowed',
+          details: 'Session closed by user',
+        });
+      });
+    }
     res.json({ ok: true });
   });
 
@@ -305,16 +401,24 @@ export function createApp(options: CreateAppOptions = {}) {
     }
   });
 
-  // Bookings list (strictly isolated by verified signed session)
+  // Bookings list (strictly isolated by verified signed session or verified Supabase JWT)
   app.get('/api/bookings', async (req: Request, res: Response) => {
     const { db, ctx } = await getAuth(req);
     if (ctx.spoofAttemptDetected) {
       await withTransaction((wdb) => {
-        appendAudit(wdb, ctx.session, 'PRIVILEGE_SPOOF_BLOCKED', 'API', '/api/bookings', 'Rejected unverified identity/role header');
+        appendAudit(wdb, ctx.session, 'PRIVILEGE_SPOOF_BLOCKED', 'API', '/api/bookings', 'Rejected unverified identity/role header or invalid token');
+        appendSecurityEvent(wdb, {
+          eventType: req.header('authorization') ? 'TOKEN_REJECTED' : 'SPOOF_ATTEMPT',
+          outcome: 'denied',
+          details: 'Rejected unverified token or spoofed identity header on GET /api/bookings',
+        });
       });
     }
-    if (ctx.session.role === 'guest') {
-      return res.status(401).json({ error: 'Authentication required to view booking records.' });
+    if (ctx.session.role !== 'guest' && (ctx.accountStatus === 'suspended' || ctx.accountStatus === 'deactivated')) {
+      await logSecurityIncident(ctx, 'SUSPENDED_ACCOUNT_BLOCKED', '/api/bookings', 'Suspended account access blocked');
+    }
+    if (!requireActiveAccount(ctx, res)) {
+      return;
     }
     const visible = db.bookings
       .filter((b) => isAuthorizedForBooking(b, ctx.session, db.vendors))
@@ -468,11 +572,22 @@ export function createApp(options: CreateAppOptions = {}) {
   // Status transition endpoint with strict state machine & confirmation guard
   app.patch('/api/bookings/:id/status', async (req: Request, res: Response) => {
     const { ctx } = await getAuth(req);
-    if (!hasRole(ctx.session, ['staff', 'admin'])) {
-      return res.status(403).json({ error: 'Only authorized staff or directors may advance booking workflow statuses.' });
+    if (
+      !requireRoles(
+        ctx,
+        ['event_planner', 'staff', 'admin'],
+        res,
+        'Only authorized planners, staff, or directors may advance booking workflow statuses.',
+      )
+    ) {
+      return;
     }
     if (ctx.session.role === 'admin' && !ctx.mfaVerified) {
-      return res.status(403).json({ error: 'MFA verification required for executive status transitions.' });
+      return res.status(403).json({
+        error: 'MFA verification required for executive status transitions.',
+        code: 'MFA_REQUIRED',
+        mfaRequired: true,
+      });
     }
 
     const parsed = z.object({ status: z.enum(BOOKING_STATUSES) }).safeParse(req.body);
@@ -525,11 +640,18 @@ export function createApp(options: CreateAppOptions = {}) {
     }
   });
 
-  // Create itemized quotation version (Admin/Staff only)
+  // Create itemized quotation version (Planner/Staff/Admin only; discounts approved by Admin)
   app.post('/api/bookings/:id/quotes', async (req: Request, res: Response) => {
     const { ctx } = await getAuth(req);
-    if (!hasRole(ctx.session, ['staff', 'admin'])) {
-      return res.status(403).json({ error: 'Only authorized staff or directors can issue quotations.' });
+    if (
+      !requireRoles(
+        ctx,
+        ['event_planner', 'staff', 'admin'],
+        res,
+        'Only authorized planners, staff, or directors can issue quotations.',
+      )
+    ) {
+      return;
     }
     const schema = z.object({
       items: z
@@ -610,8 +732,8 @@ export function createApp(options: CreateAppOptions = {}) {
   // Digital Contract Signature with SHA-256 hash & evidentiary metadata
   app.post('/api/bookings/:id/contract/sign', async (req: Request, res: Response) => {
     const { ctx } = await getAuth(req);
-    if (ctx.session.role === 'guest' || ctx.session.role === 'vendor') {
-      return res.status(403).json({ error: 'Not authorized to sign this contract.' });
+    if (!requireRoles(ctx, ['client', 'event_planner', 'staff', 'admin'], res, 'Not authorized to sign this contract.')) {
+      return;
     }
     const schema = z.object({ signatureName: z.string().trim().min(2, 'Typed legal signature is required') });
     const parsed = schema.safeParse(req.body);
@@ -665,8 +787,15 @@ export function createApp(options: CreateAppOptions = {}) {
   // Record payment milestone (Staging Verification Mode)
   app.post('/api/bookings/:id/payments/:paymentId/pay', async (req: Request, res: Response) => {
     const { ctx } = await getAuth(req);
-    if (ctx.session.role === 'guest' || ctx.session.role === 'vendor') {
-      return res.status(403).json({ error: 'Not authorized to process payment milestones.' });
+    if (
+      !requireRoles(
+        ctx,
+        ['client', 'event_planner', 'staff', 'admin'],
+        res,
+        'Not authorized to process payment milestones.',
+      )
+    ) {
+      return;
     }
     try {
       const updated = await withTransaction(async (db) => {
@@ -703,8 +832,8 @@ export function createApp(options: CreateAppOptions = {}) {
 
   app.patch('/api/bookings/:id/milestones/:milestoneId', async (req: Request, res: Response) => {
     const { ctx } = await getAuth(req);
-    if (ctx.session.role === 'guest' || ctx.session.role === 'vendor') {
-      return res.status(403).json({ error: 'Unauthorized.' });
+    if (!requireRoles(ctx, ['client', 'event_planner', 'staff', 'admin'], res, 'Unauthorized.')) {
+      return;
     }
     const updated = await withTransaction(async (db) => {
       const booking = db.bookings.find((b) => b.id === req.params.id);
@@ -721,7 +850,7 @@ export function createApp(options: CreateAppOptions = {}) {
 
   app.post('/api/bookings/:id/messages', async (req: Request, res: Response) => {
     const { ctx } = await getAuth(req);
-    if (ctx.session.role === 'guest') return res.status(401).json({ error: 'Sign in required.' });
+    if (!requireActiveAccount(ctx, res)) return;
     const parsed = z.object({ text: z.string().trim().min(1).max(1000) }).safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: 'Message cannot be empty.' });
 
@@ -745,22 +874,26 @@ export function createApp(options: CreateAppOptions = {}) {
   // Concept Studio endpoints (server-enforced record-level isolation & approval)
   app.get('/api/concepts', async (req: Request, res: Response) => {
     const { db, ctx } = await getAuth(req);
-    if (ctx.session.role === 'guest') {
-      return res.status(401).json({ error: 'Sign in required to view saved concepts.' });
-    }
-    const visible =
-      ctx.session.role === 'admin' || ctx.session.role === 'staff'
-        ? db.concepts
-        : ctx.session.role === 'client'
-          ? db.concepts.filter((c) => c.clientId === ctx.session.id)
-          : [];
+    if (!requireActiveAccount(ctx, res)) return;
+    const visible = hasPlanningClearance(ctx.session)
+      ? db.concepts
+      : ctx.session.role === 'client'
+        ? db.concepts.filter((c) => c.clientId === ctx.session.id)
+        : [];
     res.json({ concepts: visible });
   });
 
   app.post('/api/concepts/:id/approve', async (req: Request, res: Response) => {
     const { ctx } = await getAuth(req);
-    if (!hasRole(ctx.session, ['client', 'staff', 'admin'])) {
-      return res.status(403).json({ error: 'Unauthorized to approve design concepts.' });
+    if (
+      !requireRoles(
+        ctx,
+        ['client', 'event_planner', 'staff', 'admin'],
+        res,
+        'Unauthorized to approve design concepts.',
+      )
+    ) {
+      return;
     }
     const updated = await withTransaction(async (db) => {
       const concept = db.concepts.find((c) => c.id === req.params.id);
@@ -936,8 +1069,8 @@ export function createApp(options: CreateAppOptions = {}) {
   // Vendors & Staff Operations
   app.get('/api/vendors', async (req: Request, res: Response) => {
     const { db, ctx } = await getAuth(req);
-    if (!hasRole(ctx.session, ['vendor', 'staff', 'admin'])) {
-      return res.status(403).json({ error: 'Vendor or operations clearance required.' });
+    if (!requireRoles(ctx, ['vendor', 'event_planner', 'staff', 'admin'], res, 'Vendor or operations clearance required.')) {
+      return;
     }
     const vendors =
       ctx.session.role === 'vendor'
@@ -948,8 +1081,8 @@ export function createApp(options: CreateAppOptions = {}) {
 
   app.patch('/api/vendors/:id/deliverables/:delivId', async (req: Request, res: Response) => {
     const { ctx } = await getAuth(req);
-    if (!hasRole(ctx.session, ['vendor', 'staff', 'admin'])) {
-      return res.status(403).json({ error: 'Unauthorized.' });
+    if (!requireRoles(ctx, ['vendor', 'event_planner', 'staff', 'admin'], res, 'Unauthorized.')) {
+      return;
     }
     const parsed = z.object({ status: z.enum(['Pending', 'In Progress', 'Completed']) }).safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: 'Invalid deliverable status.' });
@@ -973,15 +1106,15 @@ export function createApp(options: CreateAppOptions = {}) {
 
   app.get('/api/staff/checklists', async (req: Request, res: Response) => {
     const { db, ctx } = await getAuth(req);
-    if (!hasRole(ctx.session, ['staff', 'admin'])) {
-      return res.status(403).json({ error: 'Staff clearance required.' });
+    if (!requireRoles(ctx, ['event_planner', 'staff', 'admin'], res, 'Planner or staff clearance required.')) {
+      return;
     }
     res.json({ checklists: db.staffChecklists });
   });
 
   app.patch('/api/staff/checklists/:id/tasks/:taskId', async (req: Request, res: Response) => {
     const { ctx } = await getAuth(req);
-    if (!hasRole(ctx.session, ['staff', 'admin'])) return res.status(403).json({ error: 'Staff clearance required.' });
+    if (!requireRoles(ctx, ['event_planner', 'staff', 'admin'], res, 'Planner or staff clearance required.')) return;
     const updated = await withTransaction(async (db) => {
       const chk = db.staffChecklists.find((c) => c.id === req.params.id);
       if (!chk) return null;
@@ -996,7 +1129,7 @@ export function createApp(options: CreateAppOptions = {}) {
 
   app.post('/api/staff/checklists/:id/issues', async (req: Request, res: Response) => {
     const { ctx } = await getAuth(req);
-    if (!hasRole(ctx.session, ['staff', 'admin'])) return res.status(403).json({ error: 'Staff clearance required.' });
+    if (!requireRoles(ctx, ['event_planner', 'staff', 'admin'], res, 'Planner or staff clearance required.')) return;
     const parsed = z.object({
       summary: z.string().trim().min(3),
       severity: z.enum(['Low', 'Medium', 'High']),
@@ -1022,15 +1155,15 @@ export function createApp(options: CreateAppOptions = {}) {
   // Inventory
   app.get('/api/inventory', async (req: Request, res: Response) => {
     const { db, ctx } = await getAuth(req);
-    if (!hasRole(ctx.session, ['staff', 'admin'])) {
-      return res.status(403).json({ error: 'Operations clearance required.' });
+    if (!requireRoles(ctx, ['event_planner', 'staff', 'admin'], res, 'Operations clearance required.')) {
+      return;
     }
     res.json({ inventory: db.inventory });
   });
 
   app.patch('/api/inventory/:id', async (req: Request, res: Response) => {
     const { ctx } = await getAuth(req);
-    if (!hasRole(ctx.session, ['staff', 'admin'])) return res.status(403).json({ error: 'Unauthorized.' });
+    if (!requireRoles(ctx, ['event_planner', 'staff', 'admin'], res, 'Unauthorized.')) return;
     const parsed = z.object({
       allocatedQuantity: z.coerce.number().int().min(0).optional(),
       condition: z.enum(['Pristine', 'Inspection Needed', 'In Maintenance']).optional(),
@@ -1078,6 +1211,7 @@ export function createApp(options: CreateAppOptions = {}) {
       automationWorkflows: db.automationWorkflows,
       automationLogs: db.automationLogs,
       auditLogs: db.auditLogs,
+      authSecurityEvents: db.authSecurityEvents,
       blackoutDates: db.blackoutDates,
       availabilityHolds: db.availabilityHolds,
       users: db.users,

@@ -1,4 +1,6 @@
-export type UserRole = 'guest' | 'client' | 'vendor' | 'staff' | 'admin';
+export type UserRole = 'guest' | 'client' | 'vendor' | 'event_planner' | 'staff' | 'admin';
+
+export type AccountStatus = 'active' | 'pending_verification' | 'suspended' | 'deactivated';
 
 export const BOOKING_STATUSES = [
   'Inquiry',
@@ -40,6 +42,49 @@ export interface UserSession {
   email: string;
   role: UserRole;
   organization?: string;
+  supabaseUserId?: string;
+  emailVerified?: boolean;
+  accountStatus?: AccountStatus;
+  mfaEnrolled?: boolean;
+}
+
+export interface StaffVendorInvitation {
+  id: string;
+  email: string;
+  assignedRole: 'vendor' | 'event_planner' | 'staff' | 'admin';
+  tokenHash: string;
+  invitedByUserId: string;
+  invitedByName: string;
+  status: 'pending' | 'accepted' | 'revoked' | 'expired';
+  expiresAt: string;
+  createdAt: string;
+  acceptedAt?: string;
+  acceptedByUserId?: string;
+  revokedAt?: string;
+}
+
+export interface AuthSecurityEvent {
+  id: string;
+  occurredAt: string;
+  eventType:
+    | 'LOGIN_SUCCESS'
+    | 'LOGIN_FAILED'
+    | 'REGISTER_INITIATED'
+    | 'TOKEN_REJECTED'
+    | 'CSRF_REJECTED'
+    | 'SPOOF_ATTEMPT'
+    | 'SUSPENDED_ACCOUNT_BLOCKED'
+    | 'UNVERIFIED_EMAIL_BLOCKED'
+    | 'MFA_VERIFIED'
+    | 'MFA_FAILED'
+    | 'INVITATION_ISSUED'
+    | 'INVITATION_ACCEPTED'
+    | 'INVITATION_REVOKED'
+    | 'LOGOUT';
+  userId?: string;
+  emailHash?: string;
+  outcome: 'allowed' | 'denied';
+  details: string;
 }
 
 export interface QuoteLineItem {

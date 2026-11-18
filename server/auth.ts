@@ -1,6 +1,11 @@
 import crypto from 'node:crypto';
 import type { Request, Response } from 'express';
-import type { UserRole, UserSession } from '../src/types/domain.ts';
+import type { AccountStatus, UserRole, UserSession } from '../src/types/domain.ts';
+import {
+  resolveTrustedUserFromClaims,
+  verifyProviderAccessToken,
+  type VerifyProviderTokenOptions,
+} from './identityProvider.ts';
 
 export const SESSION_COOKIE_NAME = 'cs_session';
 
@@ -24,7 +29,10 @@ export interface SignedSessionPayload {
 export interface AuthenticatedContext {
   session: UserSession;
   mfaVerified: boolean;
-  authMethod: 'cookie' | 'bearer' | 'guest';
+  emailVerified: boolean;
+  accountStatus: AccountStatus;
+  aal: 'aal1' | 'aal2';
+  authMethod: 'cookie' | 'bearer' | 'supabase_jwt' | 'guest';
   spoofAttemptDetected: boolean;
 }
 
@@ -115,11 +123,24 @@ export const GUEST_USER: UserSession = {
   name: 'Public Visitor',
   email: 'visitor@celebrationsisters.example.com',
   role: 'guest',
+  emailVerified: false,
+  accountStatus: 'active',
 };
 
+function guestContext(spoofAttemptDetected: boolean): AuthenticatedContext {
+  return {
+    session: GUEST_USER,
+    mfaVerified: false,
+    emailVerified: false,
+    accountStatus: 'active',
+    aal: 'aal1',
+    authMethod: 'guest',
+    spoofAttemptDetected,
+  };
+}
+
 /**
- * Resolves authenticated user strictly from a cryptographically signed session cookie
- * or Bearer token. Unverified raw headers (x-user-id / x-user-role) are NEVER trusted.
+ * Synchronous session resolver for HMAC-signed session cookies / tokens.
  */
 export function resolveAuthenticatedContext(
   req: Request,
@@ -141,40 +162,80 @@ export function resolveAuthenticatedContext(
   }
 
   if (!rawToken) {
-    return {
-      session: GUEST_USER,
-      mfaVerified: false,
-      authMethod: 'guest',
-      spoofAttemptDetected: Boolean(rawSpoofHeader),
-    };
+    return guestContext(Boolean(rawSpoofHeader));
   }
 
   const verified = verifySessionToken(rawToken);
   if (!verified) {
-    return {
-      session: GUEST_USER,
-      mfaVerified: false,
-      authMethod: 'guest',
-      spoofAttemptDetected: true,
-    };
+    return guestContext(true);
   }
 
   const matchedUser = registeredUsers.find((u) => u.id === verified.userId);
   if (!matchedUser) {
-    return {
-      session: GUEST_USER,
-      mfaVerified: false,
-      authMethod: 'guest',
-      spoofAttemptDetected: false,
-    };
+    return guestContext(false);
   }
+
+  const accountStatus: AccountStatus = matchedUser.accountStatus ?? 'active';
+  const emailVerified = matchedUser.emailVerified ?? true;
 
   return {
     session: matchedUser,
     mfaVerified: verified.mfaVerified,
+    emailVerified,
+    accountStatus,
+    aal: verified.mfaVerified ? 'aal2' : 'aal1',
     authMethod,
     spoofAttemptDetected: false,
   };
+}
+
+/**
+ * Primary request authentication resolver.
+ * Supports cryptographic Supabase Auth JWTs (3-segment JWT via Authorization: Bearer)
+ * alongside server-signed HttpOnly session cookies/tokens.
+ * Unverified raw headers (x-user-id / x-user-role) and mutable JWT user_metadata role claims are NEVER trusted.
+ */
+export async function resolveAuthenticatedContextAsync(
+  req: Request,
+  registeredUsers: UserSession[],
+  providerVerifyOptions?: VerifyProviderTokenOptions,
+): Promise<AuthenticatedContext> {
+  const rawSpoofHeader = req.header('x-user-id') || req.header('x-user-role');
+  const authHeader = req.header('authorization');
+
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const rawToken = authHeader.slice(7).trim();
+    if (!rawToken) {
+      return guestContext(true);
+    }
+
+    // Standard 3-part JWS indicates an external identity provider JWT (Supabase Auth)
+    if (rawToken.split('.').length === 3) {
+      const claims = await verifyProviderAccessToken(rawToken, providerVerifyOptions);
+      if (!claims) {
+        return guestContext(true);
+      }
+      const resolved = resolveTrustedUserFromClaims(claims, registeredUsers);
+      return {
+        session: resolved.user,
+        mfaVerified: resolved.mfaVerified,
+        emailVerified: resolved.emailVerified,
+        accountStatus: resolved.accountStatus,
+        aal: claims.aal,
+        authMethod: 'supabase_jwt',
+        spoofAttemptDetected: false,
+      };
+    }
+
+    // 2-part server HMAC staging token
+    return resolveAuthenticatedContext(req, registeredUsers);
+  }
+
+  if (rawSpoofHeader && !parseCookies(req)[SESSION_COOKIE_NAME]) {
+    return guestContext(true);
+  }
+
+  return resolveAuthenticatedContext(req, registeredUsers);
 }
 
 export function verifyAdminMfaCode(code: string): boolean {

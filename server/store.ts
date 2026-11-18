@@ -3,6 +3,7 @@ import path from 'node:path';
 import type {
   AISessionRecord,
   AuditLogEntry,
+  AuthSecurityEvent,
   AutomationLog,
   AutomationWorkflow,
   AvailabilityHold,
@@ -12,6 +13,7 @@ import type {
   DesignConceptRecord,
   InventoryItem,
   StaffChecklistRecord,
+  StaffVendorInvitation,
   UserRole,
   UserSession,
   VendorRecord,
@@ -32,6 +34,8 @@ export interface DatabaseSchema {
   automationWorkflows: AutomationWorkflow[];
   automationLogs: AutomationLog[];
   auditLogs: AuditLogEntry[];
+  invitations: StaffVendorInvitation[];
+  authSecurityEvents: AuthSecurityEvent[];
 }
 
 function getDbPath(): string {
@@ -446,6 +450,8 @@ function buildInitialSeed(): DatabaseSchema {
         createdAt: '2026-10-01T09:00:00.000Z',
       },
     ],
+    invitations: [],
+    authSecurityEvents: [],
   };
 }
 
@@ -467,9 +473,11 @@ export async function readDb(): Promise<DatabaseSchema> {
   const dbPath = await ensureDbFile();
   const raw = await fs.readFile(dbPath, 'utf8');
   const parsed = JSON.parse(raw) as DatabaseSchema;
-  // Backward-compatible backfill for Phase 1 records
+  // Backward-compatible backfill for Phase 1/2 records
   parsed.availabilityHolds = parsed.availabilityHolds || [];
   parsed.blackoutDates = parsed.blackoutDates || [];
+  parsed.invitations = parsed.invitations || [];
+  parsed.authSecurityEvents = parsed.authSecurityEvents || [];
   for (const b of parsed.bookings || []) {
     if (!b.architecturalStage) {
       b.architecturalStage = LEGACY_TO_ARCH_STATUS[b.status] ?? 'INQUIRY';
@@ -521,13 +529,27 @@ export function appendAudit(
   }
 }
 
+export function appendSecurityEvent(
+  db: DatabaseSchema,
+  event: Omit<AuthSecurityEvent, 'id' | 'occurredAt'>,
+): void {
+  db.authSecurityEvents.unshift({
+    id: `sec-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    occurredAt: new Date().toISOString(),
+    ...event,
+  });
+  if (db.authSecurityEvents.length > 500) {
+    db.authSecurityEvents = db.authSecurityEvents.slice(0, 500);
+  }
+}
+
 export function canTransitionBookingStatus(from: BookingStatus, to: BookingStatus): boolean {
   if (from === to) return true;
   return VALID_BOOKING_TRANSITIONS[from]?.includes(to) ?? false;
 }
 
 export function sanitizeBookingForRole(booking: BookingRecord, session: UserSession): BookingRecord | Partial<BookingRecord> {
-  if (session.role === 'admin' || session.role === 'staff') {
+  if (session.role === 'admin' || session.role === 'staff' || session.role === 'event_planner') {
     return booking;
   }
   if (session.role === 'client') {
@@ -576,7 +598,7 @@ export function sanitizeBookingForRole(booking: BookingRecord, session: UserSess
 }
 
 export function isAuthorizedForBooking(booking: BookingRecord, session: UserSession, vendors: VendorRecord[]): boolean {
-  if (session.role === 'admin' || session.role === 'staff') return true;
+  if (session.role === 'admin' || session.role === 'staff' || session.role === 'event_planner') return true;
   if (session.role === 'client') return booking.clientId === session.id;
   if (session.role === 'vendor') {
     const vendor = vendors.find((v) => v.email.toLowerCase() === session.email.toLowerCase() || v.contactName === session.name);
