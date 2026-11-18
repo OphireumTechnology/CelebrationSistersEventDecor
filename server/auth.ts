@@ -77,8 +77,13 @@ export function parseCookies(req: Request): Record<string, string> {
     if (eqIdx === -1) continue;
     const key = segment.slice(0, eqIdx).trim();
     const val = segment.slice(eqIdx + 1).trim();
-    if (key) {
-      result[key] = decodeURIComponent(val);
+    if (key && !Object.prototype.hasOwnProperty.call(result, key)) {
+      try {
+        result[key] = decodeURIComponent(val);
+      } catch {
+        // Malformed percent-encoding is untrusted input, not a server error.
+        // Ignore the invalid cookie so auth safely falls back to guest.
+      }
     }
   }
   return result;
