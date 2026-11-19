@@ -30,8 +30,15 @@ jobs:
             throw 'Unexpected write statement in audit script.'
           }
           Write-Host 'PowerShell syntax and read-only guardrails passed.'
-      - name: Assert no database access in hosted workflow
+      - name: Verify hosted workflow does not inject database credentials
         shell: pwsh
         run: |
-          if ($env:PGPASSWORD -or $env:DATABASE_URL) { throw 'Unexpected database credential in hosted audit job.' }
-          Write-Host 'Hosted CI performs static checks only; local database remains unreachable.'
+          # Check the workflow configuration, not ambient variables present on the hosted runner.
+          # Presence of an ambient variable is not evidence that this workflow used it.
+          $workflow = Get-Content '.github/workflows/postgres-readonly-audit.yml' -Raw
+          if ($workflow -match '\$\{\{\s*secrets\.' -or
+              $workflow -match '(?im)^\s*(PGPASSWORD|DATABASE_URL)\s*:' -or
+              $workflow -match '(?im)^\s*runs-on:\s*self-hosted') {
+            throw 'Audit workflow must not configure database secrets or self-hosted execution.'
+          }
+          Write-Host 'Hosted CI validates code only; it does not invoke the PostgreSQL audit.'
