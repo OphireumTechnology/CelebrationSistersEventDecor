@@ -4,7 +4,7 @@
  */
 
 const SENSITIVE_KEY_PATTERN =
-  /(secret|token|password|passwd|authorization|cookie|api[-_]?key|totp|recovery|private[-_]?key|connectionstring|database_url)/i;
+  /(secret|token|password|passwd|authorization|cookie|api[-_]?key|totp|recovery|private[-_]?key|connectionstring|database_url|email)/i;
 
 const SECRET_VALUE_PATTERN =
   /(Bearer\s+[A-Za-z0-9._~+/-]+=*|postgres(?:ql)?:\/\/[^@\s]+@|re_[A-Za-z0-9]{12,}|AIzaSy[A-Za-z0-9_-]{20,}|whsec_[A-Za-z0-9]{10,}|-----BEGIN [A-Z ]+PRIVATE KEY-----)/gi;
