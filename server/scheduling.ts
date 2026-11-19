@@ -413,8 +413,8 @@ export function validateRequestedConsultationSlot(params: {
   if (Number.isNaN(startDt.getTime())) {
     return { valid: false, errorCode: 'INVALID_TIME', error: 'Consultation start time must be a valid UTC ISO timestamp.' };
   }
-  if (startDt.getTime() < nowMs + 60 * 60_000) {
-    return { valid: false, errorCode: 'INVALID_TIME', error: 'Consultation appointments must be scheduled at least 1 hour in advance.' };
+  if (startDt.getTime() < nowMs + 2 * 60 * 60_000) {
+    return { valid: false, errorCode: 'INVALID_TIME', error: 'Consultation appointments must be scheduled at least 2 hours in advance.' };
   }
 
   // Convert startDt into studio date (YYYY-MM-DD) & HH:MM
