@@ -14,12 +14,18 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 1. Map Supabase auth.uid() to internal users.id via immutable supabase_user_id binding
+-- 1. Map Supabase auth.uid() (when present) to internal users.id via immutable supabase_user_id binding
 CREATE OR REPLACE FUNCTION app_current_user_id() RETURNS UUID AS $$
   SELECT COALESCE(
     NULLIF(current_setting('app.current_user_id', true), '')::UUID,
-    (SELECT u.id FROM users u WHERE u.supabase_user_id = auth.uid() LIMIT 1),
-    auth.uid()
+    (
+      SELECT u.id
+      FROM users u
+      WHERE app_resolve_provider_uid() IS NOT NULL
+        AND u.supabase_user_id = app_resolve_provider_uid()
+      LIMIT 1
+    ),
+    app_resolve_provider_uid()
   );
 $$ LANGUAGE SQL STABLE;
 

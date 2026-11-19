@@ -92,6 +92,16 @@ export async function validateMigrationsDirectory(
     if (/\bDROP\s+TABLE\b/i.test(sql) || /\bTRUNCATE\s+TABLE\b/i.test(sql)) {
       errors.push(`Destructive DDL (DROP TABLE / TRUNCATE TABLE) detected in forward migration ${filename}`);
     }
+    // Guard against unconditional auth.uid() calls outside guarded to_regprocedure / dynamic EXECUTE
+    const sqlWithoutComments = sql
+      .replace(/--.*$/gm, '')
+      .replace(/to_regprocedure\('auth\.uid\(\)'\)/gi, '')
+      .replace(/EXECUTE\s+'SELECT\s+auth\.uid\(\)'/gi, '');
+    if (/\bauth\.uid\s*\(\s*\)/i.test(sqlWithoutComments)) {
+      errors.push(
+        `Unconditional auth.uid() detected in ${filename}; use app_resolve_provider_uid() for vanilla Railway PostgreSQL compatibility.`,
+      );
+    }
   }
 
   // Verify every sensitive table has BOTH ENABLE ROW LEVEL SECURITY and at least one CREATE POLICY
@@ -117,7 +127,10 @@ export async function validateMigrationsDirectory(
     errors.push('Vendor brief view v_vendor_booking_briefs is missing security_invoker = true.');
   }
   if (!/to_regprocedure\('auth\.uid\(\)'\)/i.test(combinedSql)) {
-    errors.push('Migration 007 must guard auth.uid() via to_regprocedure for Railway PostgreSQL compatibility.');
+    errors.push('Migrations must guard auth.uid() via to_regprocedure for Railway PostgreSQL compatibility.');
+  }
+  if (!/CREATE\s+POLICY\s+notification_outbox_worker_scoped\s+ON\s+notification_outbox/i.test(combinedSql)) {
+    errors.push('Migration 008 must define least-privilege notification_outbox_worker_scoped policy under FORCE RLS.');
   }
   if (!/excl_consultations_planner_buffered_overlap/i.test(combinedSql)) {
     errors.push('Migration 007 must enforce buffered consultation overlap exclusion constraint.');

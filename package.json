@@ -11,6 +11,7 @@
     "start": "node dist-server/server.mjs",
     "preview": "vite preview",
     "clean": "rm -rf dist dist-server server.js",
+    "typecheck": "tsc --noEmit",
     "lint": "tsc --noEmit && oxlint src server tests scripts server.ts",
     "test": "tsx --test tests/*.test.ts"
   },
@@ -41,6 +42,7 @@
     "esbuild": "^0.28.0",
     "eslint": "^10.15.0",
     "oxlint": "^1.94.0",
+    "playwright-core": "^1.65.1",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.21.0",
     "typescript": "~5.9.3",

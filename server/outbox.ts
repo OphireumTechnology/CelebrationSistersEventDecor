@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import type { NotificationDeliveryRecord, OutboxNotificationJob } from '../src/types/domain.ts';
-import type { FetchLike, SendNotificationInput } from './notifications.ts';
+import { getEmailRuntimeConfig, type FetchLike, type SendNotificationInput } from './notifications.ts';
 import { logStructured, observability } from './observability.ts';
 import type { DatabaseSchema } from './store.ts';
 import { appendAudit, withTransaction } from './store.ts';
@@ -148,6 +148,37 @@ export function enqueueOutboxNotification(
   return { job, deduplicated: false };
 }
 
+function applyProviderDeliveryEventInTx(
+  db: DatabaseSchema,
+  providerMessageId: string | undefined,
+  eventStatus: 'Delivered' | 'Bounced',
+  details?: string,
+): { updated: boolean; job?: OutboxNotificationJob } {
+  if (!providerMessageId || !providerMessageId.trim()) {
+    return { updated: false };
+  }
+  const job = db.notificationOutbox.find((j) => j.providerMessageId === providerMessageId);
+  if (!job) return { updated: false };
+
+  // Out-of-order and duplicate terminal-state safety:
+  // - Never downgrade or re-mutate an already Delivered record on duplicate Delivered events
+  // - Never re-mutate an already DeadLetter record on duplicate Bounced events
+  // - Never downgrade an already Delivered job if a stale non-bounce/non-complaint event arrives
+  if (job.status === 'Delivered' && eventStatus === 'Delivered') {
+    return { updated: false, job };
+  }
+  if (job.status === 'DeadLetter' && eventStatus === 'Bounced') {
+    return { updated: false, job };
+  }
+
+  job.status = eventStatus === 'Delivered' ? 'Delivered' : 'DeadLetter';
+  job.lastError = eventStatus === 'Bounced' ? details || 'Recipient bounced at email provider.' : undefined;
+  job.updatedAt = new Date().toISOString();
+  syncDeliveryLedgerFromJob(db, job);
+  observability.recordNotificationOutcome(eventStatus === 'Delivered' ? 'delivered' : 'dead_letter');
+  return { updated: true, job: { ...job } };
+}
+
 /**
  * Records downstream provider delivery confirmation (e.g., from a verified Resend webhook)
  * idempotently without ever fabricating delivery on HTTP 2xx submission alone.
@@ -157,20 +188,70 @@ export async function recordProviderDeliveryConfirmation(
   eventStatus: 'Delivered' | 'Bounced',
   details?: string,
 ): Promise<{ updated: boolean; job?: OutboxNotificationJob }> {
-  return withTransaction((db) => {
-    const job = db.notificationOutbox.find((j) => j.providerMessageId === providerMessageId);
-    if (!job) return { updated: false };
+  return withTransaction((db) =>
+    applyProviderDeliveryEventInTx(db, providerMessageId, eventStatus, details),
+  );
+}
 
-    if (job.status === 'Delivered' && eventStatus === 'Delivered') {
-      return { updated: false, job };
+/**
+ * Atomically deduplicates a verified Resend webhook event by `svix-id`, persists the
+ * immutable webhook audit entry, and reconciles the matching outbox job inside ONE
+ * serialized transaction so concurrent webhook replays can never double-process or
+ * mutate unrelated outbox records.
+ */
+export async function reconcileResendWebhookAtomic(params: {
+  svixId: string;
+  eventType: string;
+  providerMessageId?: string;
+  payloadSha256: string;
+  bounceDetails?: string;
+  nowIso?: string;
+}): Promise<{ deduplicated: boolean; reconciled: boolean; job?: OutboxNotificationJob }> {
+  const nowIso = params.nowIso ?? new Date().toISOString();
+  return withTransaction((db) => {
+    const existing = db.notificationWebhookEvents.find((e) => e.svixId === params.svixId);
+    if (existing) {
+      return { deduplicated: true, reconciled: false };
     }
 
-    job.status = eventStatus === 'Delivered' ? 'Delivered' : 'DeadLetter';
-    job.lastError = eventStatus === 'Bounced' ? details || 'Recipient bounced at email provider.' : undefined;
-    job.updatedAt = new Date().toISOString();
-    syncDeliveryLedgerFromJob(db, job);
-    observability.recordNotificationOutcome(eventStatus === 'Delivered' ? 'delivered' : 'dead_letter');
-    return { updated: true, job };
+    const isDeliveryTerminalEvent =
+      params.eventType === 'email.delivered' ||
+      params.eventType === 'email.bounced' ||
+      params.eventType === 'email.complained';
+
+    let reconciled = false;
+    let job: OutboxNotificationJob | undefined;
+
+    if (params.providerMessageId && params.eventType === 'email.delivered') {
+      const result = applyProviderDeliveryEventInTx(db, params.providerMessageId, 'Delivered');
+      reconciled = result.updated;
+      job = result.job;
+    } else if (
+      params.providerMessageId &&
+      (params.eventType === 'email.bounced' || params.eventType === 'email.complained')
+    ) {
+      const details = params.bounceDetails || `Resend event: ${params.eventType}`;
+      const result = applyProviderDeliveryEventInTx(db, params.providerMessageId, 'Bounced', details);
+      reconciled = result.updated;
+      job = result.job;
+    }
+
+    db.notificationWebhookEvents.unshift({
+      id: `whk-${crypto.randomUUID().slice(0, 10)}`,
+      provider: 'resend',
+      svixId: params.svixId,
+      eventType: params.eventType,
+      providerMessageId: params.providerMessageId,
+      signatureVerified: true,
+      payloadSha256: params.payloadSha256,
+      status: isDeliveryTerminalEvent && reconciled ? 'processed' : 'ignored',
+      receivedAt: nowIso,
+    });
+    if (db.notificationWebhookEvents.length > 500) {
+      db.notificationWebhookEvents = db.notificationWebhookEvents.slice(0, 500);
+    }
+
+    return { deduplicated: false, reconciled, job };
   });
 }
 
@@ -301,10 +382,10 @@ export class NotificationOutboxWorker {
       return summary;
     }
 
-    const apiKey = (this.options.apiKey ?? process.env.RESEND_API_KEY ?? '').trim();
-    const fromAddress = (this.options.fromAddress ?? process.env.EMAIL_FROM ?? '').trim();
-    const liveEnabled =
-      this.options.liveDeliveryEnabled ?? process.env.EMAIL_LIVE_DELIVERY_ENABLED === 'true';
+    const runtimeCfg = getEmailRuntimeConfig();
+    const apiKey = (this.options.apiKey ?? runtimeCfg.apiKey).trim();
+    const fromAddress = (this.options.fromAddress ?? runtimeCfg.fromAddress).trim();
+    const liveEnabled = this.options.liveDeliveryEnabled ?? runtimeCfg.liveDeliveryEnabled;
     const fetchImpl = this.options.fetchImpl ?? fetch;
     const providerTimeoutMs = this.options.providerTimeoutMs ?? 10_000;
     const baseBackoffMs = this.options.baseBackoffMs ?? 5_000;

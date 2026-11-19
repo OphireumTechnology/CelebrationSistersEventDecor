@@ -13,6 +13,22 @@ import { sha256Hex } from './auth.ts';
 
 export const STUDIO_TIMEZONE = 'America/New_York';
 
+/**
+ * Single authoritative studio preparation cutoff for consultation bookings & holds (2 hours).
+ * Shared identically by availability generation, hold creation, booking creation, and rescheduling.
+ */
+export const MIN_CONSULTATION_NOTICE_MINUTES = 120;
+
+export function meetsConsultationNotice(
+  startUtc: string | Date,
+  nowMs: number = Date.now(),
+  minNoticeMinutes: number = MIN_CONSULTATION_NOTICE_MINUTES,
+): boolean {
+  const startMs = typeof startUtc === 'string' ? new Date(startUtc).getTime() : startUtc.getTime();
+  if (Number.isNaN(startMs)) return false;
+  return startMs >= nowMs + minNoticeMinutes * 60_000;
+}
+
 export const SUPPORTED_TIMEZONES = [
   'America/New_York',
   'America/Chicago',
@@ -280,7 +296,6 @@ export function computeConsultationAvailability(params: {
     ? params.clientTimezone
     : STUDIO_TIMEZONE;
   const nowMs = params.nowMs ?? Date.now();
-  const minLeadMs = nowMs + 2 * 60 * 60_000; // Minimum 2-hour studio preparation notice
   const safeDays = Math.max(1, Math.min(params.days, 45));
 
   const plannerNames = new Map<string, string>();
@@ -349,9 +364,9 @@ export function computeConsultationAvailability(params: {
         let available = true;
         let unavailableReason: string | undefined;
 
-        if (startDateUtc.getTime() < minLeadMs) {
+        if (!meetsConsultationNotice(startDateUtc, nowMs)) {
           available = false;
-          unavailableReason = 'Past booking notice cutoff';
+          unavailableReason = 'Past 2-hour booking notice cutoff';
         } else {
           const conflictCheck = findPlannerSlotConflict({
             plannerId: rule.plannerId,
@@ -435,8 +450,12 @@ export function validateRequestedConsultationSlot(params: {
   if (Number.isNaN(startDt.getTime())) {
     return { valid: false, errorCode: 'INVALID_TIME', error: 'Consultation start time must be a valid UTC ISO timestamp.' };
   }
-  if (startDt.getTime() < nowMs + 60 * 60_000) {
-    return { valid: false, errorCode: 'INVALID_TIME', error: 'Consultation appointments must be scheduled at least 1 hour in advance.' };
+  if (!meetsConsultationNotice(startDt, nowMs)) {
+    return {
+      valid: false,
+      errorCode: 'INVALID_TIME',
+      error: `Consultation appointments must be scheduled at least ${MIN_CONSULTATION_NOTICE_MINUTES / 60} hours in advance.`,
+    };
   }
 
   // Convert startDt into studio date (YYYY-MM-DD) & HH:MM
@@ -534,7 +553,7 @@ export function validateRequestedConsultationSlot(params: {
  * access, storing ONLY its SHA-256 hash on the consultation record.
  */
 export function generateConsultationAccessToken(): { token: string; hash: string } {
-  const token = `csa_${crypto.randomBytes(24).toString('base64url')}`;
+  const token = `csa_${crypto.randomBytes(32).toString('base64url')}`;
   return { token, hash: sha256Hex(token) };
 }
 

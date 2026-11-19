@@ -3,11 +3,39 @@ import type { NotificationCategory, NotificationDeliveryRecord } from '../src/ty
 
 export type { NotificationCategory };
 
+export interface EmailRuntimeConfig {
+  apiKey: string;
+  fromAddress: string;
+  staffNotificationEmail: string;
+  liveDeliveryEnabled: boolean;
+  webhookSecret: string;
+}
+
+/**
+ * Single authoritative email & Resend environment variable contract across API routes,
+ * outbox workers, health diagnostics, and webhook verification:
+ *   - RESEND_API_KEY
+ *   - EMAIL_FROM
+ *   - EMAIL_LIVE_DELIVERY_ENABLED ('true' to enable outbound sends)
+ *   - RESEND_WEBHOOK_SECRET
+ *   - STAFF_NOTIFICATION_EMAIL
+ */
+export function getEmailRuntimeConfig(env: NodeJS.ProcessEnv = process.env): EmailRuntimeConfig {
+  return {
+    apiKey: (env.RESEND_API_KEY || '').trim(),
+    fromAddress: (env.EMAIL_FROM || '').trim(),
+    staffNotificationEmail: (env.STAFF_NOTIFICATION_EMAIL || '').trim(),
+    liveDeliveryEnabled: env.EMAIL_LIVE_DELIVERY_ENABLED === 'true',
+    webhookSecret: (env.RESEND_WEBHOOK_SECRET || '').trim(),
+  };
+}
+
 export interface EmailProviderStatus {
   provider: 'resend' | 'unconfigured';
   configured: boolean;
   fromAddressConfigured: boolean;
   staffRecipientConfigured: boolean;
+  webhookSecretConfigured: boolean;
   liveDeliveryEnabled: boolean;
   reason: string;
 }
@@ -103,20 +131,18 @@ export function verifyResendWebhookSignature(params: {
   return { valid: false, reason: 'Webhook HMAC signature verification failed.' };
 }
 
-export function getEmailProviderStatus(): EmailProviderStatus {
-  const apiKey = (process.env.RESEND_API_KEY || '').trim();
-  const fromAddress = (process.env.EMAIL_FROM || '').trim();
-  const staffRecipient = (process.env.STAFF_NOTIFICATION_EMAIL || '').trim();
-  const liveEnabled = process.env.EMAIL_LIVE_DELIVERY_ENABLED === 'true';
+export function getEmailProviderStatus(env: NodeJS.ProcessEnv = process.env): EmailProviderStatus {
+  const cfg = getEmailRuntimeConfig(env);
 
-  if (apiKey && fromAddress) {
+  if (cfg.apiKey && cfg.fromAddress) {
     return {
       provider: 'resend',
       configured: true,
       fromAddressConfigured: true,
-      staffRecipientConfigured: Boolean(staffRecipient),
-      liveDeliveryEnabled: liveEnabled,
-      reason: liveEnabled
+      staffRecipientConfigured: Boolean(cfg.staffNotificationEmail),
+      webhookSecretConfigured: Boolean(cfg.webhookSecret),
+      liveDeliveryEnabled: cfg.liveDeliveryEnabled,
+      reason: cfg.liveDeliveryEnabled
         ? 'Resend API key and verified sender configured; provider acceptance tracked (delivery requires webhook confirmation).'
         : 'Resend API key configured, but EMAIL_LIVE_DELIVERY_ENABLED is not true; outbound sends remain safely paused.',
     };
@@ -125,8 +151,9 @@ export function getEmailProviderStatus(): EmailProviderStatus {
   return {
     provider: 'unconfigured',
     configured: false,
-    fromAddressConfigured: Boolean(fromAddress),
-    staffRecipientConfigured: Boolean(staffRecipient),
+    fromAddressConfigured: Boolean(cfg.fromAddress),
+    staffRecipientConfigured: Boolean(cfg.staffNotificationEmail),
+    webhookSecretConfigured: Boolean(cfg.webhookSecret),
     liveDeliveryEnabled: false,
     reason: 'RESEND_API_KEY and EMAIL_FROM are not configured; notifications are audited without claiming email delivery.',
   };
@@ -452,9 +479,10 @@ export async function dispatchEmailNotification(
   }
 
   const nowIso = new Date().toISOString();
-  const apiKey = (options?.apiKey ?? process.env.RESEND_API_KEY ?? '').trim();
-  const fromAddress = (options?.fromAddress ?? process.env.EMAIL_FROM ?? '').trim();
-  const liveEnabled = options?.liveDeliveryEnabled ?? process.env.EMAIL_LIVE_DELIVERY_ENABLED === 'true';
+  const runtimeCfg = getEmailRuntimeConfig();
+  const apiKey = (options?.apiKey ?? runtimeCfg.apiKey).trim();
+  const fromAddress = (options?.fromAddress ?? runtimeCfg.fromAddress).trim();
+  const liveEnabled = options?.liveDeliveryEnabled ?? runtimeCfg.liveDeliveryEnabled;
 
   const baseRecord: NotificationDeliveryRecord = {
     id: `ntf-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,

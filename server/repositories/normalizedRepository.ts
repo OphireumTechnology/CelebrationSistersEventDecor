@@ -9,9 +9,11 @@ import type { UserRole } from '../../src/types/domain.ts';
  * without disturbing existing app_state_snapshots data during phased rollout.
  */
 
+export type NormalizedActorRole = UserRole | 'notification_worker';
+
 export interface NormalizedActorContext {
   userId: string;
-  role: UserRole;
+  role: NormalizedActorRole;
   clientId?: string;
 }
 
@@ -386,6 +388,13 @@ export class PostgresNormalizedRepository implements NormalizedPersistenceReposi
     leaseSeconds = 60,
   ): Promise<ClaimedOutboxRow[]> {
     return this.runTx(async (client) => {
+      // Apply transaction-local (`SET LOCAL`) least-privilege worker context so FORCE RLS on
+      // notification_outbox allows claiming due jobs without elevating privileges or leaking context
+      // across pooled connections (auto-resets on COMMIT/ROLLBACK).
+      await applyTransactionActorContext(client, {
+        userId: '00000000-0000-0000-0000-000000000000',
+        role: 'notification_worker',
+      });
       const res = await client.query<ClaimedOutboxRow>(
         `WITH candidate AS (
            SELECT id

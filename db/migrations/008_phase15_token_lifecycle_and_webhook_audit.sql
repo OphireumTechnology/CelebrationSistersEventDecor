@@ -43,6 +43,18 @@ ALTER TABLE notification_outbox FORCE ROW LEVEL SECURITY;
 ALTER TABLE notification_webhook_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE notification_webhook_events FORCE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS notification_outbox_ops_admin ON notification_outbox;
+CREATE POLICY notification_outbox_ops_admin ON notification_outbox
+  FOR ALL
+  USING (app_current_role() IN ('admin', 'staff', 'event_planner'))
+  WITH CHECK (app_current_role() IN ('admin', 'staff', 'event_planner'));
+
+DROP POLICY IF EXISTS notification_outbox_worker_scoped ON notification_outbox;
+CREATE POLICY notification_outbox_worker_scoped ON notification_outbox
+  FOR ALL
+  USING (app_current_role() = 'notification_worker')
+  WITH CHECK (app_current_role() = 'notification_worker');
+
 DROP POLICY IF EXISTS notification_webhook_events_ops_only ON notification_webhook_events;
 CREATE POLICY notification_webhook_events_ops_only ON notification_webhook_events
   FOR ALL

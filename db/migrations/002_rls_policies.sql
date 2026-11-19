@@ -1,12 +1,26 @@
 -- Celebration Sisters Event Decor — Row-Level Security (RLS) Policies
 -- Version: 002
 -- Enforces strict client isolation, vendor assignment scoping, and protected admin telemetry.
--- Expects session context via Supabase auth.uid() or SET LOCAL app.current_user_id / app.current_role.
+-- Expects session context via SET LOCAL app.current_user_id / app.current_role,
+-- safely delegating to Supabase auth.uid() ONLY if that function exists in the catalog.
+-- Returns NULL when unauthenticated (fail-closed on both Railway PostgreSQL and Supabase).
+
+CREATE OR REPLACE FUNCTION app_resolve_provider_uid() RETURNS UUID AS $$
+DECLARE
+  v_uid UUID;
+BEGIN
+  IF to_regprocedure('auth.uid()') IS NOT NULL THEN
+    EXECUTE 'SELECT auth.uid()' INTO v_uid;
+    RETURN v_uid;
+  END IF;
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql STABLE;
 
 CREATE OR REPLACE FUNCTION app_current_user_id() RETURNS UUID AS $$
   SELECT COALESCE(
     NULLIF(current_setting('app.current_user_id', true), '')::UUID,
-    auth.uid()
+    app_resolve_provider_uid()
   );
 $$ LANGUAGE SQL STABLE;
 

@@ -49,6 +49,7 @@ import {
   buildStaffAlertTemplate,
   buildStatusUpdateTemplate,
   getEmailProviderStatus,
+  getEmailRuntimeConfig,
   verifyResendWebhookSignature,
   type FetchLike,
 } from './notifications.ts';
@@ -56,7 +57,7 @@ import { logStructured, observability } from './observability.ts';
 import {
   enqueueOutboxNotification,
   NotificationOutboxWorker,
-  recordProviderDeliveryConfirmation,
+  reconcileResendWebhookAtomic,
   requeueOutboxJob,
 } from './outbox.ts';
 import {
@@ -2697,9 +2698,18 @@ export function createApp(options: CreateAppOptions = {}) {
           db.consultationIdempotencyKeys[idempotencyKey] = consultationId;
           db.bookingIdempotencyKeys[idempotencyKey] = bookingId;
         }
-        if (holderHash) {
-          db.consultationSlotHolds = db.consultationSlotHolds.filter((h) => h.holderFingerprintHash !== holderHash);
-        }
+        const bookedStartMs = new Date(newConsultation.startUtc).getTime();
+        const bookedEndMs = new Date(newConsultation.endUtc).getTime();
+        db.consultationSlotHolds = db.consultationSlotHolds.filter((h) => {
+          if (new Date(h.expiresAt).getTime() <= nowMs) return false;
+          if (holderHash && h.holderFingerprintHash === holderHash) return false;
+          if (h.plannerId === chosenPlannerId) {
+            const hStart = new Date(h.slotStartUtc).getTime();
+            const hEnd = new Date(h.slotEndUtc).getTime();
+            if (hStart < bookedEndMs && bookedStartMs < hEnd) return false;
+          }
+          return true;
+        });
 
         const clientWindow = formatFullDateTimeForTimezone(newConsultation.startUtc, input.clientTimezone);
         const studioWindow = formatFullDateTimeForTimezone(newConsultation.startUtc, STUDIO_TIMEZONE);
@@ -4179,7 +4189,7 @@ export function createApp(options: CreateAppOptions = {}) {
     '/api/webhooks/resend',
     rateLimit(120, 60_000, { endpointGroup: 'webhooks:resend', failClosed: false }),
     async (req: Request, res: Response) => {
-      const webhookSecret = (process.env.RESEND_WEBHOOK_SECRET || '').trim();
+      const { webhookSecret } = getEmailRuntimeConfig();
       if (!webhookSecret) {
         return res.status(503).json({
           error: 'Resend webhook verification secret is not configured.',
@@ -4225,46 +4235,19 @@ export function createApp(options: CreateAppOptions = {}) {
             ? payload.data.id
             : undefined;
       const payloadSha256 = sha256Hex(rawBody);
-      const nowIso = new Date().toISOString();
+      const bounceDetails = payload.data?.bounce?.message;
 
-      // Deduplicate webhook delivery by svix-id
-      const dupCheck = await withTransaction((db) => {
-        const existing = db.notificationWebhookEvents.find((e) => e.svixId === svixId);
-        if (existing) {
-          return { duplicate: true as const };
-        }
-        db.notificationWebhookEvents.unshift({
-          id: `whk-${crypto.randomUUID().slice(0, 10)}`,
-          provider: 'resend',
-          svixId,
-          eventType,
-          providerMessageId,
-          signatureVerified: true,
-          payloadSha256,
-          status:
-            eventType === 'email.delivered' || eventType === 'email.bounced' || eventType === 'email.complained'
-              ? 'processed'
-              : 'ignored',
-          receivedAt: nowIso,
-        });
-        if (db.notificationWebhookEvents.length > 500) {
-          db.notificationWebhookEvents = db.notificationWebhookEvents.slice(0, 500);
-        }
-        return { duplicate: false as const };
+      // Deduplicate svix-id, record immutable audit row, and reconcile outbox job atomically in ONE transaction
+      const atomicResult = await reconcileResendWebhookAtomic({
+        svixId,
+        eventType,
+        providerMessageId,
+        payloadSha256,
+        bounceDetails,
       });
 
-      if (dupCheck.duplicate) {
-        return res.status(200).json({ received: true, deduplicated: true });
-      }
-
-      let reconciled = false;
-      if (providerMessageId && eventType === 'email.delivered') {
-        const result = await recordProviderDeliveryConfirmation(providerMessageId, 'Delivered');
-        reconciled = result.updated;
-      } else if (providerMessageId && (eventType === 'email.bounced' || eventType === 'email.complained')) {
-        const details = payload.data?.bounce?.message || `Resend event: ${eventType}`;
-        const result = await recordProviderDeliveryConfirmation(providerMessageId, 'Bounced', details);
-        reconciled = result.updated;
+      if (atomicResult.deduplicated) {
+        return res.status(200).json({ received: true, deduplicated: true, reconciled: false });
       }
 
       res.status(200).json({
@@ -4272,7 +4255,7 @@ export function createApp(options: CreateAppOptions = {}) {
         deduplicated: false,
         eventType,
         providerMessageId,
-        reconciled,
+        reconciled: atomicResult.reconciled,
       });
     },
   );

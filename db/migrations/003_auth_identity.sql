@@ -76,7 +76,10 @@ CREATE POLICY users_self_or_admin_select ON users
   USING (
     app_current_role() = 'admin'
     OR id = app_current_user_id()
-    OR supabase_user_id = auth.uid()
+    OR (
+      app_resolve_provider_uid() IS NOT NULL
+      AND supabase_user_id = app_resolve_provider_uid()
+    )
   );
 
 DROP POLICY IF EXISTS invitations_admin_only ON staff_vendor_invitations;

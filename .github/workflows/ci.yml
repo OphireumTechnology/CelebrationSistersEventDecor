@@ -59,7 +59,9 @@ jobs:
         run: npx tsx scripts/reconcile-snapshot-to-normalized.ts
 
       - name: TypeScript typecheck and Oxlint
-        run: npm run lint
+        run: |
+          npm run typecheck
+          npm run lint
 
       - name: Automated unit, integration & security regression tests
         run: npm test

@@ -26,6 +26,7 @@ All non-secret variable declarations are documented in `.env.example`. Configure
 | `EMAIL_FROM` | Yes (for live email) | Verified sender identity on `celebrationsistersdecor.com` |
 | `EMAIL_LIVE_DELIVERY_ENABLED=true` | Only after Staging Verification | Explicit gate allowing live external email dispatch |
 | `RESEND_WEBHOOK_SECRET` | Yes (for delivery reconciliation) | Svix signing secret (`whsec_...`) for `POST /api/webhooks/resend` |
+| `STAFF_NOTIFICATION_EMAIL` | Yes (for live studio alerts) | Internal Columbia, SC studio alert recipient address |
 
 ---
 
@@ -39,9 +40,8 @@ Because `.git` and `gh` CLI are not present in this sandbox:
 4. Push branch and open a Pull Request targeting `main`; confirm GitHub Actions CI (`CI Verification & Production Hardening Checks` + `Docker Production Image Build Check`) passes green.
 
 ### Stage 2: Staging Database & Railway Backend Verification
-1. On fresh vanilla Railway PostgreSQL (without Supabase `auth` schema), apply the 4-line `auth.uid()` shim documented in `docs/phase15/02_DATABASE_VALIDATION.md`.
-2. Apply migrations `001` through `008` with `psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f <file>` and re-run `008` once to verify live idempotency.
-3. Deploy the PR branch to Railway Staging with `DATABASE_CA_CERT` / `DATABASE_CA_CERT_BASE64`, `RESEND_API_KEY`, and `RESEND_WEBHOOK_SECRET`.
+1. Apply migrations `001` through `008` cleanly in order on fresh vanilla Railway PostgreSQL or Supabase PostgreSQL with `psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f <file>` (no manual `auth` schema shim required after Phase 15R) and re-run `008` once to verify live idempotency.
+2. Deploy the PR branch to Railway Staging with `DATABASE_CA_CERT` / `DATABASE_CA_CERT_BASE64`, `RESEND_API_KEY`, `EMAIL_FROM`, `RESEND_WEBHOOK_SECRET`, and `STAFF_NOTIFICATION_EMAIL`.
 4. Verify `/health` (`200`), `/ready` (`200` with `tls.rejectUnauthorized === true` and zero cert-chain errors), and outbox worker polling heartbeats.
 5. Register `https://<staging-backend>/api/webhooks/resend` in Resend Dashboard and execute a live consultation booking -> verify real inbox delivery -> verify signed webhook transitions job from `ProviderAccepted` to `Delivered`.
 6. Execute live reschedule, client detail update, proposal handoff, admin dead-letter retry, and token revocation in staging.

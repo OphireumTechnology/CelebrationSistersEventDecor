@@ -38,21 +38,14 @@
 
 ---
 
-## 3. Vanilla Railway PostgreSQL Bootstrap Compatibility Finding
+## 3. Vanilla Railway PostgreSQL Bootstrap Compatibility (Phase 15R Resolved)
 
-During our Phase 15 audit of historical migrations `001`–`008`, we verified an important deployment prerequisite:
-- Historical migrations `002_rls_policies.sql` (line 9), `003_auth_identity.sql` (line 79), and `005_rls_event_planner_and_invoices.sql` (lines 21–22) reference `auth.uid()` directly inside policy helper functions, whereas `007_consultation_scheduling_and_railway_rls.sql` introduces `public.auth_uid_safe()` (which checks `current_setting('app.current_user_id', true)` and only falls back to `auth.uid()` if the Supabase `auth` schema exists).
-- **Supabase PostgreSQL:** Already defines `auth.uid()`, so `001`–`008` execute cleanly in order.
-- **Fresh Vanilla Railway PostgreSQL (no `auth` schema):** Before applying `002` on a brand-new vanilla Railway PostgreSQL instance, run the following non-destructive 4-line compatibility shim once (without altering or weakening RLS):
+During Phase 15R repair of migrations `001`–`008`:
+- Historical unconditional `auth.uid()` calls in `002_rls_policies.sql`, `003_auth_identity.sql`, and `005_rls_event_planner_and_invoices.sql` were replaced with `app_resolve_provider_uid()`, which checks `to_regprocedure('auth.uid()') IS NOT NULL` before executing `SELECT auth.uid()` and otherwise returns `NULL` (fail-closed).
+- **Zero manual `auth` schema shim is required** on either fresh vanilla Railway PostgreSQL or Supabase PostgreSQL.
+- `008_phase15_token_lifecycle_and_webhook_audit.sql` adds `notification_outbox_ops_admin` and least-privilege `notification_outbox_worker_scoped` (`app_current_role() = 'notification_worker'`) policies so `FORCE ROW LEVEL SECURITY` operates safely for non-superuser ops and outbox workers.
 
-```sql
-CREATE SCHEMA IF NOT EXISTS auth;
-CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$
-  SELECT NULLIF(current_setting('app.current_user_id', true), '')::uuid;
-$$;
-```
-
-Then apply `001` through `008` in exact lexical order:
+Apply `001` through `008` in exact lexical order:
 
 ```bash
 for f in db/migrations/00*.sql; do
