@@ -155,6 +155,27 @@ export function addDaysIso(dateIso: string, days: number): string {
   return dt.toISOString().slice(0, 10);
 }
 
+/**
+ * Evaluates major US federal studio holidays (New Year's Day, Memorial Day,
+ * Independence Day, Labor Day, Thanksgiving, Christmas Day) deterministically for any year.
+ */
+export function getStudioHolidayReason(dateIso: string): string | null {
+  const [y, m, d] = dateIso.split('-').map(Number);
+  if (!y || !m || !d) return null;
+  if (m === 1 && d === 1) return "New Year's Day — Studio Closed";
+  if (m === 7 && d === 4) return 'Independence Day — Studio Closed';
+  if (m === 12 && d === 25) return 'Christmas Day — Studio Closed';
+
+  const dow = getDayOfWeekForIsoDate(dateIso);
+  // Memorial Day: Last Monday of May (May 25-31)
+  if (m === 5 && dow === 1 && d >= 25) return 'Memorial Day — Studio Closed';
+  // Labor Day: First Monday of September (Sep 1-7)
+  if (m === 9 && dow === 1 && d <= 7) return 'Labor Day — Studio Closed';
+  // Thanksgiving Day: Fourth Thursday of November (Nov 22-28)
+  if (m === 11 && dow === 4 && d >= 22 && d <= 28) return 'Thanksgiving Day — Studio Closed';
+  return null;
+}
+
 function parseMinutesOfDay(hhmm: string): number {
   const [h, m] = hhmm.split(':').map(Number);
   return h * 60 + m;
@@ -272,15 +293,16 @@ export function computeConsultationAvailability(params: {
   for (let offset = 0; offset < safeDays; offset += 1) {
     const dateIso = addDaysIso(params.startDate, offset);
     const blackout = params.blackoutDates.find((b) => b.date === dateIso);
+    const holidayReason = blackout ? null : getStudioHolidayReason(dateIso);
     const dow = getDayOfWeekForIsoDate(dateIso);
 
-    if (blackout) {
+    if (blackout || holidayReason) {
       results.push({
         date: dateIso,
         studioTimezone: STUDIO_TIMEZONE,
         clientTimezone: safeClientTz,
         isBlackout: true,
-        blackoutReason: blackout.reason,
+        blackoutReason: blackout ? blackout.reason : holidayReason || 'Studio Holiday Closure',
         isStudioOpen: false,
         availableCount: 0,
         slots: [],
@@ -436,11 +458,12 @@ export function validateRequestedConsultationSlot(params: {
   const studioMins = Number(partMap.hour) * 60 + Number(partMap.minute);
 
   const blackout = params.blackoutDates.find((b) => b.date === studioDateIso);
-  if (blackout) {
+  const holidayReason = blackout ? null : getStudioHolidayReason(studioDateIso);
+  if (blackout || holidayReason) {
     return {
       valid: false,
       errorCode: 'BLACKOUT',
-      error: `Studio is closed on ${studioDateIso} (${blackout.reason}). Please select another consultation date.`,
+      error: `Studio is closed on ${studioDateIso} (${blackout ? blackout.reason : holidayReason}). Please select another consultation date.`,
     };
   }
 
@@ -527,4 +550,46 @@ export function verifyConsultationAccessToken(
   const b = Buffer.from(storedHash, 'utf8');
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
+}
+
+export interface ConsultationTokenCheckResult {
+  valid: boolean;
+  code?: 'INVALID_CONSULTATION_TOKEN' | 'TOKEN_REVOKED' | 'TOKEN_EXPIRED';
+  error?: string;
+}
+
+/**
+ * Verifies a consultation's scoped public access token against its stored SHA-256 hash
+ * AND enforces explicit revocation and expiration boundaries.
+ */
+export function validateConsultationTokenAccess(
+  consultation: Pick<ConsultationAppointment, 'accessTokenHash' | 'accessTokenExpiresAt' | 'accessTokenRevokedAt'>,
+  providedToken: string | undefined,
+  nowMs: number = Date.now(),
+): ConsultationTokenCheckResult {
+  if (!verifyConsultationAccessToken(providedToken, consultation.accessTokenHash)) {
+    return {
+      valid: false,
+      code: 'INVALID_CONSULTATION_TOKEN',
+      error: 'Consultation record not found or verification token is invalid.',
+    };
+  }
+  if (consultation.accessTokenRevokedAt) {
+    return {
+      valid: false,
+      code: 'TOKEN_REVOKED',
+      error: 'This consultation verification token has been revoked. Please sign in or contact our studio.',
+    };
+  }
+  if (consultation.accessTokenExpiresAt) {
+    const expMs = new Date(consultation.accessTokenExpiresAt).getTime();
+    if (!Number.isNaN(expMs) && expMs <= nowMs) {
+      return {
+        valid: false,
+        code: 'TOKEN_EXPIRED',
+        error: 'This consultation verification token has expired. Please sign in or contact our studio for assistance.',
+      };
+    }
+  }
+  return { valid: true };
 }

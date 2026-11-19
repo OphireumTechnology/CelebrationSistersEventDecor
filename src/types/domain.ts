@@ -492,6 +492,9 @@ export interface ConsultationAppointment {
   privacyConsentVersion: string;
   /** SHA-256 hash of scoped public verification token; raw token is never persisted. */
   accessTokenHash: string;
+  accessTokenExpiresAt?: string;
+  accessTokenRevokedAt?: string;
+  contactUpdatedAt?: string;
   idempotencyKey?: string;
   outcomeSummary?: string;
   clientDecision?: 'Pending' | 'Approved' | 'Declined' | 'Revision Requested';
@@ -522,4 +525,16 @@ export interface CrmFollowUpTask {
   completedAt?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface NotificationWebhookEvent {
+  id: string;
+  provider: 'resend';
+  svixId: string;
+  eventType: string;
+  providerMessageId?: string;
+  signatureVerified: boolean;
+  payloadSha256: string;
+  status: 'processed' | 'ignored' | 'duplicate';
+  receivedAt: string;
 }

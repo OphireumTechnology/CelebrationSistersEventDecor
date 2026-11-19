@@ -38,6 +38,71 @@ export function escapeHtml(raw: string): string {
     .replace(/'/g, '&#39;');
 }
 
+export interface ResendWebhookVerificationResult {
+  valid: boolean;
+  reason?: string;
+}
+
+/**
+ * Verifies Resend (Svix) webhook HMAC-SHA256 signatures with constant-time comparison
+ * and replay-window enforcement (±5 minutes by default).
+ */
+export function verifyResendWebhookSignature(params: {
+  rawBody: string;
+  svixId: string;
+  svixTimestamp: string;
+  svixSignature: string;
+  webhookSecret: string;
+  nowSeconds?: number;
+  toleranceSeconds?: number;
+}): ResendWebhookVerificationResult {
+  const { rawBody, svixId, svixTimestamp, svixSignature, webhookSecret } = params;
+  if (!webhookSecret || !webhookSecret.trim()) {
+    return { valid: false, reason: 'RESEND_WEBHOOK_SECRET is not configured.' };
+  }
+  if (!svixId || !svixTimestamp || !svixSignature) {
+    return { valid: false, reason: 'Missing required svix-id, svix-timestamp, or svix-signature headers.' };
+  }
+
+  const tsSec = Number(svixTimestamp);
+  if (!Number.isFinite(tsSec)) {
+    return { valid: false, reason: 'Invalid svix-timestamp header.' };
+  }
+  const nowSec = params.nowSeconds ?? Math.floor(Date.now() / 1000);
+  const tolerance = params.toleranceSeconds ?? 300;
+  if (Math.abs(nowSec - tsSec) > tolerance) {
+    return { valid: false, reason: 'Webhook timestamp outside allowed replay tolerance window.' };
+  }
+
+  const cleanSecret = webhookSecret.trim().startsWith('whsec_')
+    ? webhookSecret.trim().slice('whsec_'.length)
+    : webhookSecret.trim();
+  const keyBytes = Buffer.from(cleanSecret, 'base64');
+  if (keyBytes.length === 0) {
+    return { valid: false, reason: 'Invalid webhook signing secret encoding.' };
+  }
+
+  const signedContent = `${svixId}.${svixTimestamp}.${rawBody}`;
+  const expectedBase64 = crypto.createHmac('sha256', keyBytes).update(signedContent, 'utf8').digest('base64');
+  const expectedBuf = Buffer.from(expectedBase64, 'utf8');
+
+  const candidates = svixSignature
+    .split(/\s+/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  for (const candidate of candidates) {
+    const [version, sigValue] = candidate.split(',');
+    if (version !== 'v1' || !sigValue) continue;
+    const providedBuf = Buffer.from(sigValue, 'utf8');
+    if (providedBuf.length === expectedBuf.length && crypto.timingSafeEqual(providedBuf, expectedBuf)) {
+      return { valid: true };
+    }
+  }
+
+  return { valid: false, reason: 'Webhook HMAC signature verification failed.' };
+}
+
 export function getEmailProviderStatus(): EmailProviderStatus {
   const apiKey = (process.env.RESEND_API_KEY || '').trim();
   const fromAddress = (process.env.EMAIL_FROM || '').trim();

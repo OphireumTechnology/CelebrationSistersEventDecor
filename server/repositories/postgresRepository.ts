@@ -1,17 +1,29 @@
+import fs from 'node:fs';
+import type { ConnectionOptions } from 'node:tls';
 import { Pool, type QueryResult, type QueryResultRow } from 'pg';
 import type { DatabaseSchema } from '../store.ts';
 
 /**
  * Production PostgreSQL / Supabase Repository Adapter & Startup Readiness Guard.
- * Ensures production deployments NEVER silently fall back to local JSON persistence
+ * Ensures production deployments NEVER silently fall back to local JSON persistence,
+ * enforce verified TLS certificate chains (never weakening rejectUnauthorized),
  * and perform genuine transactional CRUD + live readiness verification against PostgreSQL.
  */
+
+export interface PostgresTlsDiagnostics {
+  enabled: boolean;
+  rejectUnauthorized: boolean;
+  caSource: 'none' | 'DATABASE_CA_CERT' | 'DATABASE_CA_CERT_BASE64' | 'PGSSLROOTCERT';
+  hostClass: 'localhost' | 'railway-internal' | 'public-network' | 'unknown';
+  sslMode: string;
+}
 
 export interface PersistenceReadinessStatus {
   adapter: 'json-local' | 'postgres';
   ready: boolean;
   connected?: boolean;
   latencyMs?: number;
+  tls?: PostgresTlsDiagnostics;
   reason: string;
 }
 
@@ -36,6 +48,143 @@ export function setInjectedPgPoolForTests(pool: PgPoolLike | null): void {
   injectedPoolForTests = pool;
 }
 
+function classifyPostgresHost(hostname: string): PostgresTlsDiagnostics['hostClass'] {
+  const lower = hostname.toLowerCase();
+  if (!lower) return 'unknown';
+  if (lower === 'localhost' || lower === '127.0.0.1' || lower === '::1') return 'localhost';
+  if (lower.endsWith('.railway.internal')) return 'railway-internal';
+  return 'public-network';
+}
+
+function loadVerifiedCaPem(env: NodeJS.ProcessEnv): {
+  ca?: string;
+  source: PostgresTlsDiagnostics['caSource'];
+} {
+  const inlinePem = (env.DATABASE_CA_CERT || '').trim();
+  if (inlinePem) {
+    const normalized = inlinePem.includes('\\n') ? inlinePem.replace(/\\n/g, '\n') : inlinePem;
+    if (!normalized.includes('-----BEGIN CERTIFICATE-----')) {
+      throw new Error('TLS_CONFIG_FAILURE: DATABASE_CA_CERT does not contain a valid PEM certificate.');
+    }
+    return { ca: normalized, source: 'DATABASE_CA_CERT' };
+  }
+
+  const base64Pem = (env.DATABASE_CA_CERT_BASE64 || '').trim();
+  if (base64Pem) {
+    const decoded = Buffer.from(base64Pem, 'base64').toString('utf8').trim();
+    if (!decoded.includes('-----BEGIN CERTIFICATE-----')) {
+      throw new Error('TLS_CONFIG_FAILURE: DATABASE_CA_CERT_BASE64 did not decode to a valid PEM certificate.');
+    }
+    return { ca: decoded, source: 'DATABASE_CA_CERT_BASE64' };
+  }
+
+  const rootCertPath = (env.PGSSLROOTCERT || '').trim();
+  if (rootCertPath) {
+    if (!fs.existsSync(rootCertPath)) {
+      throw new Error(`TLS_CONFIG_FAILURE: PGSSLROOTCERT path does not exist (${rootCertPath}).`);
+    }
+    const pem = fs.readFileSync(rootCertPath, 'utf8').trim();
+    if (!pem.includes('-----BEGIN CERTIFICATE-----')) {
+      throw new Error('TLS_CONFIG_FAILURE: PGSSLROOTCERT file does not contain a valid PEM certificate.');
+    }
+    return { ca: pem, source: 'PGSSLROOTCERT' };
+  }
+
+  return { ca: undefined, source: 'none' };
+}
+
+/**
+ * Resolves secure PostgreSQL TLS configuration and strips conflicting query-string sslmode
+ * parameters so node-postgres never silently overrides verified certificate settings.
+ *
+ * Security invariants:
+ * - Certificate verification (`rejectUnauthorized: true`) is NEVER disabled in production.
+ * - Custom managed PostgreSQL / Railway / Supabase CA bundles are loaded from
+ *   `DATABASE_CA_CERT`, `DATABASE_CA_CERT_BASE64`, or `PGSSLROOTCERT`.
+ * - Non-TLS connections are permitted ONLY for loopback (`localhost`/`127.0.0.1`) OR
+ *   private WireGuard `.railway.internal` hosts when explicitly configured with `PGSSLMODE=disable`.
+ */
+export function buildPostgresSslConfig(
+  databaseUrl: string,
+  env: NodeJS.ProcessEnv = process.env,
+): {
+  sanitizedConnectionString: string;
+  ssl: ConnectionOptions | undefined;
+  diagnostics: PostgresTlsDiagnostics;
+} {
+  if ((env.PG_SSL_REJECT_UNAUTHORIZED || '').toLowerCase() === 'false') {
+    throw new Error(
+      'TLS_CONFIG_FAILURE: Disabling PostgreSQL TLS certificate verification (PG_SSL_REJECT_UNAUTHORIZED=false) is prohibited. Configure DATABASE_CA_CERT, DATABASE_CA_CERT_BASE64, or PGSSLROOTCERT with the provider root CA instead.',
+    );
+  }
+
+  let parsedUrl: URL | null = null;
+  let querySslMode = '';
+  let hostname = '';
+  try {
+    parsedUrl = new URL(databaseUrl);
+    hostname = parsedUrl.hostname || '';
+    querySslMode = (parsedUrl.searchParams.get('sslmode') || '').trim().toLowerCase();
+  } catch {
+    hostname = '';
+  }
+
+  const hostClass = classifyPostgresHost(hostname);
+  const sslMode = (env.PGSSLMODE || querySslMode || (hostClass === 'localhost' ? 'disable' : 'verify-full')).toLowerCase();
+
+  if (sslMode === 'no-verify') {
+    throw new Error(
+      'TLS_CONFIG_FAILURE: sslmode=no-verify is prohibited. Use verify-full or verify-ca with a verified provider CA bundle.',
+    );
+  }
+
+  // Strip sslmode from URL query string after parsing so pg does not silently downgrade ssl options
+  let sanitizedConnectionString = databaseUrl;
+  if (parsedUrl && parsedUrl.searchParams.has('sslmode')) {
+    parsedUrl.searchParams.delete('sslmode');
+    sanitizedConnectionString = parsedUrl.toString();
+  }
+
+  if (sslMode === 'disable') {
+    if (hostClass === 'public-network' && env.NODE_ENV === 'production') {
+      throw new Error(
+        'TLS_CONFIG_FAILURE: PGSSLMODE=disable is prohibited for public-network PostgreSQL hosts in production.',
+      );
+    }
+    return {
+      sanitizedConnectionString,
+      ssl: undefined,
+      diagnostics: {
+        enabled: false,
+        rejectUnauthorized: false,
+        caSource: 'none',
+        hostClass,
+        sslMode: 'disable',
+      },
+    };
+  }
+
+  const { ca, source } = loadVerifiedCaPem(env);
+  const ssl: ConnectionOptions = {
+    rejectUnauthorized: true,
+    minVersion: 'TLSv1.2',
+    ...(ca ? { ca } : {}),
+    ...(hostname ? { servername: hostname } : {}),
+  };
+
+  return {
+    sanitizedConnectionString,
+    ssl,
+    diagnostics: {
+      enabled: true,
+      rejectUnauthorized: true,
+      caSource: source,
+      hostClass,
+      sslMode,
+    },
+  };
+}
+
 export function getPersistenceAdapterMode(): 'json-local' | 'postgres' {
   const isProd = process.env.NODE_ENV === 'production';
   const adapterPref = (process.env.PERSISTENCE_ADAPTER || (isProd ? 'postgres' : 'json-local')).toLowerCase();
@@ -45,7 +194,8 @@ export function getPersistenceAdapterMode(): 'json-local' | 'postgres' {
 export function getPersistenceStatus(): PersistenceReadinessStatus {
   const isProd = process.env.NODE_ENV === 'production';
   const adapterPref = (process.env.PERSISTENCE_ADAPTER || (isProd ? 'postgres' : 'json-local')).toLowerCase();
-  const hasDatabaseUrl = Boolean(process.env.DATABASE_URL && process.env.DATABASE_URL.trim().length > 0);
+  const databaseUrl = (process.env.DATABASE_URL || '').trim();
+  const hasDatabaseUrl = databaseUrl.length > 0;
 
   if (adapterPref === 'postgres') {
     if (!hasDatabaseUrl && !injectedPoolForTests) {
@@ -56,10 +206,30 @@ export function getPersistenceStatus(): PersistenceReadinessStatus {
         reason: 'PERSISTENCE_ADAPTER=postgres requires DATABASE_URL to be configured.',
       };
     }
+
+    if (hasDatabaseUrl) {
+      try {
+        const tlsConfig = buildPostgresSslConfig(databaseUrl);
+        return {
+          adapter: 'postgres',
+          ready: true,
+          tls: tlsConfig.diagnostics,
+          reason: 'PostgreSQL connection string and verified TLS configuration ready; migrations 001-008 supported.',
+        };
+      } catch (err) {
+        return {
+          adapter: 'postgres',
+          ready: false,
+          connected: false,
+          reason: err instanceof Error ? err.message : 'Invalid PostgreSQL TLS configuration.',
+        };
+      }
+    }
+
     return {
       adapter: 'postgres',
       ready: true,
-      reason: 'PostgreSQL connection string configured; migrations 001-007 supported.',
+      reason: 'PostgreSQL test pool injected; migrations 001-008 supported.',
     };
   }
 
@@ -97,23 +267,21 @@ export function getPgPool(): PgPoolLike {
     throw new Error('DATABASE_URL is not configured for PostgreSQL persistence.');
   }
 
-  if (sharedPool && sharedPoolUrl === databaseUrl) {
+  const cacheKey = `${databaseUrl}|${process.env.PGSSLMODE || ''}|${process.env.PGSSLROOTCERT || ''}|${Boolean(process.env.DATABASE_CA_CERT)}|${Boolean(process.env.DATABASE_CA_CERT_BASE64)}`;
+  if (sharedPool && sharedPoolUrl === cacheKey) {
     return sharedPool;
   }
 
-  const useSsl =
-    !databaseUrl.includes('localhost') &&
-    !databaseUrl.includes('127.0.0.1') &&
-    process.env.PGSSLMODE !== 'disable';
+  const tlsResolved = buildPostgresSslConfig(databaseUrl);
 
   const pool = new Pool({
-    connectionString: databaseUrl,
+    connectionString: tlsResolved.sanitizedConnectionString,
     max: Number(process.env.PG_POOL_MAX) || 10,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: Number(process.env.PG_CONNECT_TIMEOUT_MS) || 5_000,
     statement_timeout: Number(process.env.PG_STATEMENT_TIMEOUT_MS) || 10_000,
     query_timeout: Number(process.env.PG_QUERY_TIMEOUT_MS) || 12_000,
-    ssl: useSsl ? { rejectUnauthorized: process.env.PG_SSL_REJECT_UNAUTHORIZED !== 'false' } : undefined,
+    ssl: tlsResolved.ssl,
   });
 
   // Prevent unhandled idle-client disconnect errors from crashing the Express process during DB restarts
@@ -126,7 +294,7 @@ export function getPgPool(): PgPoolLike {
   });
 
   sharedPool = pool;
-  sharedPoolUrl = databaseUrl;
+  sharedPoolUrl = cacheKey;
   return sharedPool;
 }
 
@@ -157,6 +325,7 @@ export async function checkPersistenceHealth(): Promise<PersistenceReadinessStat
       ready: true,
       connected: true,
       latencyMs: Date.now() - startedAt,
+      tls: baseStatus.tls,
       reason: 'PostgreSQL connection verified via live health query.',
     };
   } catch (err) {
@@ -164,12 +333,20 @@ export async function checkPersistenceHealth(): Promise<PersistenceReadinessStat
       typeof err === 'object' && err && 'code' in err && typeof (err as { code?: unknown }).code === 'string'
         ? (err as { code: string }).code
         : 'DB_UNREACHABLE';
+    const isTlsChainError =
+      code === 'SELF_SIGNED_CERT_IN_CHAIN' ||
+      code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' ||
+      code === 'DEPTH_ZERO_SELF_SIGNED_CERT' ||
+      code === 'ERR_TLS_CERT_ALTNAME_INVALID';
     return {
       adapter: 'postgres',
       ready: false,
       connected: false,
       latencyMs: Date.now() - startedAt,
-      reason: `PostgreSQL connectivity check failed (${code}).`,
+      tls: baseStatus.tls,
+      reason: isTlsChainError
+        ? `PostgreSQL TLS certificate chain verification failed (${code}). Configure DATABASE_CA_CERT, DATABASE_CA_CERT_BASE64, or PGSSLROOTCERT with your provider CA bundle.`
+        : `PostgreSQL connectivity check failed (${code}).`,
     };
   }
 }

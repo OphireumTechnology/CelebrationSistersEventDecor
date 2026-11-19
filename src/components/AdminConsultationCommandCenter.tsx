@@ -19,6 +19,8 @@ import {
   type ConsultationAppointment,
   type ConsultationMethod,
   type CrmFollowUpTask,
+  type CrmPipelineStage,
+  type NotificationWebhookEvent,
   type OutboxNotificationJob,
   type StaffAvailabilityRule,
   type UserRole,
@@ -38,6 +40,25 @@ interface ConsultationMetrics {
   overdueFollowUps: number;
 }
 
+interface ConversionAnalytics {
+  totalLeads: number;
+  qualifiedRatePct: number;
+  completionRatePct: number;
+  proposalRatePct: number;
+  bookingConversionRatePct: number;
+}
+
+interface PlannerWorkloadItem {
+  plannerId: string;
+  plannerName: string;
+  role: UserRole;
+  activeUpcoming: number;
+  pendingReview: number;
+  completedCount: number;
+  bookedCount: number;
+  openFollowUps: number;
+}
+
 interface PlannerOption {
   id: string;
   name: string;
@@ -48,11 +69,14 @@ interface PlannerOption {
 interface CommandCenterPayload {
   consultations: ConsultationAppointment[];
   metrics: ConsultationMetrics;
+  conversionAnalytics?: ConversionAnalytics;
+  plannerWorkload?: PlannerWorkloadItem[];
   planners: PlannerOption[];
   staffAvailabilityRules: StaffAvailabilityRule[];
   crmFollowUpTasks: CrmFollowUpTask[];
   blackoutDates: BlackoutDate[];
   notificationOutbox: OutboxNotificationJob[];
+  notificationWebhookEvents?: NotificationWebhookEvent[];
   auditLogs: AuditLogEntry[];
 }
 
@@ -127,6 +151,15 @@ export function AdminConsultationCommandCenter({
     const dt = new Date(Date.now() + 3 * 24 * 60 * 60_000);
     return dt.toISOString().slice(0, 10);
   });
+
+  // Admin inline reschedule state
+  const [adminRescheduleOpen, setAdminRescheduleOpen] = useState(false);
+  const [adminRescheduleSlots, setAdminRescheduleSlots] = useState<
+    Array<{ slotId: string; startUtc: string; plannerId: string; plannerName: string; studioDisplayLabel: string; dateLocal: string }>
+  >([]);
+  const [adminSelectedSlotUtc, setAdminSelectedSlotUtc] = useState('');
+  const [adminRescheduleReason, setAdminRescheduleReason] = useState('Rescheduled by studio coordinator');
+  const [outboxStatusFilter, setOutboxStatusFilter] = useState<string>('ALL');
 
   // Staff availability editor state
   const [editingPlannerId, setEditingPlannerId] = useState<string>('');
@@ -336,6 +369,79 @@ export function AdminConsultationCommandCenter({
     );
     if (ok) setNewTaskTitle('');
   };
+
+  const openAdminReschedule = async () => {
+    if (!selectedConsultation) return;
+    setAdminRescheduleOpen(true);
+    setAdminSelectedSlotUtc('');
+    try {
+      const startDate = new Date().toISOString().slice(0, 10);
+      const params = new URLSearchParams({
+        startDate,
+        days: '14',
+        timezone: 'America/New_York',
+        method: selectedConsultation.method,
+        excludeConsultationId: selectedConsultation.id,
+      });
+      const res = await apiFetch(`/api/consultations/availability?${params.toString()}`, { credentials: 'include' });
+      const json = await res.json();
+      const flatSlots: Array<{
+        slotId: string;
+        startUtc: string;
+        plannerId: string;
+        plannerName: string;
+        studioDisplayLabel: string;
+        dateLocal: string;
+      }> = [];
+      for (const day of json.days || []) {
+        for (const s of day.slots || []) {
+          if (s.available) {
+            flatSlots.push({
+              slotId: s.slotId,
+              startUtc: s.startUtc,
+              plannerId: s.plannerId,
+              plannerName: s.plannerName,
+              studioDisplayLabel: s.studioDisplayLabel,
+              dateLocal: s.dateLocal,
+            });
+          }
+        }
+      }
+      setAdminRescheduleSlots(flatSlots.slice(0, 24));
+      if (flatSlots[0]) setAdminSelectedSlotUtc(flatSlots[0].startUtc);
+    } catch {
+      setFeedback({ type: 'err', text: 'Unable to load available reschedule slots.' });
+    }
+  };
+
+  const handleAdminRescheduleSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!selectedConsultation || !adminSelectedSlotUtc) return;
+    const picked = adminRescheduleSlots.find((s) => s.startUtc === adminSelectedSlotUtc);
+    const ok = await runAction(
+      `/api/consultations/${selectedConsultation.id}/reschedule`,
+      'POST',
+      {
+        newStartUtc: adminSelectedSlotUtc,
+        plannerId: picked?.plannerId || selectedConsultation.assignedPlannerId,
+        reason: adminRescheduleReason.trim() || 'Rescheduled by studio coordinator',
+      },
+      `Rescheduled ${selectedConsultation.referenceCode} and released previous slot.`,
+    );
+    if (ok) setAdminRescheduleOpen(false);
+  };
+
+  const filteredOutboxJobs = useMemo(() => {
+    if (!data) return [];
+    if (outboxStatusFilter === 'ALL') return data.notificationOutbox;
+    if (outboxStatusFilter === 'ACTIVE') {
+      return data.notificationOutbox.filter((j) => j.status === 'Pending' || j.status === 'Retrying');
+    }
+    if (outboxStatusFilter === 'SKIPPED') {
+      return data.notificationOutbox.filter((j) => j.status.startsWith('Skipped'));
+    }
+    return data.notificationOutbox.filter((j) => j.status === outboxStatusFilter);
+  }, [data, outboxStatusFilter]);
 
   const metrics = data?.metrics;
 
@@ -563,6 +669,20 @@ export function AdminConsultationCommandCenter({
                     <dt className="text-[var(--cs-charcoal-muted)]">Venue</dt>
                     <dd className="font-medium mt-0.5 truncate">{selectedConsultation.venueName}</dd>
                   </div>
+                  <div>
+                    <dt className="text-[var(--cs-charcoal-muted)]">Theme / Palette</dt>
+                    <dd className="font-medium mt-0.5 truncate">{selectedConsultation.eventTheme || 'Not specified'}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-[var(--cs-charcoal-muted)]">Contact Preference</dt>
+                    <dd className="font-medium mt-0.5 uppercase">{selectedConsultation.preferredContactMethod}</dd>
+                  </div>
+                  {selectedConsultation.consultationNotes && (
+                    <div className="col-span-2 pt-2 border-t border-[var(--cs-border)]">
+                      <dt className="text-[var(--cs-charcoal-muted)]">Client Vision & Requirements</dt>
+                      <dd className="text-[var(--cs-charcoal)] mt-0.5">{selectedConsultation.consultationNotes}</dd>
+                    </div>
+                  )}
                 </dl>
 
                 {/* Quick Lifecycle & Assignment Controls */}
@@ -587,6 +707,15 @@ export function AdminConsultationCommandCenter({
                     {['Pending', 'Confirmed', 'Rescheduled'].includes(selectedConsultation.status) && (
                       <button
                         type="button"
+                        onClick={() => (adminRescheduleOpen ? setAdminRescheduleOpen(false) : openAdminReschedule())}
+                        className="min-h-[40px] px-3.5 py-2 text-xs font-medium border border-[var(--cs-purple)] text-[var(--cs-purple)] hover:bg-[var(--cs-purple-soft)] rounded-md cursor-pointer"
+                      >
+                        {adminRescheduleOpen ? 'Close Reschedule' : 'Reschedule Slot'}
+                      </button>
+                    )}
+                    {['Pending', 'Confirmed', 'Rescheduled'].includes(selectedConsultation.status) && (
+                      <button
+                        type="button"
                         onClick={() =>
                           runAction(
                             `/api/consultations/${selectedConsultation.id}/cancel`,
@@ -602,28 +731,89 @@ export function AdminConsultationCommandCenter({
                     )}
                   </div>
 
-                  <div>
-                    <label className="block text-xs font-medium text-[var(--cs-charcoal)] mb-1">
-                      Assigned Lead Planner
-                    </label>
-                    <select
-                      value={selectedConsultation.assignedPlannerId}
-                      onChange={(e) =>
-                        runAction(
-                          `/api/consultations/${selectedConsultation.id}/assign`,
-                          'PATCH',
-                          { plannerId: e.target.value },
-                          `Reassigned planner for ${selectedConsultation.referenceCode}.`,
-                        )
-                      }
-                      className="w-full min-h-[40px] px-3 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md bg-white"
+                  {adminRescheduleOpen && (
+                    <form
+                      onSubmit={handleAdminRescheduleSubmit}
+                      className="p-3.5 bg-[var(--cs-ivory)] border border-[var(--cs-border-strong)] rounded-md space-y-2.5 text-xs"
                     >
-                      {data?.planners.map((p) => (
-                        <option key={p.id} value={p.id}>
-                          {p.name} ({p.role})
-                        </option>
-                      ))}
-                    </select>
+                      <p className="font-semibold text-[var(--cs-purple)]">Admin Reschedule (ET Studio Availability)</p>
+                      <select
+                        required
+                        value={adminSelectedSlotUtc}
+                        onChange={(e) => setAdminSelectedSlotUtc(e.target.value)}
+                        className="w-full min-h-[40px] px-2.5 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md bg-white tabular-nums"
+                      >
+                        {adminRescheduleSlots.length === 0 && <option value="">Loading available slots...</option>}
+                        {adminRescheduleSlots.map((slot) => (
+                          <option key={slot.slotId} value={slot.startUtc}>
+                            {slot.dateLocal} · {slot.studioDisplayLabel} ({slot.plannerName})
+                          </option>
+                        ))}
+                      </select>
+                      <input
+                        type="text"
+                        value={adminRescheduleReason}
+                        onChange={(e) => setAdminRescheduleReason(e.target.value)}
+                        placeholder="Reschedule reason"
+                        className="w-full px-2.5 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md bg-white"
+                      />
+                      <button
+                        type="submit"
+                        disabled={!adminSelectedSlotUtc}
+                        className="w-full min-h-[40px] px-3 py-2 text-xs font-medium text-white bg-[var(--cs-purple)] rounded-md cursor-pointer disabled:opacity-50"
+                      >
+                        Confirm Admin Reschedule
+                      </button>
+                    </form>
+                  )}
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                    <div>
+                      <label className="block text-xs font-medium text-[var(--cs-charcoal)] mb-1">
+                        Assigned Lead Planner
+                      </label>
+                      <select
+                        value={selectedConsultation.assignedPlannerId}
+                        onChange={(e) =>
+                          runAction(
+                            `/api/consultations/${selectedConsultation.id}/assign`,
+                            'PATCH',
+                            { plannerId: e.target.value },
+                            `Reassigned planner for ${selectedConsultation.referenceCode}.`,
+                          )
+                        }
+                        className="w-full min-h-[40px] px-3 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md bg-white"
+                      >
+                        {data?.planners.map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.name} ({p.role})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-[var(--cs-charcoal)] mb-1">
+                        Lead Qualification / CRM Stage
+                      </label>
+                      <select
+                        value={selectedConsultation.crmStage}
+                        onChange={(e) =>
+                          runAction(
+                            `/api/consultations/${selectedConsultation.id}/stage`,
+                            'PATCH',
+                            { crmStage: e.target.value as CrmPipelineStage },
+                            `Updated ${selectedConsultation.referenceCode} CRM stage to ${e.target.value}.`,
+                          )
+                        }
+                        className="w-full min-h-[40px] px-3 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md bg-white"
+                      >
+                        {CRM_PIPELINE_STAGES.map((stage) => (
+                          <option key={stage} value={stage}>
+                            {stage}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
                   </div>
                 </div>
 
@@ -716,7 +906,67 @@ export function AdminConsultationCommandCenter({
                 );
               })}
             </div>
+
+            {data.conversionAnalytics && (
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 pt-2 border-t border-[var(--cs-border)]">
+                {[
+                  { label: 'Total Pipeline Leads', value: String(data.conversionAnalytics.totalLeads) },
+                  { label: 'Qualified Rate', value: `${data.conversionAnalytics.qualifiedRatePct}%` },
+                  { label: 'Completion Rate', value: `${data.conversionAnalytics.completionRatePct}%` },
+                  { label: 'Proposal Sent Rate', value: `${data.conversionAnalytics.proposalRatePct}%` },
+                  { label: 'Event Booked Conversion', value: `${data.conversionAnalytics.bookingConversionRatePct}%` },
+                ].map((stat) => (
+                  <div key={stat.label} className="p-3 bg-white border border-[var(--cs-border)] rounded-md">
+                    <p className="text-[11px] text-[var(--cs-charcoal-muted)]">{stat.label}</p>
+                    <p className="font-display text-lg font-semibold text-[var(--cs-purple)] tabular-nums mt-0.5">
+                      {stat.value}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
+
+          {data.plannerWorkload && data.plannerWorkload.length > 0 && (
+            <div className="bg-white border border-[var(--cs-border)] rounded-lg p-5 space-y-3">
+              <div>
+                <h4 className="font-display text-lg font-semibold text-[var(--cs-purple)]">
+                  Planner Workload Distribution
+                </h4>
+                <p className="text-xs text-[var(--cs-charcoal-muted)]">
+                  Active upcoming consultations, review queues, closed bookings, and open follow-up tasks per planner.
+                </p>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs border-collapse">
+                  <thead>
+                    <tr className="border-b border-[var(--cs-border)] text-[var(--cs-charcoal-muted)]">
+                      <th className="py-2 pr-3 font-medium">Planner</th>
+                      <th className="py-2 pr-3 font-medium">Role</th>
+                      <th className="py-2 pr-3 font-medium">Upcoming</th>
+                      <th className="py-2 pr-3 font-medium">Pending</th>
+                      <th className="py-2 pr-3 font-medium">Completed</th>
+                      <th className="py-2 pr-3 font-medium">Event Booked</th>
+                      <th className="py-2 pr-3 font-medium">Open Tasks</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[var(--cs-border)] tabular-nums">
+                    {data.plannerWorkload.map((pw) => (
+                      <tr key={pw.plannerId}>
+                        <td className="py-2 pr-3 font-semibold text-[var(--cs-charcoal)]">{pw.plannerName}</td>
+                        <td className="py-2 pr-3 text-[var(--cs-charcoal-muted)]">{pw.role}</td>
+                        <td className="py-2 pr-3 font-medium text-[var(--cs-purple)]">{pw.activeUpcoming}</td>
+                        <td className="py-2 pr-3">{pw.pendingReview}</td>
+                        <td className="py-2 pr-3">{pw.completedCount}</td>
+                        <td className="py-2 pr-3 font-semibold">{pw.bookedCount}</td>
+                        <td className="py-2 pr-3">{pw.openFollowUps}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
 
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
             <div className="lg:col-span-7 bg-white border border-[var(--cs-border)] rounded-lg p-5 space-y-3">
@@ -994,6 +1244,14 @@ export function AdminConsultationCommandCenter({
           </div>
 
           <form onSubmit={handleSaveStaffSchedule} className="space-y-3">
+            <div className="hidden sm:grid sm:grid-cols-12 gap-2 text-[11px] font-medium text-[var(--cs-charcoal-muted)] pb-1 border-b border-[var(--cs-border)]">
+              <span className="col-span-2">Day</span>
+              <span className="col-span-2">Start (ET)</span>
+              <span className="col-span-2">End (ET)</span>
+              <span className="col-span-2">Duration (min)</span>
+              <span className="col-span-2">Buffer Before</span>
+              <span className="col-span-2">Buffer After</span>
+            </div>
             <div className="divide-y divide-[var(--cs-border)]">
               {editableRules.map((rule, idx) => (
                 <div key={rule.dayOfWeek} className="py-2.5 grid grid-cols-2 sm:grid-cols-12 gap-2 items-center text-xs">
@@ -1012,6 +1270,7 @@ export function AdminConsultationCommandCenter({
                   </label>
                   <input
                     type="time"
+                    aria-label={`${DAY_NAMES[rule.dayOfWeek]} start time`}
                     disabled={!rule.isActive}
                     value={rule.startTimeLocal}
                     onChange={(e) =>
@@ -1019,10 +1278,11 @@ export function AdminConsultationCommandCenter({
                         prev.map((r, i) => (i === idx ? { ...r, startTimeLocal: e.target.value } : r)),
                       )
                     }
-                    className="sm:col-span-3 px-2 py-1.5 border border-[var(--cs-border-strong)] rounded tabular-nums disabled:opacity-45"
+                    className="sm:col-span-2 px-2 py-1.5 border border-[var(--cs-border-strong)] rounded tabular-nums disabled:opacity-45"
                   />
                   <input
                     type="time"
+                    aria-label={`${DAY_NAMES[rule.dayOfWeek]} end time`}
                     disabled={!rule.isActive}
                     value={rule.endTimeLocal}
                     onChange={(e) =>
@@ -1030,13 +1290,59 @@ export function AdminConsultationCommandCenter({
                         prev.map((r, i) => (i === idx ? { ...r, endTimeLocal: e.target.value } : r)),
                       )
                     }
-                    className="sm:col-span-3 px-2 py-1.5 border border-[var(--cs-border-strong)] rounded tabular-nums disabled:opacity-45"
+                    className="sm:col-span-2 px-2 py-1.5 border border-[var(--cs-border-strong)] rounded tabular-nums disabled:opacity-45"
                   />
-                  <span className="sm:col-span-4 text-[11px] text-[var(--cs-charcoal-muted)] tabular-nums">
-                    {rule.isActive
-                      ? `${rule.slotDurationMinutes}m slot · ${rule.bufferBeforeMinutes}m/${rule.bufferAfterMinutes}m buffer`
-                      : 'Day off'}
-                  </span>
+                  <input
+                    type="number"
+                    min={15}
+                    max={180}
+                    step={15}
+                    aria-label={`${DAY_NAMES[rule.dayOfWeek]} slot duration minutes`}
+                    disabled={!rule.isActive}
+                    value={rule.slotDurationMinutes}
+                    onChange={(e) =>
+                      setEditableRules((prev) =>
+                        prev.map((r, i) =>
+                          i === idx ? { ...r, slotDurationMinutes: Math.max(15, Math.min(180, Number(e.target.value))) } : r,
+                        ),
+                      )
+                    }
+                    className="sm:col-span-2 px-2 py-1.5 border border-[var(--cs-border-strong)] rounded tabular-nums disabled:opacity-45"
+                  />
+                  <input
+                    type="number"
+                    min={0}
+                    max={60}
+                    step={5}
+                    aria-label={`${DAY_NAMES[rule.dayOfWeek]} buffer before minutes`}
+                    disabled={!rule.isActive}
+                    value={rule.bufferBeforeMinutes}
+                    onChange={(e) =>
+                      setEditableRules((prev) =>
+                        prev.map((r, i) =>
+                          i === idx ? { ...r, bufferBeforeMinutes: Math.max(0, Math.min(60, Number(e.target.value))) } : r,
+                        ),
+                      )
+                    }
+                    className="sm:col-span-2 px-2 py-1.5 border border-[var(--cs-border-strong)] rounded tabular-nums disabled:opacity-45"
+                  />
+                  <input
+                    type="number"
+                    min={0}
+                    max={60}
+                    step={5}
+                    aria-label={`${DAY_NAMES[rule.dayOfWeek]} buffer after minutes`}
+                    disabled={!rule.isActive}
+                    value={rule.bufferAfterMinutes}
+                    onChange={(e) =>
+                      setEditableRules((prev) =>
+                        prev.map((r, i) =>
+                          i === idx ? { ...r, bufferAfterMinutes: Math.max(0, Math.min(60, Number(e.target.value))) } : r,
+                        ),
+                      )
+                    }
+                    className="sm:col-span-2 px-2 py-1.5 border border-[var(--cs-border-strong)] rounded tabular-nums disabled:opacity-45"
+                  />
                 </div>
               ))}
             </div>
@@ -1091,6 +1397,50 @@ export function AdminConsultationCommandCenter({
             )}
           </div>
 
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap gap-1.5">
+              {[
+                { id: 'ALL', label: `All (${data.notificationOutbox.length})` },
+                {
+                  id: 'ACTIVE',
+                  label: `Pending/Retrying (${data.notificationOutbox.filter((j) => j.status === 'Pending' || j.status === 'Retrying').length})`,
+                },
+                {
+                  id: 'ProviderAccepted',
+                  label: `ProviderAccepted (${data.notificationOutbox.filter((j) => j.status === 'ProviderAccepted').length})`,
+                },
+                {
+                  id: 'Delivered',
+                  label: `Delivered (${data.notificationOutbox.filter((j) => j.status === 'Delivered').length})`,
+                },
+                {
+                  id: 'DeadLetter',
+                  label: `DeadLetter (${data.notificationOutbox.filter((j) => j.status === 'DeadLetter').length})`,
+                },
+                {
+                  id: 'SKIPPED',
+                  label: `Skipped (${data.notificationOutbox.filter((j) => j.status.startsWith('Skipped')).length})`,
+                },
+              ].map((f) => (
+                <button
+                  key={f.id}
+                  type="button"
+                  onClick={() => setOutboxStatusFilter(f.id)}
+                  className={`min-h-[34px] px-2.5 py-1 text-[11px] font-medium rounded border cursor-pointer tabular-nums ${
+                    outboxStatusFilter === f.id
+                      ? 'bg-[var(--cs-purple)] text-white border-[var(--cs-purple)]'
+                      : 'bg-white text-[var(--cs-charcoal-muted)] border-[var(--cs-border)] hover:border-[var(--cs-purple)]'
+                  }`}
+                >
+                  {f.label}
+                </button>
+              ))}
+            </div>
+            <span className="text-[11px] text-[var(--cs-charcoal-muted)] tabular-nums">
+              Signed Resend webhooks reconciled: {data.notificationWebhookEvents?.length ?? 0}
+            </span>
+          </div>
+
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs border-collapse">
               <thead>
@@ -1100,26 +1450,54 @@ export function AdminConsultationCommandCenter({
                   <th className="py-2 pr-3 font-medium">Recipient</th>
                   <th className="py-2 pr-3 font-medium">Status</th>
                   <th className="py-2 pr-3 font-medium">Attempts</th>
+                  <th className="py-2 pr-3 font-medium">Action</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[var(--cs-border)]">
-                {data.notificationOutbox.slice(0, 25).map((job) => (
+                {filteredOutboxJobs.slice(0, 30).map((job) => (
                   <tr key={job.id}>
                     <td className="py-2.5 pr-3 font-semibold text-[var(--cs-purple)] tabular-nums">
                       {job.bookingReference || '—'}
                     </td>
                     <td className="py-2.5 pr-3">{job.category}</td>
                     <td className="py-2.5 pr-3 text-[var(--cs-charcoal-muted)]">{job.recipient}</td>
-                    <td className="py-2.5 pr-3 font-medium">{job.status}</td>
+                    <td className="py-2.5 pr-3">
+                      <span className="font-medium">{job.status}</span>
+                      {job.lastError && (
+                        <p className="text-[10px] text-amber-800 truncate max-w-[220px]" title={job.lastError}>
+                          {job.lastError}
+                        </p>
+                      )}
+                    </td>
                     <td className="py-2.5 pr-3 tabular-nums">
                       {job.attempts}/{job.maxAttempts}
                     </td>
+                    <td className="py-2.5 pr-3">
+                      {currentRole === 'admin' && (job.status === 'DeadLetter' || job.status.startsWith('Skipped')) ? (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            runAction(
+                              `/api/admin/outbox/${job.id}/retry`,
+                              'POST',
+                              { processImmediately: true },
+                              `Requeued and processed notification job ${job.id}.`,
+                            )
+                          }
+                          className="min-h-[32px] px-2.5 py-1 text-[11px] font-medium border border-[var(--cs-purple)] text-[var(--cs-purple)] hover:bg-[var(--cs-purple-soft)] rounded cursor-pointer"
+                        >
+                          Retry
+                        </button>
+                      ) : (
+                        <span className="text-[11px] text-[var(--cs-charcoal-muted)]">—</span>
+                      )}
+                    </td>
                   </tr>
                 ))}
-                {data.notificationOutbox.length === 0 && (
+                {filteredOutboxJobs.length === 0 && (
                   <tr>
-                    <td colSpan={5} className="py-6 text-center text-[var(--cs-charcoal-muted)]">
-                      No outbox notification jobs queued yet.
+                    <td colSpan={6} className="py-6 text-center text-[var(--cs-charcoal-muted)]">
+                      No outbox notification jobs match this filter.
                     </td>
                   </tr>
                 )}

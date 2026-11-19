@@ -52,7 +52,7 @@ jobs:
       - name: Dependency security audit (blocking high/critical threshold)
         run: npm audit --audit-level=high
 
-      - name: Validate SQL migrations 001-007 ordering & RLS coverage
+      - name: Validate SQL migrations 001-008 ordering & RLS coverage
         run: npx tsx scripts/verify-migrations.ts
 
       - name: Verify snapshot-to-normalized reconciliation dry-run

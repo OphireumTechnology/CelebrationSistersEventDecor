@@ -174,6 +174,42 @@ export async function recordProviderDeliveryConfirmation(
   });
 }
 
+/**
+ * Administrative safe requeue for DeadLetter or Skipped outbox notification jobs.
+ * Never fabricates delivery; resets status to Pending and appends an immutable audit record.
+ */
+export async function requeueOutboxJob(
+  jobId: string,
+  actor: { id: string; name: string; email: string; role: 'guest' | 'client' | 'vendor' | 'event_planner' | 'staff' | 'admin' },
+  reason?: string,
+): Promise<{ ok: boolean; error?: string; job?: OutboxNotificationJob }> {
+  return withTransaction((db) => {
+    const job = db.notificationOutbox.find((j) => j.id === jobId);
+    if (!job) return { ok: false, error: 'Outbox notification job not found.' };
+    if (job.status === 'Delivered' || job.status === 'ProviderAccepted') {
+      return { ok: false, error: `Job is already ${job.status} and cannot be requeued.` };
+    }
+    const nowIso = new Date().toISOString();
+    job.status = 'Pending';
+    job.attempts = 0;
+    job.nextAttemptAt = nowIso;
+    job.claimedBy = undefined;
+    job.claimedAt = undefined;
+    job.lastError = undefined;
+    job.updatedAt = nowIso;
+    syncDeliveryLedgerFromJob(db, job);
+    appendAudit(
+      db,
+      actor,
+      'NOTIFICATION_JOB_REQUEUED',
+      'OutboxNotification',
+      job.id,
+      `Manually requeued ${job.category} (${job.bookingReference || 'general'})${reason ? ` — ${reason}` : ''}`,
+    );
+    return { ok: true, job: { ...job } };
+  });
+}
+
 async function fetchWithTimeout(
   fetchImpl: FetchLike,
   url: string,
@@ -471,9 +507,22 @@ export class NotificationOutboxWorker {
     if (this.timer) return;
     this.timer = setInterval(() => {
       this.processOnce().catch((err) => {
-        logStructured('error', 'outbox_worker_poll_error', {
+        const message = err instanceof Error ? err.message : 'Unknown worker error';
+        const code =
+          typeof err === 'object' && err && 'code' in err && typeof (err as { code?: unknown }).code === 'string'
+            ? (err as { code: string }).code
+            : undefined;
+        const isTlsFailure =
+          code === 'SELF_SIGNED_CERT_IN_CHAIN' ||
+          code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' ||
+          code === 'DEPTH_ZERO_SELF_SIGNED_CERT' ||
+          message.includes('TLS_CONFIG_FAILURE');
+        logStructured('error', isTlsFailure ? 'outbox_worker_pg_tls_error' : 'outbox_worker_poll_error', {
           workerId: this.workerId,
-          error: err instanceof Error ? err.message : 'Unknown worker error',
+          code,
+          error: isTlsFailure
+            ? 'PostgreSQL TLS certificate chain verification failed; configure DATABASE_CA_CERT, DATABASE_CA_CERT_BASE64, or PGSSLROOTCERT.'
+            : message,
         });
       });
     }, intervalMs);

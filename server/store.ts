@@ -16,6 +16,7 @@ import type {
   DesignConceptRecord,
   InventoryItem,
   NotificationDeliveryRecord,
+  NotificationWebhookEvent,
   OutboxNotificationJob,
   StaffAvailabilityRule,
   StaffChecklistRecord,
@@ -54,6 +55,7 @@ export interface DatabaseSchema {
   authSecurityEvents: AuthSecurityEvent[];
   notificationDeliveries: NotificationDeliveryRecord[];
   notificationOutbox: OutboxNotificationJob[];
+  notificationWebhookEvents: NotificationWebhookEvent[];
   revokedSessionIds: Record<string, number>;
   bookingIdempotencyKeys: Record<string, string>;
   consultationIdempotencyKeys: Record<string, string>;
@@ -629,6 +631,7 @@ function buildInitialSeed(): DatabaseSchema {
     authSecurityEvents: [],
     notificationDeliveries: [],
     notificationOutbox: [],
+    notificationWebhookEvents: [],
     revokedSessionIds: {},
     bookingIdempotencyKeys: {},
     consultationIdempotencyKeys: {},
@@ -647,6 +650,7 @@ function normalizeSchema(parsed: DatabaseSchema): DatabaseSchema {
   parsed.authSecurityEvents = parsed.authSecurityEvents || [];
   parsed.notificationDeliveries = parsed.notificationDeliveries || [];
   parsed.notificationOutbox = parsed.notificationOutbox || [];
+  parsed.notificationWebhookEvents = parsed.notificationWebhookEvents || [];
   parsed.revokedSessionIds = parsed.revokedSessionIds || {};
   parsed.bookingIdempotencyKeys = parsed.bookingIdempotencyKeys || {};
   parsed.consultationIdempotencyKeys = parsed.consultationIdempotencyKeys || {};

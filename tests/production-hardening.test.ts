@@ -513,6 +513,7 @@ test('PostgreSQL repository executes live SELECT 1 health check, atomic BEGIN/FO
     authSecurityEvents: [],
     notificationDeliveries: [],
     notificationOutbox: [],
+    notificationWebhookEvents: [],
     revokedSessionIds: {},
     bookingIdempotencyKeys: {},
     consultations: [],

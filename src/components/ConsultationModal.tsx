@@ -80,14 +80,30 @@ interface ConfirmedConsultationResult {
   outboxQueued: number;
 }
 
+interface ManagedProposalSummary {
+  version: number;
+  totalAmount: number;
+  discountAmount: number;
+  itemCount: number;
+  createdAt: string;
+  clientDecision: string;
+  crmStage: string;
+}
+
 interface ManagedConsultation {
   id: string;
   referenceCode: string;
   eventTitle: string;
   eventType: string;
+  eventTheme?: string;
   eventDate: string;
+  guestCount?: number;
+  budgetRange?: string;
   venueName: string;
   location: string;
+  clientPhone?: string;
+  preferredContactMethod?: PreferredContactMethod;
+  notes?: string;
   method: ConsultationMethod;
   methodLabel: string;
   status: string;
@@ -101,8 +117,10 @@ interface ManagedConsultation {
   clientWindow: string;
   studioWindow: string;
   rescheduleCount: number;
+  accessTokenExpiresAt?: string;
   canReschedule: boolean;
   canCancel: boolean;
+  proposalSummary?: ManagedProposalSummary;
   updatedAt: string;
 }
 
@@ -207,6 +225,7 @@ export function ConsultationModal({
   // Step 1: Event Discovery
   const [eventType, setEventType] = useState(initialEventType || SERVICE_DIVISIONS[0].title);
   const [eventTitle, setEventTitle] = useState('');
+  const [eventTheme, setEventTheme] = useState('');
   const [selectedDivisions, setSelectedDivisions] = useState<string[]>(
     initialServiceId ? [initialServiceId] : ['wedding-planning'],
   );
@@ -256,9 +275,18 @@ export function ConsultationModal({
   const [rescheduleSlot, setRescheduleSlot] = useState<ComputedSlot | null>(null);
   const [cancelReason, setCancelReason] = useState('');
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
+  const [editDetailsOpen, setEditDetailsOpen] = useState(false);
+  const [editPhone, setEditPhone] = useState('');
+  const [editPreferredContact, setEditPreferredContact] = useState<PreferredContactMethod>('email');
+  const [editEventTheme, setEditEventTheme] = useState('');
+  const [editVenueName, setEditVenueName] = useState('');
+  const [editGuestCount, setEditGuestCount] = useState(120);
+  const [editNotes, setEditNotes] = useState('');
+  const [showRevokeConfirm, setShowRevokeConfirm] = useState(false);
 
   const idempotencyKeyRef = useRef<string>(createKey('cs-consult'));
   const holderKeyRef = useRef<string>(createKey('cs-hold'));
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
   const todayIso = new Date().toISOString().slice(0, 10);
 
   const fetchAvailability = useCallback(
@@ -296,6 +324,7 @@ export function ConsultationModal({
     setStep(1);
     setEventType(initialEventType || SERVICE_DIVISIONS[0].title);
     setEventTitle('');
+    setEventTheme('');
     setSelectedDivisions(initialServiceId ? [initialServiceId] : ['wedding-planning']);
     setEventDate('');
     setGuestCount(initialGuestCount || 120);
@@ -325,8 +354,11 @@ export function ConsultationModal({
     setLegacyTracking(null);
     setRescheduleOpen(false);
     setShowCancelConfirm(false);
+    setEditDetailsOpen(false);
+    setShowRevokeConfirm(false);
     idempotencyKeyRef.current = createKey('cs-consult');
     holderKeyRef.current = createKey('cs-hold');
+    requestAnimationFrame(() => closeButtonRef.current?.focus());
   }, [open, initialServiceId, initialEventType, initialLocation, initialGuestCount, initialNotes]);
 
   // Load real-time availability whenever user is on Step 2 or switches method/timezone
@@ -471,6 +503,7 @@ export function ConsultationModal({
         body: JSON.stringify({
           eventType,
           eventTitle: (eventTitle || `${clientName.trim()} ${eventType}`).trim(),
+          eventTheme: eventTheme.trim(),
           serviceDivisionIds: selectedDivisions,
           eventDate,
           guestCount: Number(guestCount),
@@ -516,6 +549,13 @@ export function ConsultationModal({
         const refreshed = await fetchAvailability(clientTimezone, method);
         setAvailabilityDays(refreshed);
         return;
+      }
+
+      if (res.status === 503) {
+        throw new Error(
+          data.error ||
+            'Our booking database is temporarily unavailable. Your consultation has not been confirmed — please click Retry in a moment (protected against duplicate bookings).',
+        );
       }
 
       if (!res.ok || !data.consultation?.referenceCode) {
@@ -585,6 +625,12 @@ export function ConsultationModal({
           throw new Error(data.error || 'Unable to verify consultation reference and access token.');
         }
         setManagedConsultation(data.consultation);
+        setEditPhone(data.consultation.clientPhone || '');
+        setEditPreferredContact(data.consultation.preferredContactMethod || 'email');
+        setEditEventTheme(data.consultation.eventTheme || '');
+        setEditVenueName(data.consultation.venueName || '');
+        setEditGuestCount(data.consultation.guestCount || 120);
+        setEditNotes(data.consultation.notes || '');
       } else {
         const res = await apiFetch(
           `/api/bookings/track?referenceCode=${encodeURIComponent(trackRef.trim())}&email=${encodeURIComponent(trackEmail.trim())}`,
@@ -695,6 +741,86 @@ export function ConsultationModal({
     }
   };
 
+  const handleUpdateClientDetails = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!managedConsultation) return;
+    setManageLoading(true);
+    setManageError(null);
+    setManageMessage(null);
+    try {
+      const res = await apiFetch(`/api/consultations/${encodeURIComponent(managedConsultation.id)}/client-details`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          accessToken: trackToken.trim(),
+          clientPhone: editPhone.trim() || undefined,
+          preferredContactMethod: editPreferredContact,
+          eventTheme: editEventTheme.trim(),
+          venueName: editVenueName.trim() || undefined,
+          guestCount: Number(editGuestCount),
+          notes: editNotes.trim(),
+        }),
+      });
+      const data = await readApiJson<{
+        consultation?: {
+          clientPhone: string;
+          preferredContactMethod: PreferredContactMethod;
+          eventTheme?: string;
+          venueName: string;
+          guestCount: number;
+          consultationNotes: string;
+          updatedAt: string;
+        };
+        error?: string;
+      }>(res);
+      if (!res.ok || !data.consultation) {
+        throw new Error(data.error || 'Unable to update consultation contact and event details.');
+      }
+      setManagedConsultation({
+        ...managedConsultation,
+        clientPhone: data.consultation.clientPhone,
+        preferredContactMethod: data.consultation.preferredContactMethod,
+        eventTheme: data.consultation.eventTheme,
+        venueName: data.consultation.venueName,
+        guestCount: data.consultation.guestCount,
+        notes: data.consultation.consultationNotes,
+        updatedAt: data.consultation.updatedAt,
+      });
+      setEditDetailsOpen(false);
+      setManageMessage('Your contact details and event requirements have been updated and synced with your planner.');
+    } catch (err) {
+      setManageError(err instanceof Error ? err.message : 'Unable to save details.');
+    } finally {
+      setManageLoading(false);
+    }
+  };
+
+  const handleRevokeToken = async () => {
+    if (!managedConsultation) return;
+    setManageLoading(true);
+    setManageError(null);
+    setManageMessage(null);
+    try {
+      const res = await apiFetch(`/api/consultations/${encodeURIComponent(managedConsultation.id)}/token/revoke`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ accessToken: trackToken.trim() }),
+      });
+      const data = await readApiJson<{ revoked?: boolean; error?: string }>(res);
+      if (!res.ok || !data.revoked) {
+        throw new Error(data.error || 'Unable to revoke verification token.');
+      }
+      setShowRevokeConfirm(false);
+      setManagedConsultation(null);
+      setTrackToken('');
+      setManageMessage('Verification token revoked immediately. Contact the studio or sign in to your client account to access this appointment.');
+    } catch (err) {
+      setManageError(err instanceof Error ? err.message : 'Token revocation failed.');
+    } finally {
+      setManageLoading(false);
+    }
+  };
+
   const activeRescheduleDay =
     rescheduleDays.find((d) => d.date === rescheduleDayIso) || rescheduleDays[0] || null;
 
@@ -735,9 +861,10 @@ export function ConsultationModal({
               {mode === 'book' ? 'Manage / Track' : 'New Consultation'}
             </button>
             <button
+              ref={closeButtonRef}
               type="button"
               onClick={onClose}
-              className="min-h-[40px] min-w-[40px] flex items-center justify-center text-[var(--cs-charcoal-muted)] hover:text-[var(--cs-purple)] rounded-md cursor-pointer"
+              className="min-h-[44px] min-w-[44px] flex items-center justify-center text-[var(--cs-charcoal-muted)] hover:text-[var(--cs-purple)] rounded-md cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--cs-purple)]"
               aria-label="Close modal"
             >
               <X className="w-5 h-5" />
@@ -889,31 +1016,228 @@ export function ConsultationModal({
                       {managedConsultation.assignedPlannerName}
                     </dd>
                   </div>
+                  {managedConsultation.eventTheme && (
+                    <div>
+                      <dt className="text-[var(--cs-charcoal-muted)]">Event Theme</dt>
+                      <dd className="font-medium text-[var(--cs-charcoal)] mt-0.5">{managedConsultation.eventTheme}</dd>
+                    </div>
+                  )}
+                  {managedConsultation.clientPhone && (
+                    <div>
+                      <dt className="text-[var(--cs-charcoal-muted)]">Contact Preference</dt>
+                      <dd className="font-medium text-[var(--cs-charcoal)] mt-0.5 tabular-nums">
+                        {managedConsultation.clientPhone} ({(managedConsultation.preferredContactMethod || 'email').toUpperCase()})
+                      </dd>
+                    </div>
+                  )}
                 </dl>
 
-                {(managedConsultation.canReschedule || managedConsultation.canCancel) && (
-                  <div className="flex flex-wrap gap-3 pt-2 border-t border-[var(--cs-border)]">
-                    {managedConsultation.canReschedule && (
+                {managedConsultation.proposalSummary && (
+                  <div className="p-4 bg-white border border-[var(--cs-gold)]/60 rounded-md space-y-1.5 text-xs">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-semibold text-[var(--cs-purple)]">
+                        Proposal Status · Version {managedConsultation.proposalSummary.version}
+                      </span>
+                      <span className="font-semibold text-[var(--cs-charcoal)] tabular-nums">
+                        ${managedConsultation.proposalSummary.totalAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                      </span>
+                    </div>
+                    <p className="text-[var(--cs-charcoal-muted)] tabular-nums">
+                      {managedConsultation.proposalSummary.itemCount} line item(s) · Decision:{' '}
+                      <span className="font-medium text-[var(--cs-charcoal)]">
+                        {managedConsultation.proposalSummary.clientDecision}
+                      </span>{' '}
+                      · CRM Stage: {managedConsultation.proposalSummary.crmStage}
+                    </p>
+                  </div>
+                )}
+
+                <div className="flex flex-wrap gap-2.5 pt-2 border-t border-[var(--cs-border)]">
+                  {managedConsultation.canReschedule && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEditDetailsOpen(false);
+                        setShowRevokeConfirm(false);
+                        openReschedulePicker();
+                      }}
+                      className="min-h-[44px] px-4 py-2 text-xs font-medium text-white bg-[var(--cs-purple)] hover:bg-[var(--cs-purple-hover)] rounded-md cursor-pointer"
+                    >
+                      Reschedule Consultation
+                    </button>
+                  )}
+                  {managedConsultation.status !== 'Cancelled' && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEditDetailsOpen((prev) => !prev);
+                        setRescheduleOpen(false);
+                        setShowCancelConfirm(false);
+                        setShowRevokeConfirm(false);
+                      }}
+                      className="min-h-[44px] px-4 py-2 text-xs font-medium border border-[var(--cs-purple)] text-[var(--cs-purple)] hover:bg-[var(--cs-purple-soft)] rounded-md cursor-pointer"
+                    >
+                      {editDetailsOpen ? 'Close Details Editor' : 'Update Contact & Requirements'}
+                    </button>
+                  )}
+                  {managedConsultation.canCancel && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowCancelConfirm(true);
+                        setRescheduleOpen(false);
+                        setEditDetailsOpen(false);
+                        setShowRevokeConfirm(false);
+                      }}
+                      className="min-h-[44px] px-4 py-2 text-xs font-medium border border-red-300 text-red-800 hover:bg-red-50 rounded-md cursor-pointer"
+                    >
+                      Cancel Appointment
+                    </button>
+                  )}
+                  {trackToken.trim() && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowRevokeConfirm((prev) => !prev);
+                        setRescheduleOpen(false);
+                        setEditDetailsOpen(false);
+                        setShowCancelConfirm(false);
+                      }}
+                      className="min-h-[44px] px-3.5 py-2 text-xs font-medium border border-[var(--cs-border-strong)] text-[var(--cs-charcoal-muted)] hover:text-[var(--cs-charcoal)] rounded-md cursor-pointer"
+                    >
+                      Revoke Access Token
+                    </button>
+                  )}
+                </div>
+
+                {editDetailsOpen && (
+                  <form onSubmit={handleUpdateClientDetails} className="p-4 bg-white border border-[var(--cs-border)] rounded-md space-y-3">
+                    <p className="text-xs font-semibold text-[var(--cs-purple)]">
+                      Update Contact Preferences & Event Requirements
+                    </p>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label htmlFor="manage-edit-phone" className="block text-[11px] font-medium text-[var(--cs-charcoal)] mb-1">
+                          Phone Number
+                        </label>
+                        <input
+                          id="manage-edit-phone"
+                          type="tel"
+                          required
+                          value={editPhone}
+                          onChange={(e) => setEditPhone(e.target.value)}
+                          className="w-full min-h-[44px] px-3 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md"
+                        />
+                      </div>
+                      <div>
+                        <label htmlFor="manage-edit-contact" className="block text-[11px] font-medium text-[var(--cs-charcoal)] mb-1">
+                          Preferred Contact Method
+                        </label>
+                        <select
+                          id="manage-edit-contact"
+                          value={editPreferredContact}
+                          onChange={(e) => setEditPreferredContact(e.target.value as PreferredContactMethod)}
+                          className="w-full min-h-[44px] px-3 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md bg-white"
+                        >
+                          <option value="email">Email</option>
+                          <option value="phone">Phone Call</option>
+                          <option value="sms">Text / SMS</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label htmlFor="manage-edit-theme" className="block text-[11px] font-medium text-[var(--cs-charcoal)] mb-1">
+                          Event Theme / Palette
+                        </label>
+                        <input
+                          id="manage-edit-theme"
+                          type="text"
+                          value={editEventTheme}
+                          onChange={(e) => setEditEventTheme(e.target.value)}
+                          placeholder="Candlelit Royal Amethyst & Champagne"
+                          className="w-full min-h-[44px] px-3 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md"
+                        />
+                      </div>
+                      <div>
+                        <label htmlFor="manage-edit-guests" className="block text-[11px] font-medium text-[var(--cs-charcoal)] mb-1">
+                          Estimated Guest Count
+                        </label>
+                        <input
+                          id="manage-edit-guests"
+                          type="number"
+                          min={10}
+                          max={5000}
+                          value={editGuestCount}
+                          onChange={(e) => setEditGuestCount(Number(e.target.value))}
+                          className="w-full min-h-[44px] px-3 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md tabular-nums"
+                        />
+                      </div>
+                    </div>
+                    <div>
+                      <label htmlFor="manage-edit-venue" className="block text-[11px] font-medium text-[var(--cs-charcoal)] mb-1">
+                        Venue Name
+                      </label>
+                      <input
+                        id="manage-edit-venue"
+                        type="text"
+                        value={editVenueName}
+                        onChange={(e) => setEditVenueName(e.target.value)}
+                        className="w-full min-h-[44px] px-3 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="manage-edit-notes" className="block text-[11px] font-medium text-[var(--cs-charcoal)] mb-1">
+                        Updated Inspiration & Event Notes
+                      </label>
+                      <textarea
+                        id="manage-edit-notes"
+                        rows={2}
+                        value={editNotes}
+                        onChange={(e) => setEditNotes(e.target.value)}
+                        className="w-full px-3 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md"
+                      />
+                    </div>
+                    <div className="flex justify-end gap-2">
                       <button
                         type="button"
-                        onClick={openReschedulePicker}
-                        className="min-h-[44px] px-4 py-2 text-xs font-medium text-white bg-[var(--cs-purple)] hover:bg-[var(--cs-purple-hover)] rounded-md cursor-pointer"
+                        onClick={() => setEditDetailsOpen(false)}
+                        className="min-h-[44px] px-3.5 py-2 text-xs text-[var(--cs-charcoal-muted)] cursor-pointer"
                       >
-                        Reschedule Consultation
+                        Cancel
                       </button>
-                    )}
-                    {managedConsultation.canCancel && (
+                      <button
+                        type="submit"
+                        disabled={manageLoading}
+                        className="min-h-[44px] px-4 py-2 text-xs font-medium text-white bg-[var(--cs-purple)] hover:bg-[var(--cs-purple-hover)] rounded-md cursor-pointer disabled:opacity-50"
+                      >
+                        {manageLoading ? 'Saving...' : 'Save Updates'}
+                      </button>
+                    </div>
+                  </form>
+                )}
+
+                {showRevokeConfirm && (
+                  <div className="p-4 bg-white border border-amber-300 rounded-md space-y-2.5 text-xs">
+                    <p className="font-semibold text-amber-950">Revoke Private Access Token?</p>
+                    <p className="text-[var(--cs-charcoal-muted)]">
+                      This immediately invalidates your current token for token-based lookup, rescheduling, and updates. Your consultation remains active in the studio schedule.
+                    </p>
+                    <div className="flex justify-end gap-2">
                       <button
                         type="button"
-                        onClick={() => {
-                          setShowCancelConfirm(true);
-                          setRescheduleOpen(false);
-                        }}
-                        className="min-h-[44px] px-4 py-2 text-xs font-medium border border-red-300 text-red-800 hover:bg-red-50 rounded-md cursor-pointer"
+                        onClick={() => setShowRevokeConfirm(false)}
+                        className="min-h-[44px] px-3.5 py-2 text-xs text-[var(--cs-charcoal-muted)] cursor-pointer"
                       >
-                        Cancel Appointment
+                        Keep Active
                       </button>
-                    )}
+                      <button
+                        type="button"
+                        disabled={manageLoading}
+                        onClick={handleRevokeToken}
+                        className="min-h-[44px] px-4 py-2 text-xs font-medium text-white bg-amber-700 hover:bg-amber-800 rounded-md cursor-pointer"
+                      >
+                        {manageLoading ? 'Revoking...' : 'Confirm Revoke Token'}
+                      </button>
+                    </div>
                   </div>
                 )}
 
@@ -1147,13 +1471,14 @@ export function ConsultationModal({
                       <button
                         type="button"
                         disabled={s.num > step}
+                        aria-current={isCurrent ? 'step' : undefined}
                         onClick={() => {
                           if (s.num < step) {
                             setError(null);
                             setStep(s.num as 1 | 2 | 3 | 4);
                           }
                         }}
-                        className={`w-full text-left px-3 py-2 rounded-md border text-xs transition-colors ${
+                        className={`w-full min-h-[44px] text-left px-3 py-2 rounded-md border text-xs transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--cs-purple)] ${
                           isCurrent
                             ? 'bg-[var(--cs-purple)] text-white border-[var(--cs-purple)]'
                             : isDone
@@ -1235,6 +1560,20 @@ export function ConsultationModal({
                       className="w-full min-h-[44px] px-3.5 py-2.5 text-sm border border-[var(--cs-border-strong)] rounded-md"
                     />
                   </div>
+                </div>
+
+                <div>
+                  <label htmlFor="wizard-event-theme" className="block text-xs font-medium text-[var(--cs-charcoal)] mb-1.5">
+                    Event Theme / Aesthetic Direction (Optional)
+                  </label>
+                  <input
+                    id="wizard-event-theme"
+                    type="text"
+                    value={eventTheme}
+                    onChange={(e) => setEventTheme(e.target.value)}
+                    placeholder="e.g., Candlelit Royal Amethyst & Champagne Gold, Modern Botanical Garden"
+                    className="w-full min-h-[44px] px-3.5 py-2.5 text-sm border border-[var(--cs-border-strong)] rounded-md"
+                  />
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
@@ -1413,7 +1752,11 @@ export function ConsultationModal({
                 )}
 
                 {availabilityLoading ? (
-                  <div className="p-8 text-center text-xs text-[var(--cs-charcoal-muted)] bg-[var(--cs-ivory)] rounded-lg border border-[var(--cs-border)]">
+                  <div
+                    role="status"
+                    aria-live="polite"
+                    className="p-8 text-center text-xs text-[var(--cs-charcoal-muted)] bg-[var(--cs-ivory)] rounded-lg border border-[var(--cs-border)]"
+                  >
                     Loading live Columbia studio availability...
                   </div>
                 ) : (
@@ -1671,6 +2014,9 @@ export function ConsultationModal({
                     <p className="text-[var(--cs-charcoal-muted)] tabular-nums">
                       Guests: {guestCount} · Investment: {budgetRange}
                     </p>
+                    {eventTheme.trim() && (
+                      <p className="text-[var(--cs-charcoal-muted)]">Theme: {eventTheme.trim()}</p>
+                    )}
                     <p className="text-[var(--cs-charcoal-muted)]">
                       Venue: {venueName || 'Venue To Be Finalized'} ({location})
                     </p>

@@ -49,10 +49,16 @@ import {
   buildStaffAlertTemplate,
   buildStatusUpdateTemplate,
   getEmailProviderStatus,
+  verifyResendWebhookSignature,
   type FetchLike,
 } from './notifications.ts';
 import { logStructured, observability } from './observability.ts';
-import { enqueueOutboxNotification, NotificationOutboxWorker } from './outbox.ts';
+import {
+  enqueueOutboxNotification,
+  NotificationOutboxWorker,
+  recordProviderDeliveryConfirmation,
+  requeueOutboxJob,
+} from './outbox.ts';
 import {
   createRateLimiter,
   InMemoryRateLimitStore,
@@ -73,8 +79,8 @@ import {
   isValidIanaTimezone,
   STUDIO_TIMEZONE,
   SUPPORTED_TIMEZONES,
+  validateConsultationTokenAccess,
   validateRequestedConsultationSlot,
-  verifyConsultationAccessToken,
 } from './scheduling.ts';
 import {
   appendAudit,
@@ -163,7 +169,14 @@ export function createApp(options: CreateAppOptions = {}) {
     }
   }
 
-  app.use(express.json({ limit: '1mb' }));
+  app.use(
+    express.json({
+      limit: '1mb',
+      verify: (req, _res, buf) => {
+        (req as Request & { rawBody?: string }).rawBody = buf.toString('utf8');
+      },
+    }),
+  );
 
   // Security headers (OWASP ASVS aligned), correlation IDs & structured request observability
   app.use((req: Request, res: Response, next: NextFunction) => {
@@ -2127,6 +2140,18 @@ export function createApp(options: CreateAppOptions = {}) {
     res.json({ summary });
   });
 
+  app.post('/api/admin/outbox/:jobId/retry', async (req: Request, res: Response) => {
+    const { ctx } = await getAuth(req);
+    if (!requireAdminMfa(ctx, res)) return;
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim().slice(0, 240) : undefined;
+    const result = await requeueOutboxJob(String(req.params.jobId), ctx.session, reason);
+    if (!result.ok) {
+      return res.status(result.error?.includes('not found') ? 404 : 409).json({ error: result.error });
+    }
+    const summary = req.body?.processImmediately ? await outboxWorker.processOnce() : undefined;
+    res.json({ job: result.job, summary });
+  });
+
   app.get('/api/admin/metrics', async (req: Request, res: Response) => {
     const { db, ctx } = await getAuth(req);
     if (!requireAdminMfa(ctx, res)) return;
@@ -2286,7 +2311,8 @@ export function createApp(options: CreateAppOptions = {}) {
       (typeof req.query?.accessToken === 'string' ? req.query.accessToken : undefined) ||
       req.header('x-consultation-token') ||
       undefined;
-    if (verifyConsultationAccessToken(providedToken, consultation.accessTokenHash)) {
+    const tokenCheck = validateConsultationTokenAccess(consultation, providedToken);
+    if (tokenCheck.valid) {
       return 'scoped_token';
     }
     return null;
@@ -2427,6 +2453,7 @@ export function createApp(options: CreateAppOptions = {}) {
   const createConsultationSchema = z.object({
     eventType: z.string().trim().min(2).max(120),
     eventTitle: z.string().trim().min(3).max(180).optional(),
+    eventTheme: z.string().trim().max(180).optional(),
     serviceDivisionIds: z.array(z.string().trim().min(1)).min(1).max(12),
     eventDate: z.string().refine(isValidIsoCalendarDate, 'Target event date must be a valid YYYY-MM-DD calendar date.'),
     guestCount: z.coerce.number().int().min(10).max(5000),
@@ -2621,6 +2648,8 @@ export function createApp(options: CreateAppOptions = {}) {
           updatedAt: nowIso,
         };
 
+        const startMs = new Date(input.consultationStartUtc).getTime();
+        const tokenExpiryMs = Math.max(nowMs + 30 * 86_400_000, startMs + 90 * 86_400_000);
         const newConsultation: ConsultationAppointment = {
           id: consultationId,
           bookingId,
@@ -2632,6 +2661,7 @@ export function createApp(options: CreateAppOptions = {}) {
           preferredContactMethod: input.preferredContactMethod,
           eventTitle: resolvedEventTitle,
           eventCategory: input.eventType,
+          eventTheme: input.eventTheme || undefined,
           serviceDivisionIds: input.serviceDivisionIds,
           eventDate: input.eventDate,
           venueName: input.venueName,
@@ -2651,8 +2681,9 @@ export function createApp(options: CreateAppOptions = {}) {
           clientTimezone: input.clientTimezone,
           privacyConsentAccepted: true,
           privacyConsentAt: nowIso,
-          privacyConsentVersion: '2026-04-v1',
+          privacyConsentVersion: '2026-11-v1',
           accessTokenHash,
+          accessTokenExpiresAt: new Date(tokenExpiryMs).toISOString(),
           idempotencyKey,
           crmStage: 'Consultation Scheduled',
           rescheduleCount: 0,
@@ -2800,12 +2831,35 @@ export function createApp(options: CreateAppOptions = {}) {
 
       const db = await readDb();
       const consultation = db.consultations.find((c) => c.referenceCode.toUpperCase() === referenceCode);
-      if (!consultation || !verifyConsultationAccessToken(accessToken, consultation.accessTokenHash)) {
+      if (!consultation) {
         return res.status(403).json({
           error: 'Consultation record not found or verification token is invalid.',
           code: 'INVALID_CONSULTATION_TOKEN',
         });
       }
+      const tokenCheck = validateConsultationTokenAccess(consultation, accessToken);
+      if (!tokenCheck.valid) {
+        return res.status(403).json({
+          error: tokenCheck.error || 'Consultation verification token is invalid.',
+          code: tokenCheck.code || 'INVALID_CONSULTATION_TOKEN',
+        });
+      }
+
+      const linkedBooking = db.bookings.find((b) => b.id === consultation.bookingId);
+      const latestQuote = linkedBooking?.quotations.length
+        ? linkedBooking.quotations[linkedBooking.quotations.length - 1]
+        : undefined;
+      const proposalSummary = latestQuote
+        ? {
+            version: latestQuote.version,
+            totalAmount: latestQuote.totalAmount,
+            discountAmount: latestQuote.discountAmount,
+            itemCount: latestQuote.items.length,
+            createdAt: latestQuote.createdAt,
+            clientDecision: consultation.clientDecision || 'Pending',
+            crmStage: consultation.crmStage,
+          }
+        : undefined;
 
       const canReschedule = canTransitionConsultationStatus(consultation.status, 'Rescheduled');
       const canCancel = canTransitionConsultationStatus(consultation.status, 'Cancelled');
@@ -2816,9 +2870,15 @@ export function createApp(options: CreateAppOptions = {}) {
           referenceCode: consultation.referenceCode,
           eventTitle: consultation.eventTitle,
           eventType: consultation.eventCategory,
+          eventTheme: consultation.eventTheme || '',
           eventDate: consultation.eventDate,
+          guestCount: consultation.guestCount,
+          budgetRange: consultation.budgetRange,
           venueName: consultation.venueName,
           location: consultation.eventLocation,
+          clientPhone: consultation.clientPhone,
+          preferredContactMethod: consultation.preferredContactMethod,
+          notes: consultation.consultationNotes,
           method: consultation.method,
           methodLabel: formatConsultationMethodLabel(consultation.method),
           status: consultation.status,
@@ -2832,11 +2892,172 @@ export function createApp(options: CreateAppOptions = {}) {
           clientWindow: formatFullDateTimeForTimezone(consultation.startUtc, consultation.clientTimezone),
           studioWindow: formatFullDateTimeForTimezone(consultation.startUtc, STUDIO_TIMEZONE),
           rescheduleCount: consultation.rescheduleCount,
+          accessTokenExpiresAt: consultation.accessTokenExpiresAt,
           canReschedule,
           canCancel,
+          proposalSummary,
           updatedAt: consultation.updatedAt,
         },
       });
+    },
+  );
+
+  // 4b. Client Self-Service Contact & Event Requirements Update (scoped token OR owning client session)
+  app.patch(
+    '/api/consultations/:id/client-details',
+    rateLimit(25, 60_000, { endpointGroup: 'consultations:client_update', failClosed: true }),
+    async (req: Request, res: Response) => {
+      const { ctx } = await getAuth(req);
+      const parsed = z
+        .object({
+          accessToken: z.string().trim().max(256).optional(),
+          clientPhone: z.string().trim().min(7).max(40).optional(),
+          preferredContactMethod: z.enum(['email', 'phone', 'sms']).optional(),
+          clientTimezone: z.string().trim().min(2).max(80).optional(),
+          eventTitle: z.string().trim().min(3).max(180).optional(),
+          eventTheme: z.string().trim().max(180).optional(),
+          guestCount: z.coerce.number().int().min(10).max(5000).optional(),
+          venueName: z.string().trim().min(2).max(180).optional(),
+          notes: z.string().trim().max(3000).optional(),
+        })
+        .safeParse(req.body ?? {});
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Invalid contact or event requirement fields.' });
+      }
+      if (parsed.data.clientTimezone && !isValidIanaTimezone(parsed.data.clientTimezone)) {
+        return res.status(400).json({ error: 'Invalid timezone identifier.' });
+      }
+
+      const nowIso = new Date().toISOString();
+      const targetId = String(req.params.id);
+      const outcome = await withTransaction((db) => {
+        const consultation = db.consultations.find(
+          (c) => c.id === targetId || c.referenceCode.toUpperCase() === targetId.toUpperCase(),
+        );
+        if (!consultation) return { ok: false as const, status: 404, error: 'Consultation not found.' };
+
+        const access = resolveConsultationActorAccess(req, ctx, consultation);
+        if (!access) {
+          return {
+            ok: false as const,
+            status: 403,
+            error: 'Valid consultation verification token or owning client session required.',
+          };
+        }
+        if (consultation.status === 'Cancelled') {
+          return { ok: false as const, status: 409, error: 'Cancelled consultations cannot be modified.' };
+        }
+
+        const updatedFields: string[] = [];
+        if (parsed.data.clientPhone !== undefined) {
+          consultation.clientPhone = parsed.data.clientPhone;
+          updatedFields.push('clientPhone');
+        }
+        if (parsed.data.preferredContactMethod !== undefined) {
+          consultation.preferredContactMethod = parsed.data.preferredContactMethod;
+          updatedFields.push('preferredContactMethod');
+        }
+        if (parsed.data.clientTimezone !== undefined) {
+          consultation.clientTimezone = parsed.data.clientTimezone;
+          updatedFields.push('clientTimezone');
+        }
+        if (parsed.data.eventTitle !== undefined) {
+          consultation.eventTitle = parsed.data.eventTitle;
+          updatedFields.push('eventTitle');
+        }
+        if (parsed.data.eventTheme !== undefined) {
+          consultation.eventTheme = parsed.data.eventTheme;
+          updatedFields.push('eventTheme');
+        }
+        if (parsed.data.guestCount !== undefined) {
+          consultation.guestCount = parsed.data.guestCount;
+          updatedFields.push('guestCount');
+        }
+        if (parsed.data.venueName !== undefined) {
+          consultation.venueName = parsed.data.venueName;
+          updatedFields.push('venueName');
+        }
+        if (parsed.data.notes !== undefined) {
+          consultation.consultationNotes = parsed.data.notes;
+          updatedFields.push('notes');
+        }
+
+        consultation.contactUpdatedAt = nowIso;
+        consultation.updatedAt = nowIso;
+
+        const linkedBooking = db.bookings.find((b) => b.id === consultation.bookingId);
+        if (linkedBooking) {
+          if (parsed.data.clientPhone !== undefined) linkedBooking.clientPhone = parsed.data.clientPhone;
+          if (parsed.data.eventTitle !== undefined) linkedBooking.eventTitle = parsed.data.eventTitle;
+          if (parsed.data.guestCount !== undefined) linkedBooking.guestCount = parsed.data.guestCount;
+          if (parsed.data.venueName !== undefined) linkedBooking.venueName = parsed.data.venueName;
+          if (parsed.data.notes !== undefined) linkedBooking.notes = parsed.data.notes;
+          linkedBooking.updatedAt = nowIso;
+        }
+
+        appendAudit(
+          db,
+          ctx.session,
+          'CONSULTATION_CLIENT_DETAILS_UPDATED',
+          'Consultation',
+          consultation.referenceCode,
+          `Updated ${updatedFields.join(', ') || 'none'} via ${access}`,
+        );
+
+        return { ok: true as const, consultation };
+      });
+
+      if (!outcome.ok) {
+        return res.status(outcome.status).json({ error: outcome.error });
+      }
+
+      res.json({
+        consultation: sanitizeConsultationForClient(outcome.consultation),
+        scheduleDisplay: {
+          clientWindow: formatFullDateTimeForTimezone(outcome.consultation.startUtc, outcome.consultation.clientTimezone),
+          studioWindow: formatFullDateTimeForTimezone(outcome.consultation.startUtc, STUDIO_TIMEZONE),
+        },
+      });
+    },
+  );
+
+  // 4c. Revoke Consultation Scoped Access Token (client owner, token holder, or admin MFA)
+  app.post(
+    '/api/consultations/:id/token/revoke',
+    rateLimit(20, 60_000, { endpointGroup: 'consultations:token_revoke', failClosed: true }),
+    async (req: Request, res: Response) => {
+      const { ctx } = await getAuth(req);
+      const targetId = String(req.params.id);
+      const nowIso = new Date().toISOString();
+
+      const outcome = await withTransaction((db) => {
+        const consultation = db.consultations.find(
+          (c) => c.id === targetId || c.referenceCode.toUpperCase() === targetId.toUpperCase(),
+        );
+        if (!consultation) return { ok: false as const, status: 404, error: 'Consultation not found.' };
+
+        const access = resolveConsultationActorAccess(req, ctx, consultation);
+        if (!access) {
+          return { ok: false as const, status: 403, error: 'Authorization required to revoke verification token.' };
+        }
+
+        consultation.accessTokenRevokedAt = nowIso;
+        consultation.updatedAt = nowIso;
+
+        appendAudit(
+          db,
+          ctx.session,
+          'CONSULTATION_TOKEN_REVOKED',
+          'Consultation',
+          consultation.referenceCode,
+          `Scoped verification token revoked via ${access}`,
+        );
+
+        return { ok: true as const, revokedAt: nowIso };
+      });
+
+      if (!outcome.ok) return res.status(outcome.status).json({ error: outcome.error });
+      res.json({ revoked: true, revokedAt: outcome.revokedAt });
     },
   );
 
@@ -3152,18 +3373,101 @@ export function createApp(options: CreateAppOptions = {}) {
       .filter((u) => ['event_planner', 'staff', 'admin'].includes(u.role) && (u.accountStatus ?? 'active') === 'active')
       .map((u) => ({ id: u.id, name: u.name, role: u.role, email: u.email }));
 
+    const nowMs = Date.now();
+    const plannerWorkload = planners.map((p) => {
+      const assigned = db.consultations.filter((c) => c.assignedPlannerId === p.id);
+      const openTasks = db.crmFollowUpTasks.filter((t) => t.assignedToUserId === p.id && t.status === 'Open');
+      return {
+        plannerId: p.id,
+        plannerName: p.name,
+        role: p.role,
+        activeUpcoming: assigned.filter(
+          (c) => ['Pending', 'Confirmed', 'Rescheduled'].includes(c.status) && new Date(c.startUtc).getTime() >= nowMs,
+        ).length,
+        pendingReview: assigned.filter((c) => c.status === 'Pending').length,
+        completedCount: assigned.filter((c) => c.status === 'Completed').length,
+        bookedCount: assigned.filter((c) => c.crmStage === 'Event Booked').length,
+        openFollowUps: openTasks.length,
+      };
+    });
+
+    const totalConsults = db.consultations.length;
+    const qualifiedOrFurther = db.consultations.filter((c) => c.crmStage !== 'New Inquiry').length;
+    const completedOrFurther = db.consultations.filter((c) =>
+      ['Consultation Completed', 'Proposal Prepared', 'Proposal Sent', 'Client Decision', 'Event Booked'].includes(c.crmStage),
+    ).length;
+    const proposalsSentOrFurther = db.consultations.filter((c) =>
+      ['Proposal Sent', 'Client Decision', 'Event Booked'].includes(c.crmStage),
+    ).length;
+    const bookedCount = db.consultations.filter((c) => c.crmStage === 'Event Booked').length;
+
     res.json({
       consultations: sanitized,
       metrics: computeConsultationMetrics(db),
+      conversionAnalytics: {
+        totalLeads: totalConsults,
+        qualifiedRatePct: totalConsults > 0 ? Math.round((qualifiedOrFurther / totalConsults) * 100) : 0,
+        completionRatePct: totalConsults > 0 ? Math.round((completedOrFurther / totalConsults) * 100) : 0,
+        proposalRatePct: totalConsults > 0 ? Math.round((proposalsSentOrFurther / totalConsults) * 100) : 0,
+        bookingConversionRatePct: totalConsults > 0 ? Math.round((bookedCount / totalConsults) * 100) : 0,
+      },
+      plannerWorkload,
       planners,
       staffAvailabilityRules: db.staffAvailabilityRules,
       crmFollowUpTasks: db.crmFollowUpTasks,
       blackoutDates: db.blackoutDates,
       notificationOutbox: db.notificationOutbox,
+      notificationWebhookEvents: db.notificationWebhookEvents,
       auditLogs: db.auditLogs.filter(
-        (a) => a.targetType === 'Consultation' || a.targetType === 'CrmTask' || a.targetType === 'StaffAvailability',
+        (a) =>
+          a.targetType === 'Consultation' ||
+          a.targetType === 'CrmTask' ||
+          a.targetType === 'StaffAvailability' ||
+          a.targetType === 'OutboxNotification',
       ),
     });
+  });
+
+  // 7b. CRM Lead Qualification & Pipeline Stage Progression (Staff/Planner/Admin MFA)
+  app.patch('/api/consultations/:id/stage', async (req: Request, res: Response) => {
+    const { ctx } = await getAuth(req);
+    if (!requireStaffOrAdminMfa(ctx, res, 'Operations clearance required to update CRM pipeline stage.')) return;
+
+    const parsed = z
+      .object({
+        crmStage: z.enum(CRM_PIPELINE_STAGES),
+        notes: z.string().trim().max(1000).optional(),
+      })
+      .safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Valid CRM pipeline stage is required.' });
+    }
+
+    const nowIso = new Date().toISOString();
+    const updated = await withTransaction((db) => {
+      const consultation = db.consultations.find((c) => c.id === String(req.params.id));
+      if (!consultation) return null;
+      const prevStage = consultation.crmStage;
+      consultation.crmStage = parsed.data.crmStage;
+      if (parsed.data.notes) {
+        consultation.outcomeSummary = consultation.outcomeSummary
+          ? `${consultation.outcomeSummary}\n${parsed.data.notes}`
+          : parsed.data.notes;
+      }
+      consultation.updatedAt = nowIso;
+      appendAudit(
+        db,
+        ctx.session,
+        'CRM_STAGE_UPDATED',
+        'Consultation',
+        consultation.referenceCode,
+        `CRM stage ${prevStage} -> ${parsed.data.crmStage}${parsed.data.notes ? ` (${parsed.data.notes})` : ''}`,
+      );
+      return consultation;
+    });
+
+    if (!updated) return res.status(404).json({ error: 'Consultation not found.' });
+    res.json({ consultation: sanitizeConsultationForClient(updated) });
   });
 
   // 8. Admin / Planner Confirm Consultation
@@ -3870,6 +4174,109 @@ export function createApp(options: CreateAppOptions = {}) {
     res.json({ remindersEvaluated: queued, outboxSummary: summary });
   });
 
+  // 16. Resend (Svix) Signed Delivery Webhook Endpoint (upgrades ProviderAccepted -> Delivered / Bounced honestly)
+  app.post(
+    '/api/webhooks/resend',
+    rateLimit(120, 60_000, { endpointGroup: 'webhooks:resend', failClosed: false }),
+    async (req: Request, res: Response) => {
+      const webhookSecret = (process.env.RESEND_WEBHOOK_SECRET || '').trim();
+      if (!webhookSecret) {
+        return res.status(503).json({
+          error: 'Resend webhook verification secret is not configured.',
+          code: 'WEBHOOK_NOT_CONFIGURED',
+        });
+      }
+
+      const rawBody =
+        (req as Request & { rawBody?: string }).rawBody ??
+        (typeof req.body === 'string' ? req.body : JSON.stringify(req.body ?? {}));
+      const svixId = (req.header('svix-id') || '').trim();
+      const svixTimestamp = (req.header('svix-timestamp') || '').trim();
+      const svixSignature = (req.header('svix-signature') || '').trim();
+
+      const verified = verifyResendWebhookSignature({
+        rawBody,
+        svixId,
+        svixTimestamp,
+        svixSignature,
+        webhookSecret,
+      });
+
+      if (!verified.valid) {
+        logStructured('warn', 'resend_webhook_signature_rejected', {
+          svixId: svixId || 'missing',
+          reason: verified.reason,
+        });
+        return res.status(401).json({
+          error: verified.reason || 'Invalid webhook signature.',
+          code: 'INVALID_WEBHOOK_SIGNATURE',
+        });
+      }
+
+      const payload = (req.body || {}) as {
+        type?: string;
+        data?: { email_id?: string; id?: string; bounce?: { message?: string } };
+      };
+      const eventType = typeof payload.type === 'string' ? payload.type : 'unknown';
+      const providerMessageId =
+        typeof payload.data?.email_id === 'string'
+          ? payload.data.email_id
+          : typeof payload.data?.id === 'string'
+            ? payload.data.id
+            : undefined;
+      const payloadSha256 = sha256Hex(rawBody);
+      const nowIso = new Date().toISOString();
+
+      // Deduplicate webhook delivery by svix-id
+      const dupCheck = await withTransaction((db) => {
+        const existing = db.notificationWebhookEvents.find((e) => e.svixId === svixId);
+        if (existing) {
+          return { duplicate: true as const };
+        }
+        db.notificationWebhookEvents.unshift({
+          id: `whk-${crypto.randomUUID().slice(0, 10)}`,
+          provider: 'resend',
+          svixId,
+          eventType,
+          providerMessageId,
+          signatureVerified: true,
+          payloadSha256,
+          status:
+            eventType === 'email.delivered' || eventType === 'email.bounced' || eventType === 'email.complained'
+              ? 'processed'
+              : 'ignored',
+          receivedAt: nowIso,
+        });
+        if (db.notificationWebhookEvents.length > 500) {
+          db.notificationWebhookEvents = db.notificationWebhookEvents.slice(0, 500);
+        }
+        return { duplicate: false as const };
+      });
+
+      if (dupCheck.duplicate) {
+        return res.status(200).json({ received: true, deduplicated: true });
+      }
+
+      let reconciled = false;
+      if (providerMessageId && eventType === 'email.delivered') {
+        const result = await recordProviderDeliveryConfirmation(providerMessageId, 'Delivered');
+        reconciled = result.updated;
+      } else if (providerMessageId && (eventType === 'email.bounced' || eventType === 'email.complained')) {
+        const details = payload.data?.bounce?.message || `Resend event: ${eventType}`;
+        const result = await recordProviderDeliveryConfirmation(providerMessageId, 'Bounced', details);
+        reconciled = result.updated;
+      }
+
+      res.status(200).json({
+        received: true,
+        deduplicated: false,
+        eventType,
+        providerMessageId,
+        reconciled,
+      });
+    },
+  );
+
   // Global safe error handler — prevents hung sockets, unhandled rejections, stack trace leaks, or raw SQL errors
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     if (res.headersSent) return;
@@ -3886,7 +4293,16 @@ export function createApp(options: CreateAppOptions = {}) {
     if (
       errMsg.includes('PERSISTENCE_READINESS_FAILURE') ||
       errMsg.includes('DATABASE_URL is not configured') ||
-      ['ECONNREFUSED', 'ETIMEDOUT', '57P01', '57P03'].includes(errCode)
+      errMsg.includes('TLS_CONFIG_FAILURE') ||
+      [
+        'ECONNREFUSED',
+        'ETIMEDOUT',
+        '57P01',
+        '57P03',
+        'SELF_SIGNED_CERT_IN_CHAIN',
+        'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+        'DEPTH_ZERO_SELF_SIGNED_CERT',
+      ].includes(errCode)
     ) {
       res.status(503).json({
         error: 'Database service is temporarily unavailable. Please try again shortly.',

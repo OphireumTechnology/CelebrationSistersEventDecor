@@ -16,6 +16,7 @@ const EXPECTED_SEQUENCE = [
   '005_rls_event_planner_and_invoices.sql',
   '006_normalized_and_outbox.sql',
   '007_consultation_scheduling_and_railway_rls.sql',
+  '008_phase15_token_lifecycle_and_webhook_audit.sql',
 ];
 
 const REQUIRED_RLS_TABLES = [
@@ -54,6 +55,7 @@ const REQUIRED_RLS_TABLES = [
   'staff_availability_rules',
   'consultation_slot_holds',
   'crm_follow_up_tasks',
+  'notification_webhook_events',
 ];
 
 export async function validateMigrationsDirectory(
