@@ -19,7 +19,7 @@ import {
   type PgClientLike,
   type PgPoolLike,
 } from '../server/repositories/postgresRepository.ts';
-import { PostgresRateLimitStore } from '../server/rateLimit.ts';
+import { createRateLimiter, InMemoryRateLimitStore, PostgresRateLimitStore } from '../server/rateLimit.ts';
 import { generateTotpCode, generateTotpSecret, verifyTotpCode } from '../server/totp.ts';
 import type { Request } from 'express';
 import type { DatabaseSchema } from '../server/store.ts';
@@ -607,4 +607,29 @@ test('replica-safe PostgresRateLimitStore enforces request caps and emits Retry-
   assert.equal(r2.remaining, 0);
   assert.equal(r3.allowed, false);
   assert.equal(r3.remaining, 0);
+});
+
+test('rate limiter ignores spoofed X-Forwarded-For headers from untrusted clients', async () => {
+  const middleware = createRateLimiter(new InMemoryRateLimitStore(), true)(2, 60_000);
+  const invoke = async (spoofedIp: string): Promise<number> => {
+    let status = 200;
+    let proceeded = false;
+    const req = {
+      method: 'POST',
+      path: '/api/auth/mfa/verify',
+      ip: '192.0.2.15',
+      socket: { remoteAddress: '192.0.2.15' },
+      header: (name: string) => name.toLowerCase() === 'x-forwarded-for' ? spoofedIp : undefined,
+    } as unknown as Request;
+    const res = {
+      setHeader: () => undefined,
+      status: (code: number) => { status = code; return res; },
+      json: () => res,
+    } as unknown as import('express').Response;
+    await middleware(req, res, () => { proceeded = true; });
+    return proceeded ? 200 : status;
+  };
+  assert.equal(await invoke('198.51.100.1'), 200);
+  assert.equal(await invoke('198.51.100.2'), 200);
+  assert.equal(await invoke('198.51.100.3'), 429);
 });
