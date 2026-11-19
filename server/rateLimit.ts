@@ -44,7 +44,8 @@ export interface PgQueryable {
 
 /**
  * Multi-replica PostgreSQL rate-limit store backed by rate_limit_buckets (migration 004).
- * Falls back cleanly to in-memory limiter if the rate-limit table is unavailable.
+ * Falls back to an in-memory limiter if the rate-limit table is unavailable.
+ * NOTE: This fallback is process-local and does not provide cross-replica enforcement.
  */
 export class PostgresRateLimitStore implements RateLimitStore {
   private readonly fallback = new InMemoryRateLimitStore();
@@ -92,8 +93,10 @@ export function createRateLimiter(store: RateLimitStore, enabled: boolean) {
   return function rateLimit(maxRequests: number, windowMs: number) {
     return async (req: Request, res: Response, next: NextFunction) => {
       if (!enabled) return next();
-      const forwarded = (req.header('x-forwarded-for') || '').split(',')[0]?.trim();
-      const clientIp = forwarded || req.ip || 'local';
+      // Do not trust a caller-controlled X-Forwarded-For header. Express req.ip
+      // uses the socket address unless the deployment explicitly configures
+      // a trusted proxy chain, preventing trivial header-rotation bypasses.
+      const clientIp = req.ip || req.socket.remoteAddress || 'local';
       const key = `${clientIp}:${req.method}:${req.path}`;
 
       const result = await store.consume(key, maxRequests, windowMs);
