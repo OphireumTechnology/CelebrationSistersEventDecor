@@ -167,20 +167,20 @@ test('Block 13.2: rate limiter ignores spoofed X-Forwarded-For, shares PostgreSQ
     assert.equal(authJson.code, 'RATE_LIMITER_UNAVAILABLE');
 
     // Noncritical limiter with failClosed: false falls back cleanly rather than returning 503
-    const nonCriticalMw = createRateLimiter({
-      windowMs: 60_000,
-      maxRequests: 2,
-      keyPrefix: 'noncrit',
+    const nonCriticalStore = new PostgresRateLimitStore({
+      async query() {
+        throw new Error('DB temporarily unreachable');
+      },
+    });
+    const nonCriticalMw = createRateLimiter(nonCriticalStore, true)(2, 60_000, {
+      endpointGroup: 'noncrit',
       failClosed: false,
-      store: new PostgresRateLimitStore({
-        async query() {
-          throw new Error('DB temporarily unreachable');
-        },
-      }),
     });
     let nextCalled = 0;
     const mockReq = {
       ip: '127.0.0.1',
+      method: 'GET',
+      path: '/api/test/noncritical',
       headers: {},
       socket: { remoteAddress: '127.0.0.1' },
     } as unknown as Request;

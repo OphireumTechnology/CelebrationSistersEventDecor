@@ -292,10 +292,11 @@ test('Block 13.5: normalized PostgreSQL repository executes row-locked atomic bo
   try {
     const db = await readDb();
     const report = buildReconciliationReport(db);
-    assert.equal(report.passed, true);
+    assert.equal(report.mode, 'dry-run');
+    assert.equal(report.snapshotPreserved, true);
     assert.equal(report.anomalies.length, 0);
-    assert.ok(report.benchmark.snapshotRoundTripAvgMs >= 0);
-    assert.ok(report.benchmark.normalizedIndexedReadAvgMs >= 0);
+    assert.ok(report.benchmark.snapshotCloneAvgMs >= 0);
+    assert.ok(report.benchmark.normalizedRowLookupAvgMs >= 0);
   } finally {
     delete process.env.CS_DB_PATH;
     await fs.rm(tmpDir, { recursive: true, force: true });
@@ -443,7 +444,7 @@ test('Block 13.7: transactional email outbox covers all 13 durability, retry, de
         netCalls += 1;
         if (netCalls === 1) throw new Error('ECONNRESET');
         if (netCalls === 2) {
-          return new Promise((_resolve, reject) => {
+          return new Promise<Response>((_resolve, reject) => {
             init?.signal?.addEventListener('abort', () => reject(new Error('Aborted')));
           });
         }
