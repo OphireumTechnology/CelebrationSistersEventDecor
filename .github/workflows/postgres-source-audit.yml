@@ -1,0 +1,30 @@
+name: PostgreSQL source audit (offline, read-only)
+on:
+  pull_request:
+    paths:
+      - 'db/**'
+      - 'scripts/verify-migrations.ts'
+      - 'scripts/check-postgres-source.ps1'
+      - 'scripts/audit-postgres.ps1'
+      - '.github/workflows/postgres-source-audit.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Existing TypeScript migration validator
+        run: npx tsx scripts/verify-migrations.ts
+      - name: PowerShell migration sequence audit
+        shell: pwsh
+        run: ./scripts/check-postgres-source.ps1
