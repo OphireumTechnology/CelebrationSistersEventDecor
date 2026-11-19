@@ -1,0 +1,546 @@
+From 59af036c26940ee832c590f412920094cf98a7cb Mon Sep 17 00:00:00 2001
+From: Celebration Sisters Release Engineering
+ <release@celebrationsisters.example.com>
+Date: Thu, 19 Nov 2026 02:08:32 +0000
+Subject: [PATCH] chore(phase-12): payment architecture, security certification
+ tests & release sync package
+
+---
+ docs/PAYMENT_INTEGRATION_ARCHITECTURE.md     | 126 ++++++++
+ docs/RAILWAY_PRODUCTION_CONFIG.md            |  19 +-
+ docs/release/PHASE_12_SYNC_AND_PR.md         |  49 +++
+ tests/phase12-security-certification.test.ts | 298 +++++++++++++++++++
+ 4 files changed, 482 insertions(+), 10 deletions(-)
+ create mode 100644 docs/PAYMENT_INTEGRATION_ARCHITECTURE.md
+ create mode 100644 docs/release/PHASE_12_SYNC_AND_PR.md
+ create mode 100644 tests/phase12-security-certification.test.ts
+
+diff --git a/docs/PAYMENT_INTEGRATION_ARCHITECTURE.md b/docs/PAYMENT_INTEGRATION_ARCHITECTURE.md
+new file mode 100644
+index 0000000..a87f919
+--- /dev/null
++++ b/docs/PAYMENT_INTEGRATION_ARCHITECTURE.md
+@@ -0,0 +1,126 @@
++# Payment Integration Architecture & Implementation Plan
++## Celebration Sisters Event Decor — Block 12.10 Readiness Blueprint
++
++**Status:** Design & Architecture Complete — **Live Payment Processing: `NOT IMPLEMENTED` (Awaiting Explicit Owner & Provider Approval)**  
++**Current Production Safeguard:** `POST /api/bookings/:id/payments/:paymentId/pay` blocks client self-marking in `NODE_ENV=production` with HTTP `501 PAYMENT_PROVIDER_NOT_INTEGRATED` (`liveProcessorVerified: false`). Manual/staging ledger updates are explicitly labeled `paymentProcessingMode: "manual_staging_ledger"`.
++
++---
++
++## 1. Existing Data Models & Constraints
++
++The relational schema in `db/migrations/001_initial_schema.sql` and RLS policies in `002_rls_policies.sql` + `005_rls_event_planner_and_invoices.sql` already provision payment-ready structures:
++
++- **`invoices` table:** `id (UUID)`, `booking_id (FK -> bookings)`, `invoice_number (UNIQUE)`, `currency ('USD')`, `total_cents (>= 0)`, `due_date`, `status ('draft' | 'open' | 'partially_paid' | 'paid' | 'void')`.
++- **`payments` table:** `id (UUID)`, `booking_id (FK -> bookings)`, `invoice_id (FK -> invoices)`, `milestone_label`, `amount_cents (> 0)`, `currency ('USD')`, `provider`, `idempotency_key (UNIQUE)`, `provider_event_id (UNIQUE)`, `status ('Pending' | 'Paid' | 'Overdue' | 'Refunded')`, `due_date`, `paid_at`.
++- **RLS Isolation:** Clients can only `SELECT` invoices/payments tied to their own bookings; Vendors have **zero** access to `quotations`, `quote_items`, `contracts`, `invoices`, or `payments`; only backend service-role/admin/staff workflows mutate payment records.
++
++---
++
++## 2. Luxury Event Provider Requirements (Columbia, SC)
++
++Celebration Sisters Event Decor invoices high-value luxury weddings, corporate galas, and full-production events (commonly $5,000–$75,000+ split across Deposit, Design Milestone, and Final Balance installments):
++
++1. **Multi-milestone installment billing** (e.g., 35% Retainer Deposit, 35% Production Milestone, 30% Final Balance 14 days pre-event).
++2. **Low-fee US ACH Bank Transfers (`us_bank_account`)** alongside Credit/Debit Cards so high-ticket deposits avoid prohibitive 2.9% card surcharges (ACH capped near $5 per transaction on Stripe).
++3. **PCI-DSS SAQ-A compliance:** Card/bank credentials must NEVER touch Celebration Sisters Express servers or browser JavaScript memory; hosted checkout or tokenized Elements only.
++4. **Cryptographically signed asynchronous webhooks** with replay protection and idempotent reconciliation.
++5. **Structured refunds, partial refunds, and chargeback/dispute evidence tracking.**
++
++---
++
++## 3. Payment Provider Comparison Matrix
++
++| Criterion | **Stripe (Recommended)** | PayPal Commerce / Braintree | Square Online Payments |
++| --- | --- | --- | --- |
++| **Card Pricing (US)** | 2.9% + $0.30 | 2.99%–3.49% + $0.49 | 2.9% + $0.30 |
++| **US ACH Direct Debit** | 0.8% capped at **$5.00** (ideal for $15k+ event retainers) | Limited / higher friction | 1.0% (no $5 cap on standard online) |
++| **PCI Scope** | SAQ-A via Stripe Checkout / Elements | SAQ-A via PayPal Smart Buttons | SAQ-A via Web Payments SDK |
++| **Webhook Security** | `Stripe-Signature` HMAC-SHA256 + timestamp tolerance + event IDs | Cert-based signature verification (heavier runtime overhead) | HMAC-SHA256 webhook signature |
++| **Idempotency Support** | First-class `Idempotency-Key` header on all write APIs | Request-ID header | `idempotency_key` in body |
++| **Dispute & Refund API** | Full lifecycle webhooks (`charge.refunded`, `charge.dispute.*`) | Supported | Supported |
++| **Node/TypeScript SDK** | Official strongly-typed `stripe` SDK | Official SDK | Official SDK |
++
++**Architectural Recommendation:** Adopt **Stripe Checkout Sessions + PaymentIntents (Cards + US ACH Direct Debit)** as the primary processor, preserving optional offline check/wire manual ledger reconciliation strictly for MFA-authenticated Executive Administrators (`admin` role only).
++
++---
++
++## 4. Checkout & PaymentIntent Architecture
++
++```text
++[Client Portal]
++   | 1. POST /api/bookings/:id/payments/:paymentId/checkout-session
++   |    (Authenticated Client; server verifies booking ownership & milestone is Pending)
++   v
++[Express Backend (Railway)]
++   | 2. Computes authoritative amount_cents from DB (NEVER trusts client-supplied amount)
++   | 3. Generates deterministic Idempotency-Key: `cs-pay:${bookingId}:${paymentId}:v${attempt}`
++   | 4. Calls Stripe API: checkout.sessions.create({
++   |      mode: 'payment',
++   |      payment_method_types: ['card', 'us_bank_account'],
++   |      client_reference_id: booking.referenceCode,
++   |      metadata: { bookingId, paymentId, invoiceId },
++   |      success_url, cancel_url
++   |    })
++   v
++[Client Browser] -> Redirects to Stripe-hosted Checkout URL (PCI SAQ-A)
++   | 5. Client completes payment on Stripe
++   v
++[Stripe Webhook Engine]
++   | 6. POST /api/webhooks/stripe  (Raw UTF-8 body + Stripe-Signature header)
++   v
++[Express Backend]
++   | 7. Verifies HMAC-SHA256 signature & timestamp tolerance (<= 300s)
++   | 8. Inside PostgreSQL Transaction (BEGIN ... SELECT FOR UPDATE ... COMMIT):
++   |      - Checks UNIQUE(provider_event_id) for idempotency
++   |      - Validates paid amount_cents === milestone.amount_cents && currency === 'USD'
++   |      - Marks milestone Paid with provider reference & paid_at
++   |      - If contract dual-signed & deposit settled -> transitions booking to Confirmed
++   |      - Inserts immutable audit_logs entry & queues Resend payment receipt
++```
++
++---
++
++## 5. Webhook Signature Verification & Replay Defense
++
++1. Mount `express.raw({ type: 'application/json' })` specifically on `/api/webhooks/stripe` **before** global `express.json()`.
++2. Verify signature using `stripe.webhooks.constructEvent(rawBody, sigHeader, process.env.STRIPE_WEBHOOK_SECRET)` with the default 300-second replay window.
++3. Reject missing/invalid signatures with HTTP `400` and log a `PAYMENT_WEBHOOK_REJECTED` security event without leaking secret material.
++4. Return HTTP `200` immediately after durable commit; return HTTP `500` on transient DB failures so Stripe's exponential retry queue redelivers safely.
++
++---
++
++## 6. Idempotent Reconciliation & Concurrency Controls
++
++- **Database Uniqueness:** Enforce `UNIQUE(idempotency_key)` and `UNIQUE(provider_event_id)` on `payments` (already defined in `001_initial_schema.sql`).
++- **Row-Level Locking:** Lock the booking/payment row via `SELECT ... FOR UPDATE` before evaluating status transitions so simultaneous webhook retries or concurrent ACH settlement callbacks never double-credit or emit duplicate receipts.
++- **Amount & Currency Verification:** Reject and alert (`PAYMENT_AMOUNT_MISMATCH`) if `event.data.object.amount_received !== milestone.amount_cents` or `currency.toUpperCase() !== 'USD'`.
++
++---
++
++## 7. Refunds, Partial Refunds, Disputes & Cancellations
++
++- **Executive Admin Only:** Only MFA-verified `admin` users may initiate refunds via `POST /api/admin/bookings/:id/payments/:paymentId/refund` (with mandatory `reason` and optional `amountCents <= paidAmountCents`).
++- **Webhook-Driven Finality:** Issuing a refund marks the milestone `Refund Pending`; only the signed `charge.refunded` webhook transitions it to `Refunded` (or records partial refund ledger entry).
++- **Disputes/Chargebacks:** Listen for `charge.dispute.created` -> immediately freeze automated booking completion, log `PAYMENT_DISPUTE_OPENED` in `audit_logs`, and dispatch an urgent Resend alert to `STAFF_NOTIFICATION_EMAIL`.
++- **Booking Cancellation:** Cancelling a booking voids unpaid `Pending` milestones and expires open Checkout Sessions (`checkout.sessions.expire`) so a client cannot pay a cancelled event.
++
++---
++
++## 8. Security, RBAC & Audit Requirements
++
++- **Strict Client Prohibition:** Clients can **never** directly call an endpoint to mark an invoice or milestone `Paid`. Only cryptographically verified provider webhooks (or MFA-verified `admin` manual check/wire recording with required wire/check reference + audit justification) may transition payment state to `Paid`.
++- **Immutable Audit Trail:** Every checkout session creation, webhook verification, settlement, refund, manual offline wire entry, and failure appends an entry to `audit_logs` containing `actor`, `bookingReference`, `amountCents`, `providerEventId`, and `timestamp`.
++- **Required Future Environment Variables (Names Only — Never Commit Values):**
++  - `PAYMENT_PROVIDER` (`none` | `stripe`)
++  - `STRIPE_SECRET_KEY` (server-side only; `sk_test_...` in staging, `sk_live_...` only after approval)
++  - `STRIPE_WEBHOOK_SECRET` (`whsec_...`)
++  - `PAYMENT_LIVE_ENABLED` (`false` by default; kill-switch mirroring `EMAIL_LIVE_DELIVERY_ENABLED`)
++
++---
++
++## 9. Phased Implementation Plan (Post-Approval)
++
++1. **Phase A (Approval Gate):** Owner approves Stripe as provider, completes Stripe US business verification, and provisions Staging Test-Mode keys (`sk_test_*`, `whsec_*`).
++2. **Phase B (Additive Migration `006`):** Expand `payments.provider` check constraint to include `'stripe'` and add `refunded_cents`, `checkout_session_id`, and `payment_dispute_status`.
++3. **Phase C (Backend & Webhook Implementation):** Add `server/payments.ts`, `POST /api/bookings/:id/payments/:paymentId/checkout-session`, `POST /api/webhooks/stripe`, and `POST /api/admin/bookings/:id/payments/:paymentId/refund`.
++4. **Phase D (Staging Sandbox Testing):** Execute Stripe test cards (success, 3DS authentication, decline, duplicate webhook replay, partial refund, dispute simulation) and verify end-to-end DB + Resend receipt reconciliation before requesting production go-live approval.
+diff --git a/docs/RAILWAY_PRODUCTION_CONFIG.md b/docs/RAILWAY_PRODUCTION_CONFIG.md
+index 5434770..925e284 100644
+--- a/docs/RAILWAY_PRODUCTION_CONFIG.md
++++ b/docs/RAILWAY_PRODUCTION_CONFIG.md
+@@ -84,21 +84,20 @@ Configure under **GitHub Repository -> Settings -> Secrets and variables -> Acti
+ 
+ ## 5. GitHub Synchronization Commands (Run Locally with Authenticated Git Credentials)
+ 
+-Because the AI Studio sandbox does not have a `.git` repository or write credentials, sync from an authorized developer workstation:
++Because the AI Studio sandbox does not have a `.git` repository or write credentials, sync from an authorized developer workstation using the generated Phase 12 patch (`docs/release/phase-12-release-integration.patch`) or direct copy:
+ 
+ ```bash
+ git checkout main
+ git pull origin main
+-git checkout -b development/phase-11-production-integration
+-# Copy/apply verified workspace files, verify with:
++git checkout -b development/phase-12-release-integration
++# Option A: Apply the transferable Phase 12 patch generated off main (cedab61)
++git am docs/release/phase-12-release-integration.patch
++# Verify cleanly before pushing:
+ npm ci && npm audit --audit-level=high && npx tsx scripts/verify-migrations.ts && npm run lint && npm test && npm run build
+-git status
+-git add -A
+-git commit -m "chore(phase-11): deterministic lockfile, migration 005 RLS fixes, AI & payment hardening"
+-git push -u origin development/phase-11-production-integration
+-gh pr create --base main --head development/phase-11-production-integration \
+-  --title "Phase 11: Deterministic Lockfile, Supabase RLS 005, AI/Payment Hardening & Release Prep" \
+-  --body "Implements Phase 11 Blocks 11.1-11.11. Do not merge until CI, Docker build, and staging acceptance pass."
++git push -u origin development/phase-12-release-integration
++gh pr create --base main --head development/phase-12-release-integration \
++  --title "Phase 12: Payment Architecture, Security Certification Tests & Release Transfer Package" \
++  --body-file docs/release/PHASE_12_SYNC_AND_PR.md
+ ```
+ 
+ ---
+diff --git a/docs/release/PHASE_12_SYNC_AND_PR.md b/docs/release/PHASE_12_SYNC_AND_PR.md
+new file mode 100644
+index 0000000..83ab2ec
+--- /dev/null
++++ b/docs/release/PHASE_12_SYNC_AND_PR.md
+@@ -0,0 +1,49 @@
++# Phase 12 Pull Request & Transferable Synchronization Guide
++## Branch: `development/phase-12-release-integration` -> `main`
++
++- **Authoritative GitHub `main` Baseline SHA:** `cedab61177d38c2e3d65edde5e27f4a470347d21` (*"ci: standardize on npm ci and add migration checks"* — confirmed 100% of Phase 11 changes including `package-lock.json`, migration `005`, `scripts/verify-migrations.ts`, `Dockerfile`, CI/Pages workflows, Express 4 async error guard, AI hardening, and `phase11-release-acceptance.test.ts` are already present on `main`).
++- **Superseded Pull Requests:** PR #2, PR #3, PR #4, and PR #5 are superseded by `main` (`cedab61`) and may be closed once GitHub Actions passes on `main` / this branch.
++
++---
++
++## Summary of Phase 12 Changes
++
++1. **Payment Integration Readiness (`docs/PAYMENT_INTEGRATION_ARCHITECTURE.md`):**
++   - Complete architecture & phased implementation plan for Stripe Checkout + PaymentIntents + US ACH Direct Debit, HMAC-SHA256 webhook verification, idempotent reconciliation, refunds/disputes, and PCI SAQ-A / RBAC boundaries.
++   - Live payment processing remains **`NOT IMPLEMENTED`** until explicit owner & provider approval.
++2. **Security Certification Regression Suite (`tests/phase12-security-certification.test.ts`):**
++   - Verifies rejection of `alg:none` JWTs, payload-tampered HMAC tokens, and MFA privilege bypass attempts.
++   - Verifies anti-session-fixation token rotation on MFA elevation and `Max-Age=0` cookie clearing on logout.
++   - Verifies live HTTP `429 RATE_LIMIT_EXCEEDED` with `RateLimit-Limit`, `RateLimit-Remaining`, and `Retry-After` headers.
++   - Verifies production PostgreSQL client payment self-marking fails closed with HTTP `501 PAYMENT_PROVIDER_NOT_INTEGRATED` (`liveProcessorVerified: false`) and client status bypass returns `403`.
++3. **Deployment Runbook & Transfer Package (`docs/RAILWAY_PRODUCTION_CONFIG.md`, `docs/release/phase-12-release-integration.patch`):**
++   - Transferable `git format-patch` artifact built cleanly off `cedab61177d38c2e3d65edde5e27f4a470347d21` and verified via `git apply --check`.
++
++---
++
++## Apply & Push Instructions (Authorized Workstation)
++
++```bash
++git checkout main
++git pull origin main
++git checkout -b development/phase-12-release-integration
++git am docs/release/phase-12-release-integration.patch
++npm ci && npm audit --audit-level=high && npx tsx scripts/verify-migrations.ts && npm run lint && npm test && npm run build
++git push -u origin development/phase-12-release-integration
++gh pr create --base main --head development/phase-12-release-integration \
++  --title "Phase 12: Payment Architecture, Security Certification Tests & Release Transfer Package" \
++  --body-file docs/release/PHASE_12_SYNC_AND_PR.md
++```
++
++---
++
++## Remaining Staging Gates Required Before `RELEASE_CANDIDATE` Promotion
++
++- [ ] Remote GitHub Actions (`verify` + `docker-build`) green on `development/phase-12-release-integration`
++- [ ] Apply migrations `001`–`005` against approved staging Supabase PostgreSQL instance & verify `/ready`
++- [ ] Verify live Supabase Auth registration, login, password recovery, immutable UUID binding & admin TOTP MFA in staging
++- [ ] Deploy compiled Express backend (`Dockerfile` + `railway.json`) to Railway staging (`zesty-curiosity` / `CelebrationSistersEventDecor`) and verify HTTPS `/health`, `/ready`, `/api/auth/config`
++- [ ] Bind GitHub Pages `VITE_API_BASE_URL` + `VITE_SUPABASE_*` variables to staging and execute desktop/tablet/mobile browser acceptance journeys
++- [ ] Verify Resend domain SPF/DKIM & send one authorized staging test email
++- [ ] Verify live Gemini API Concierge & Concept Studio in staging (if AI enabled)
++- [ ] Explicit owner sign-off prior to merging into `main` or enabling live production credentials
+diff --git a/tests/phase12-security-certification.test.ts b/tests/phase12-security-certification.test.ts
+new file mode 100644
+index 0000000..dbd5d36
+--- /dev/null
++++ b/tests/phase12-security-certification.test.ts
+@@ -0,0 +1,298 @@
++import assert from 'node:assert/strict';
++import fs from 'node:fs/promises';
++import os from 'node:os';
++import path from 'node:path';
++import test from 'node:test';
++import type { QueryResult, QueryResultRow } from 'pg';
++import { createApp } from '../server/app.ts';
++import {
++  setInjectedPgPoolForTests,
++  type PgClientLike,
++  type PgPoolLike,
++} from '../server/repositories/postgresRepository.ts';
++import type { DatabaseSchema } from '../server/store.ts';
++import { readDb } from '../server/store.ts';
++import { generateTotpCode } from '../server/totp.ts';
++
++async function startIsolatedServer(options?: { enableRateLimit?: boolean }) {
++  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cs-p12-sec-'));
++  process.env.CS_DB_PATH = path.join(tmpDir, 'db.json');
++  const app = createApp({ enableRateLimit: options?.enableRateLimit ?? false });
++  const server = await new Promise<ReturnType<typeof app.listen>>((resolve) => {
++    const s = app.listen(0, '127.0.0.1', () => resolve(s));
++  });
++  const addr = server.address();
++  const baseUrl = typeof addr === 'object' && addr ? `http://127.0.0.1:${addr.port}` : '';
++  return {
++    baseUrl,
++    cleanup: async () => {
++      await new Promise<void>((resolve) => server.close(() => resolve()));
++      await fs.rm(tmpDir, { recursive: true, force: true });
++      delete process.env.CS_DB_PATH;
++    },
++  };
++}
++
++function createInMemoryMockPgPool(initialSeed: DatabaseSchema): PgPoolLike {
++  let committed: DatabaseSchema = JSON.parse(JSON.stringify(initialSeed)) as DatabaseSchema;
++  let staged: DatabaseSchema = JSON.parse(JSON.stringify(initialSeed)) as DatabaseSchema;
++
++  const client: PgClientLike = {
++    async query<T extends QueryResultRow = QueryResultRow>(text: string, values?: unknown[]): Promise<QueryResult<T>> {
++      const sql = text.trim().replace(/\s+/g, ' ');
++      if (sql === 'BEGIN') {
++        staged = JSON.parse(JSON.stringify(committed)) as DatabaseSchema;
++        return { rows: [], rowCount: 0, command: 'BEGIN', oid: 0, fields: [] };
++      }
++      if (sql === 'COMMIT') {
++        committed = JSON.parse(JSON.stringify(staged)) as DatabaseSchema;
++        return { rows: [], rowCount: 0, command: 'COMMIT', oid: 0, fields: [] };
++      }
++      if (sql === 'ROLLBACK') {
++        staged = JSON.parse(JSON.stringify(committed)) as DatabaseSchema;
++        return { rows: [], rowCount: 0, command: 'ROLLBACK', oid: 0, fields: [] };
++      }
++      if (sql.startsWith('SELECT payload FROM app_state_snapshots')) {
++        return {
++          rows: [{ payload: staged } as unknown as T],
++          rowCount: 1,
++          command: 'SELECT',
++          oid: 0,
++          fields: [],
++        };
++      }
++      if (sql.startsWith('UPDATE app_state_snapshots')) {
++        staged = JSON.parse(String(values?.[1] ?? '{}')) as DatabaseSchema;
++        return { rows: [], rowCount: 1, command: 'UPDATE', oid: 0, fields: [] };
++      }
++      return { rows: [{ payload: committed } as unknown as T], rowCount: 1, command: 'OK', oid: 0, fields: [] };
++    },
++    release() {
++      // no-op
++    },
++  };
++
++  return {
++    async connect() {
++      return client;
++    },
++    async query<T extends QueryResultRow = QueryResultRow>(): Promise<QueryResult<T>> {
++      return { rows: [{ ok: 1 } as unknown as T], rowCount: 1, command: 'SELECT', oid: 0, fields: [] };
++    },
++    async end() {
++      // no-op
++    },
++  };
++}
++
++test('Block 12.11: rejects alg:none JWT, tampered HMAC session tokens, and MFA privilege bypass attempts', async () => {
++  const { baseUrl, cleanup } = await startIsolatedServer();
++  try {
++    // 1. Forged alg:none JWT claiming admin + aal2 must be rejected (401)
++    const header = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url');
++    const payload = Buffer.from(
++      JSON.stringify({
++        sub: 'sb-uuid-admin',
++        email: 'directors@celebrationsisters.example.com',
++        role: 'admin',
++        aal: 'aal2',
++        exp: Math.floor(Date.now() / 1000) + 3600,
++      }),
++    ).toString('base64url');
++    const unsignedJwt = `${header}.${payload}.`;
++
++    const algNoneBookings = await fetch(`${baseUrl}/api/bookings`, {
++      headers: { Authorization: `Bearer ${unsignedJwt}` },
++    });
++    assert.equal(algNoneBookings.status, 401);
++
++    const algNoneAdmin = await fetch(`${baseUrl}/api/admin/overview`, {
++      headers: { Authorization: `Bearer ${unsignedJwt}` },
++    });
++    assert.equal(algNoneAdmin.status, 403);
++
++    // 2. Tampering a legitimate client token payload to claim admin + mfaVerified:true must fail signature check
++    const switchRes = await fetch(`${baseUrl}/api/auth/switch`, {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
++      body: JSON.stringify({ userId: 'user-client-camille' }),
++    });
++    const { token: clientToken } = (await switchRes.json()) as { token: string };
++    const [, originalSig] = clientToken.split('.');
++    const forgedPayload = Buffer.from(
++      JSON.stringify({
++        userId: 'user-admin-director',
++        role: 'admin',
++        mfaVerified: true,
++        issuedAt: Date.now(),
++        expiresAt: Date.now() + 60_000,
++      }),
++    ).toString('base64url');
++    const tamperedToken = `${forgedPayload}.${originalSig}`;
++
++    const tamperedAdmin = await fetch(`${baseUrl}/api/admin/overview`, {
++      headers: { Authorization: `Bearer ${tamperedToken}` },
++    });
++    assert.equal(tamperedAdmin.status, 403);
++
++    const tamperedSession = await fetch(`${baseUrl}/api/auth/session`, {
++      headers: { Authorization: `Bearer ${tamperedToken}` },
++    });
++    const tamperedSessionBody = (await tamperedSession.json()) as { user: { role: string } };
++    assert.equal(tamperedSessionBody.user.role, 'guest');
++  } finally {
++    await cleanup();
++  }
++});
++
++test('Block 12.11: enforces token rotation on MFA elevation (anti-session-fixation) and cookie clearing on logout', async () => {
++  const { baseUrl, cleanup } = await startIsolatedServer();
++  try {
++    const switchRes = await fetch(`${baseUrl}/api/auth/switch`, {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
++      body: JSON.stringify({ userId: 'user-admin-director' }),
++    });
++    const { token: preMfaToken } = (await switchRes.json()) as { token: string };
++
++    const enrollRes = await fetch(`${baseUrl}/api/auth/mfa/totp/enroll`, {
++      method: 'POST',
++      headers: { Authorization: `Bearer ${preMfaToken}` },
++    });
++    const { secret } = (await enrollRes.json()) as { secret: string };
++
++    const verifyRes = await fetch(`${baseUrl}/api/auth/mfa/verify`, {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${preMfaToken}` },
++      body: JSON.stringify({ code: generateTotpCode(secret) }),
++    });
++    assert.equal(verifyRes.status, 200);
++    const { token: postMfaToken } = (await verifyRes.json()) as { token: string };
++
++    // Token MUST rotate on privilege elevation; pre-MFA token remains denied on executive routes
++    assert.notEqual(postMfaToken, preMfaToken);
++    const preMfaReplay = await fetch(`${baseUrl}/api/admin/overview`, {
++      headers: { Authorization: `Bearer ${preMfaToken}` },
++    });
++    assert.equal(preMfaReplay.status, 403);
++
++    const postMfaOverview = await fetch(`${baseUrl}/api/admin/overview`, {
++      headers: { Authorization: `Bearer ${postMfaToken}` },
++    });
++    assert.equal(postMfaOverview.status, 200);
++
++    // Logout clears session cookie with Max-Age=0
++    const logoutRes = await fetch(`${baseUrl}/api/auth/logout`, {
++      method: 'POST',
++      headers: { Authorization: `Bearer ${postMfaToken}` },
++    });
++    assert.equal(logoutRes.status, 200);
++    const clearedCookie = logoutRes.headers.get('set-cookie') || '';
++    assert.ok(clearedCookie.includes('cs_session='));
++    assert.ok(clearedCookie.includes('Max-Age=0'));
++  } finally {
++    await cleanup();
++  }
++});
++
++test('Block 12.11: enforces HTTP 429 RATE_LIMIT_EXCEEDED with RateLimit-* and Retry-After headers when rate limiter is active', async () => {
++  const { baseUrl, cleanup } = await startIsolatedServer({ enableRateLimit: true });
++  try {
++    // /api/auth/mfa/totp/enroll is rate-limited to 5 requests per 60s
++    let hit429 = false;
++    for (let i = 0; i < 7; i += 1) {
++      const res = await fetch(`${baseUrl}/api/auth/mfa/totp/enroll`, {
++        method: 'POST',
++      });
++      if (res.status === 429) {
++        hit429 = true;
++        const body = (await res.json()) as { code: string };
++        assert.equal(body.code, 'RATE_LIMIT_EXCEEDED');
++        assert.equal(res.headers.get('ratelimit-limit'), '5');
++        assert.equal(res.headers.get('ratelimit-remaining'), '0');
++        const retryAfter = Number(res.headers.get('retry-after') || '0');
++        assert.ok(retryAfter >= 1);
++        break;
++      }
++    }
++    assert.equal(hit429, true, 'Expected rate limiter to trigger HTTP 429 after 5 attempts');
++  } finally {
++    await cleanup();
++  }
++});
++
++test('Block 12.10 & 12.11: blocks production client payment self-marking with HTTP 501 PAYMENT_PROVIDER_NOT_INTEGRATED when PostgreSQL is live', async () => {
++  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cs-p12-pay-'));
++  process.env.CS_DB_PATH = path.join(tmpDir, 'db.json');
++  const seed = await readDb();
++  const mockPool = createInMemoryMockPgPool(seed);
++
++  const prevEnv = process.env.NODE_ENV;
++  const prevAdapter = process.env.PERSISTENCE_ADAPTER;
++  const prevSecret = process.env.SESSION_SECRET;
++  const prevDbUrl = process.env.DATABASE_URL;
++
++  const { signSessionToken } = await import('../server/auth.ts');
++
++  setInjectedPgPoolForTests(mockPool);
++  process.env.NODE_ENV = 'production';
++  process.env.PERSISTENCE_ADAPTER = 'postgres';
++  process.env.DATABASE_URL = 'postgresql://staging:test@127.0.0.1:5432/cs_staging';
++  process.env.SESSION_SECRET = 'phase-12-verified-production-test-secret-key-2026';
++
++  const app = createApp({ enableRateLimit: false });
++  const server = await new Promise<ReturnType<typeof app.listen>>((resolve) => {
++    const s = app.listen(0, '127.0.0.1', () => resolve(s));
++  });
++  const addr = server.address();
++  const baseUrl = typeof addr === 'object' && addr ? `http://127.0.0.1:${addr.port}` : '';
++
++  try {
++    const prodClientToken = signSessionToken({
++      userId: 'user-client-camille',
++      role: 'client',
++      mfaVerified: true,
++      issuedAt: Date.now(),
++      expiresAt: Date.now() + 60_000,
++    });
++
++    const targetBooking = seed.bookings.find((b) => b.clientId === 'user-client-camille');
++    assert.ok(targetBooking);
++    const pendingMilestone = targetBooking.payments.find((p) => p.status !== 'Paid') ?? targetBooking.payments[0];
++    assert.ok(pendingMilestone);
++
++    // 1. Production client self-marking payment MUST fail closed with 501 PAYMENT_PROVIDER_NOT_INTEGRATED
++    const payRes = await fetch(
++      `${baseUrl}/api/bookings/${targetBooking.id}/payments/${pendingMilestone.id}/pay`,
++      {
++        method: 'POST',
++        headers: { Authorization: `Bearer ${prodClientToken}` },
++      },
++    );
++    assert.equal(payRes.status, 501);
++    const payBody = (await payRes.json()) as { code: string; liveProcessorVerified: boolean };
++    assert.equal(payBody.code, 'PAYMENT_PROVIDER_NOT_INTEGRATED');
++    assert.equal(payBody.liveProcessorVerified, false);
++
++    // 2. Client attempting to bypass payment by forcing status to Confirmed via PATCH MUST be rejected (403)
++    const statusBypass = await fetch(`${baseUrl}/api/bookings/${targetBooking.id}/status`, {
++      method: 'PATCH',
++      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${prodClientToken}` },
++      body: JSON.stringify({ status: 'Confirmed' }),
++    });
++    assert.equal(statusBypass.status, 403);
++  } finally {
++    await new Promise<void>((resolve) => server.close(() => resolve()));
++    setInjectedPgPoolForTests(null);
++    if (prevEnv === undefined) delete process.env.NODE_ENV;
++    else process.env.NODE_ENV = prevEnv;
++    if (prevAdapter === undefined) delete process.env.PERSISTENCE_ADAPTER;
++    else process.env.PERSISTENCE_ADAPTER = prevAdapter;
++    if (prevSecret === undefined) delete process.env.SESSION_SECRET;
++    else process.env.SESSION_SECRET = prevSecret;
++    if (prevDbUrl === undefined) delete process.env.DATABASE_URL;
++    else process.env.DATABASE_URL = prevDbUrl;
++    await fs.rm(tmpDir, { recursive: true, force: true });
++    delete process.env.CS_DB_PATH;
++  }
++});
+-- 
+2.34.1
+

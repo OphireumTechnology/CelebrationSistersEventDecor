@@ -84,21 +84,20 @@ Configure under **GitHub Repository -> Settings -> Secrets and variables -> Acti
 
 ## 5. GitHub Synchronization Commands (Run Locally with Authenticated Git Credentials)
 
-Because the AI Studio sandbox does not have a `.git` repository or write credentials, sync from an authorized developer workstation:
+Because the AI Studio sandbox does not have a `.git` repository or write credentials, sync from an authorized developer workstation using the generated Phase 12 patch (`docs/release/phase-12-release-integration.patch`) or direct copy:
 
 ```bash
 git checkout main
 git pull origin main
-git checkout -b development/phase-11-production-integration
-# Copy/apply verified workspace files, verify with:
+git checkout -b development/phase-12-release-integration
+# Option A: Apply the transferable Phase 12 patch generated off main (cedab61)
+git am docs/release/phase-12-release-integration.patch
+# Verify cleanly before pushing:
 npm ci && npm audit --audit-level=high && npx tsx scripts/verify-migrations.ts && npm run lint && npm test && npm run build
-git status
-git add -A
-git commit -m "chore(phase-11): deterministic lockfile, migration 005 RLS fixes, AI & payment hardening"
-git push -u origin development/phase-11-production-integration
-gh pr create --base main --head development/phase-11-production-integration \
-  --title "Phase 11: Deterministic Lockfile, Supabase RLS 005, AI/Payment Hardening & Release Prep" \
-  --body "Implements Phase 11 Blocks 11.1-11.11. Do not merge until CI, Docker build, and staging acceptance pass."
+git push -u origin development/phase-12-release-integration
+gh pr create --base main --head development/phase-12-release-integration \
+  --title "Phase 12: Payment Architecture, Security Certification Tests & Release Transfer Package" \
+  --body-file docs/release/PHASE_12_SYNC_AND_PR.md
 ```
 
 ---
