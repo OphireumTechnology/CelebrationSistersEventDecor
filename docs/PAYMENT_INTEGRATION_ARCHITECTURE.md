@@ -112,7 +112,7 @@ Celebration Sisters Event Decor invoices high-value luxury weddings, corporate g
 - **Immutable Audit Trail:** Every checkout session creation, webhook verification, settlement, refund, manual offline wire entry, and failure appends an entry to `audit_logs` containing `actor`, `bookingReference`, `amountCents`, `providerEventId`, and `timestamp`.
 - **Required Future Environment Variables (Names Only — Never Commit Values):**
   - `PAYMENT_PROVIDER` (`none` | `stripe`)
-  - `STRIPE_SECRET_KEY` (server-side only; `sk_test_...` in staging, `sk_live_...` only after approval)
+  - `STRIPE_SECRET_KEY` (server-side only; use a Stripe test-mode secret in staging and a production secret only after explicit approval; never commit either value)
   - `STRIPE_WEBHOOK_SECRET` (`whsec_...`)
   - `PAYMENT_LIVE_ENABLED` (`false` by default; kill-switch mirroring `EMAIL_LIVE_DELIVERY_ENABLED`)
 
