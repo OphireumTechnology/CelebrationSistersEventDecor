@@ -25,27 +25,39 @@ function futureIsoDate(daysAhead: number): string {
 
 async function main() {
   const results: AcceptanceCheck[] = [];
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cs-phase16-browser-'));
-  const dbPath = path.join(tmpDir, 'phase16-browser-db.json');
+  const externalFrontendUrl = (process.env.TARGET_FRONTEND_URL || '').trim().replace(/\/+$/, '');
+  const externalApiBaseUrl = (process.env.TARGET_API_BASE_URL || externalFrontendUrl).trim().replace(/\/+$/, '');
+  const isExternalStaging = Boolean(externalFrontendUrl);
 
-  process.env.CS_DB_PATH = dbPath;
-  process.env.PERSISTENCE_ADAPTER = 'json-local';
-  process.env.ALLOW_DEMO_AUTH = 'true';
-  process.env.EMAIL_LIVE_DELIVERY_ENABLED = 'false';
+  let tmpDir: string | null = null;
+  let server: ReturnType<ReturnType<typeof createApp>['listen']> | null = null;
+  let baseUrl = externalFrontendUrl;
+  let apiBaseUrl = externalApiBaseUrl;
 
-  const distDir = path.resolve(process.cwd(), 'dist');
-  const app = createApp({ enableRateLimit: false });
-  app.use(express.static(distDir));
-  app.get('*', (_req, res) => {
-    res.sendFile(path.join(distDir, 'index.html'));
-  });
+  if (!isExternalStaging) {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cs-phase16-browser-'));
+    const dbPath = path.join(tmpDir, 'phase16-browser-db.json');
 
-  const server = await new Promise<ReturnType<typeof app.listen>>((resolve) => {
-    const s = app.listen(0, '127.0.0.1', () => resolve(s));
-  });
-  const addr = server.address();
-  assert.ok(typeof addr === 'object' && addr);
-  const baseUrl = `http://127.0.0.1:${addr.port}`;
+    process.env.CS_DB_PATH = dbPath;
+    process.env.PERSISTENCE_ADAPTER = 'json-local';
+    process.env.ALLOW_DEMO_AUTH = 'true';
+    process.env.EMAIL_LIVE_DELIVERY_ENABLED = 'false';
+
+    const distDir = path.resolve(process.cwd(), 'dist');
+    const app = createApp({ enableRateLimit: false });
+    app.use(express.static(distDir));
+    app.get('*', (_req, res) => {
+      res.sendFile(path.join(distDir, 'index.html'));
+    });
+
+    server = await new Promise<ReturnType<typeof app.listen>>((resolve) => {
+      const s = app.listen(0, '127.0.0.1', () => resolve(s));
+    });
+    const addr = server.address();
+    assert.ok(typeof addr === 'object' && addr);
+    baseUrl = `http://127.0.0.1:${addr.port}`;
+    apiBaseUrl = baseUrl;
+  }
 
   const record = (
     id: string,
@@ -149,7 +161,7 @@ async function main() {
     await dialog.getByPlaceholder(/\(803\) 555-0148/i).fill('(803) 555-0192');
     await dialog.getByRole('button', { name: /Review Consultation/i }).click();
     await dialog.getByText(/privacy|consent/i).first().waitFor({ state: 'visible' });
-    const invalidServerSlotRes = await fetch(`${baseUrl}/api/consultations`, {
+    const invalidServerSlotRes = await fetch(`${apiBaseUrl}/api/consultations`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -260,14 +272,14 @@ async function main() {
 
     // Seed one active consultation for Admin Command Center workflows
     const availRes = await fetch(
-      `${baseUrl}/api/consultations/availability?startDate=${futureIsoDate(4)}&days=14&timezone=America/New_York&method=video`,
+      `${apiBaseUrl}/api/consultations/availability?startDate=${futureIsoDate(4)}&days=14&timezone=America/New_York&method=video`,
     );
     const availData = (await availRes.json()) as {
       days: Array<{ slots: Array<{ startUtc: string; plannerId: string; available: boolean }> }>;
     };
     const adminSlot = availData.days.flatMap((d) => d.slots).find((s) => s.available);
     assert.ok(adminSlot);
-    const seedRes = await fetch(`${baseUrl}/api/consultations`, {
+    const seedRes = await fetch(`${apiBaseUrl}/api/consultations`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -297,20 +309,20 @@ async function main() {
     };
 
     // Authenticate Executive Admin with MFA TOTP
-    const switchRes = await fetch(`${baseUrl}/api/auth/switch`, {
+    const switchRes = await fetch(`${apiBaseUrl}/api/auth/switch`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
       body: JSON.stringify({ userId: 'user-admin-director' }),
     });
     assert.equal(switchRes.status, 200);
     const preAuth = (await switchRes.json()) as { token: string };
-    const enrollRes = await fetch(`${baseUrl}/api/auth/mfa/totp/enroll`, {
+    const enrollRes = await fetch(`${apiBaseUrl}/api/auth/mfa/totp/enroll`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${preAuth.token}` },
     });
     assert.equal(enrollRes.status, 200);
     const enrolled = (await enrollRes.json()) as { secret: string };
-    const verifyRes = await fetch(`${baseUrl}/api/auth/mfa/verify`, {
+    const verifyRes = await fetch(`${apiBaseUrl}/api/auth/mfa/verify`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${preAuth.token}` },
       body: JSON.stringify({ code: generateTotpCode(enrolled.secret) }),
@@ -435,8 +447,12 @@ async function main() {
     process.exitCode = 1;
   } finally {
     if (browser) await browser.close();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    if (server) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+    if (tmpDir) {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
   }
 }
 

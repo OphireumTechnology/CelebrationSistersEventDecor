@@ -37,6 +37,7 @@ import {
 } from './authz.ts';
 import { generateConceptProposal, getGeminiConfigStatus, runConciergeTurn } from './gemini.ts';
 import { getIdentityProviderStatus, type VerifyProviderTokenOptions } from './identityProvider.ts';
+import { classifyDatabaseError } from './lib/pgErrorClassifier.ts';
 import {
   buildConsultationCancelledTemplate,
   buildConsultationConfirmationTemplate,
@@ -4275,35 +4276,21 @@ export function createApp(options: CreateAppOptions = {}) {
   );
 
   // Global safe error handler — prevents hung sockets, unhandled rejections, stack trace leaks, or raw SQL errors
-  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
     if (res.headersSent) return;
     const isSyntax = err instanceof SyntaxError && 'status' in err;
     if (isSyntax) {
       res.status(400).json({ error: 'Malformed JSON request payload.', code: 'BAD_JSON' });
       return;
     }
-    const errMsg = err instanceof Error ? err.message : '';
-    const errCode =
-      typeof err === 'object' && err && 'code' in err && typeof (err as { code?: unknown }).code === 'string'
-        ? (err as { code: string }).code
-        : '';
-    if (
-      errMsg.includes('PERSISTENCE_READINESS_FAILURE') ||
-      errMsg.includes('DATABASE_URL is not configured') ||
-      errMsg.includes('TLS_CONFIG_FAILURE') ||
-      [
-        'ECONNREFUSED',
-        'ETIMEDOUT',
-        '57P01',
-        '57P03',
-        'SELF_SIGNED_CERT_IN_CHAIN',
-        'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
-        'DEPTH_ZERO_SELF_SIGNED_CERT',
-      ].includes(errCode)
-    ) {
-      res.status(503).json({
-        error: 'Database service is temporarily unavailable. Please try again shortly.',
-        code: 'DATABASE_UNAVAILABLE',
+    const classified = classifyDatabaseError(err);
+    if (classified) {
+      if (classified.httpStatus === 409 && req.path.startsWith('/api/consultations')) {
+        observability.recordBookingOutcome(false);
+      }
+      res.status(classified.httpStatus).json({
+        error: classified.message,
+        code: classified.code,
         requestId: res.getHeader('X-Request-Id'),
       });
       return;
