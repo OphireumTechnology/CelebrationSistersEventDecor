@@ -49,7 +49,7 @@ In the Phase 14 baseline of `server/repositories/postgresRepository.ts`:
 
 ### Honest Delivery Lifecycle
 - `Pending` -> `Retrying` (exponential backoff on transient 5xx/network failure) -> `DeadLetter` (after `maxAttempts`)
-- `Pending` -> `Skipped` (when `RESEND_API_KEY` is missing or `ENABLE_LIVE_EMAIL_DELIVERY !== 'true'`)
+- `Pending` -> `Skipped` (when `RESEND_API_KEY` is missing or `EMAIL_LIVE_DELIVERY_ENABLED !== 'true'`)
 - `Pending` -> `ProviderAccepted` (HTTP 2xx from Resend API with `providerMessageId`)
 - `ProviderAccepted` -> `Delivered` / `Bounced` (ONLY upon verified Svix-signed Resend webhook event)
 
@@ -69,7 +69,7 @@ In the Phase 14 baseline of `server/repositories/postgresRepository.ts`:
 ## 3. Staging Checklist for Live Resend & PostgreSQL Cutover
 
 To move from **Code Ready** to **Staging Verified**:
-1. Configure `RESEND_API_KEY`, `EMAIL_FROM_ADDRESS` (verified sender domain `celebrationsistersdecor.com`), `ENABLE_LIVE_EMAIL_DELIVERY=true`, and `RESEND_WEBHOOK_SECRET` in Railway staging variables.
+1. Configure `RESEND_API_KEY`, `EMAIL_FROM` (verified sender domain `celebrationsistersdecor.com`), `EMAIL_LIVE_DELIVERY_ENABLED=true`, and `RESEND_WEBHOOK_SECRET` in Railway staging variables.
 2. Configure `DATABASE_URL` and `DATABASE_CA_CERT` (or `DATABASE_CA_CERT_BASE64`) in Railway staging variables.
 3. Register `https://<staging-backend-domain>/api/webhooks/resend` in the Resend Webhook Dashboard for `email.delivered`, `email.bounced`, and `email.complained`.
 4. Submit a staging consultation booking, verify inbox delivery, confirm `ProviderAccepted -> Delivered` transition via signed webhook, and inspect `/ready` TLS diagnostics.
