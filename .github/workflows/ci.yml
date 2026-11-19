@@ -105,9 +105,11 @@ jobs:
             fi
             sleep 0.25
           done
-          curl -fsS http://127.0.0.1:3199/health | grep -q '"status":"alive"'
-          curl -fsS http://127.0.0.1:3199/ready | grep -q '"status":"ready"'
-          curl -fsS http://127.0.0.1:3199/api/auth/config | grep -q '"mfaPolicy"'
+          # Assert the actual response contracts. /ready returns ok + persistence,
+          # while /api/auth/config reports identity-provider configuration.
+          curl -fsS http://127.0.0.1:3199/health | node -e "let s='';process.stdin.on('data',c=>s+=c).on('end',()=>{const j=JSON.parse(s);if(j.ok!==true||j.status!=='alive')process.exit(1)})"
+          curl -fsS http://127.0.0.1:3199/ready | node -e "let s='';process.stdin.on('data',c=>s+=c).on('end',()=>{const j=JSON.parse(s);if(j.ok!==true||j.persistence?.ready!==true)process.exit(1)})"
+          curl -fsS http://127.0.0.1:3199/api/auth/config | node -e "let s='';process.stdin.on('data',c=>s+=c).on('end',()=>{const j=JSON.parse(s);if(typeof j.allowedOriginsCount!=='number')process.exit(1)})"
           kill -TERM "$SERVER_PID"
           wait "$SERVER_PID"
           rm -f /tmp/ci-smoke-db.json
