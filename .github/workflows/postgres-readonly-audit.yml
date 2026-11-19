@@ -1,0 +1,25 @@
+name: Phase 1 PostgreSQL audit static validation
+on:
+  pull_request:
+    paths:
+      - 'scripts/audit/**'
+      - '.github/workflows/postgres-readonly-audit.yml'
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  audit-tooling:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse and validate read-only audit tooling
+        shell: pwsh
+        run: |
+          Get-ChildItem scripts/audit -Filter '*.ps1' | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName,[ref]$tokens,[ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) { throw "PowerShell syntax error in $($_.Name)" }
+          }
+          ./scripts/audit/Test-PostgresAudit.ps1
