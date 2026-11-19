@@ -179,6 +179,8 @@ test('Block 13.2: rate limiter ignores spoofed X-Forwarded-For, shares PostgreSQ
     let nextCalled = 0;
     const mockReq = {
       ip: '127.0.0.1',
+      method: 'GET',
+      path: '/api/test/noncritical',
       headers: {},
       socket: { remoteAddress: '127.0.0.1' },
     } as unknown as Request;
