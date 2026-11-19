@@ -12,6 +12,7 @@ import { VALID_CONSULTATION_TRANSITIONS } from '../src/types/domain.ts';
 import { sha256Hex } from './auth.ts';
 
 export const STUDIO_TIMEZONE = 'America/New_York';
+export const MIN_CONSULTATION_NOTICE_MINUTES = 120;
 
 export const SUPPORTED_TIMEZONES = [
   'America/New_York',
@@ -280,7 +281,7 @@ export function computeConsultationAvailability(params: {
     ? params.clientTimezone
     : STUDIO_TIMEZONE;
   const nowMs = params.nowMs ?? Date.now();
-  const minLeadMs = nowMs + 2 * 60 * 60_000; // Minimum 2-hour studio preparation notice
+  const minLeadMs = nowMs + MIN_CONSULTATION_NOTICE_MINUTES * 60_000; // Minimum studio preparation notice
   const safeDays = Math.max(1, Math.min(params.days, 45));
 
   const plannerNames = new Map<string, string>();
@@ -435,8 +436,8 @@ export function validateRequestedConsultationSlot(params: {
   if (Number.isNaN(startDt.getTime())) {
     return { valid: false, errorCode: 'INVALID_TIME', error: 'Consultation start time must be a valid UTC ISO timestamp.' };
   }
-  if (startDt.getTime() < nowMs + 60 * 60_000) {
-    return { valid: false, errorCode: 'INVALID_TIME', error: 'Consultation appointments must be scheduled at least 1 hour in advance.' };
+  if (startDt.getTime() < nowMs + MIN_CONSULTATION_NOTICE_MINUTES * 60_000) {
+    return { valid: false, errorCode: 'INVALID_TIME', error: 'Consultation appointments must be scheduled at least 2 hours in advance.' };
   }
 
   // Convert startDt into studio date (YYYY-MM-DD) & HH:MM
