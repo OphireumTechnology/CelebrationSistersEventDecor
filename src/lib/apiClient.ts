@@ -7,6 +7,19 @@
 export interface ApiEnvConfig {
   apiBaseUrl?: string;
   baseUrl?: string;
+  staticPagesBuild?: boolean;
+  hostname?: string;
+}
+
+const STATIC_PAGES_HOSTNAMES = new Set([
+  'celebrationsistersdecor.com',
+  'www.celebrationsistersdecor.com',
+]);
+
+export function isStaticPagesHostname(hostname: string | undefined): boolean {
+  const normalized = (hostname || '').trim().toLowerCase();
+  if (!normalized) return false;
+  return STATIC_PAGES_HOSTNAMES.has(normalized) || normalized.endsWith('.github.io');
 }
 
 let activeAccessToken: string | null = null;
@@ -64,9 +77,22 @@ export function resolveApiEnvironment(env?: ApiEnvConfig) {
       : typeof import.meta !== 'undefined'
         ? import.meta.env?.BASE_URL ?? '/'
         : '/';
+  const staticPagesBuild =
+    env?.staticPagesBuild !== undefined
+      ? env.staticPagesBuild
+      : typeof import.meta !== 'undefined'
+        ? import.meta.env?.VITE_GITHUB_PAGES === 'true'
+        : false;
+  const runtimeHostname =
+    env?.hostname !== undefined
+      ? env.hostname
+      : typeof window !== 'undefined' && window.location
+        ? window.location.hostname
+        : '';
 
   const configuredApiBase = sanitizeApiBaseUrl(rawBase);
-  const onStaticPages = viteBase !== '/';
+  const onStaticPages =
+    viteBase !== '/' || staticPagesBuild || isStaticPagesHostname(runtimeHostname);
   const backendConfigured = !onStaticPages || Boolean(configuredApiBase);
 
   return {

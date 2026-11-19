@@ -366,6 +366,7 @@ export function createApp(options: CreateAppOptions = {}) {
     const identity = getIdentityProviderStatus();
     res.json({
       ...identity,
+      demoPersonasAvailable: process.env.NODE_ENV !== 'production',
       viteSupabaseConfigured: Boolean(process.env.VITE_SUPABASE_URL && process.env.VITE_SUPABASE_ANON_KEY),
       allowedOriginsCount: getAllowedOrigins().length,
     });

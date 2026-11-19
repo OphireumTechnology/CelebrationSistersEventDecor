@@ -12,7 +12,7 @@ import { PortfolioAndAboutView } from './components/PortfolioAndAboutView';
 import { PortalsWorkspace } from './components/PortalsWorkspace';
 import { PublicHomeView } from './components/PublicHomeView';
 import { ServiceDivisionCatalog } from './components/ServiceDivisionCatalog';
-import { apiFetch, setApiCsrfToken } from './lib/apiClient';
+import { apiFetch, isBackendConfigured, setApiCsrfToken } from './lib/apiClient';
 import type { UserSession } from './types/domain';
 
 const DEFAULT_GUEST: UserSession = {
@@ -40,22 +40,31 @@ export default function App() {
   }>({});
 
   useEffect(() => {
+    if (!isBackendConfigured) {
+      return;
+    }
     const initAuth = async () => {
       try {
-        const [personasRes, sessionRes] = await Promise.all([
-          apiFetch('/api/auth/personas', { credentials: 'include' }),
+        const [configRes, sessionRes] = await Promise.all([
+          apiFetch('/api/auth/config', { credentials: 'include' }),
           apiFetch('/api/auth/session', { credentials: 'include' }),
         ]);
-        if (personasRes.ok) {
-          const pData = await personasRes.json();
-          setPersonas(pData.personas || []);
-        }
         if (sessionRes.ok) {
           const sData = await sessionRes.json();
           setApiCsrfToken(sData.csrfToken ?? null);
           if (sData.user) {
             setCurrentUser(sData.user);
             setMfaRequired(Boolean(sData.mfaRequired));
+          }
+        }
+        if (configRes.ok) {
+          const cfg = await configRes.json();
+          if (cfg.demoPersonasAvailable === true) {
+            const personasRes = await apiFetch('/api/auth/personas', { credentials: 'include' });
+            if (personasRes.ok) {
+              const pData = await personasRes.json();
+              setPersonas(pData.personas || []);
+            }
           }
         }
       } catch {

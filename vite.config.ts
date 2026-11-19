@@ -14,6 +14,11 @@ export default defineConfig(() => {
     base: process.env.GITHUB_PAGES === 'true' && process.env.GITHUB_PAGES_CUSTOM_DOMAIN !== 'true'
       ? '/CelebrationSistersEventDecor/'
       : '/',
+    define: {
+      'import.meta.env.VITE_GITHUB_PAGES': JSON.stringify(
+        process.env.GITHUB_PAGES === 'true' ? 'true' : 'false',
+      ),
+    },
     plugins: [
       react(),
       tailwindcss(),

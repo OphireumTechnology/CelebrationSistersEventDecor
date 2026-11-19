@@ -302,13 +302,23 @@ export function ConsultationModal({
         });
         if (excludeId) params.set('excludeConsultationId', excludeId);
         const res = await apiFetch(`/api/consultations/availability?${params.toString()}`);
-        const data = await readApiJson<AvailabilityResponse>(res);
+        const contentType = res.headers.get('content-type') || '';
+        const isJson = contentType.toLowerCase().includes('application/json');
+        const data = isJson ? await readApiJson<AvailabilityResponse>(res) : ({} as AvailabilityResponse);
         if (!res.ok || !Array.isArray(data.days)) {
-          throw new Error(data.error || 'Unable to load studio consultation availability.');
+          if (data.error) {
+            throw new Error(data.error);
+          }
+          if (!isJson && res.status === 404) {
+            throw new Error(
+              'Live consultation scheduling is currently disconnected from the studio booking server. Please try again shortly or contact our Columbia studio directly.',
+            );
+          }
+          throw new Error('Unable to load studio consultation availability.');
         }
         return data.days;
       } catch (err) {
-        setAvailabilityError(err instanceof Error ? err.message : 'Unable to load availability.');
+        setAvailabilityError(err instanceof Error ? err.message : 'Unable to load studio consultation availability.');
         return [];
       } finally {
         setAvailabilityLoading(false);
