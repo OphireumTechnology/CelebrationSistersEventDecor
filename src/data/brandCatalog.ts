@@ -35,13 +35,15 @@ export interface PortfolioItem {
   isVerifiedPortfolioPhoto: true;
 }
 
-export const OFFICIAL_LOGO_SRC = `${import.meta.env.BASE_URL}assets/celebration-sisters-logo.png`;
+const BASE_URL = (import.meta.env?.BASE_URL as string | undefined) ?? '/';
 
-export const HERO_BALLROOM_IMAGE = `${import.meta.env.BASE_URL}src/assets/images/hero_luxury_ballroom_1794948632249.jpg`;
-export const IMG_WEDDING_FLORAL = `${import.meta.env.BASE_URL}src/assets/images/service_wedding_floral_1794948632464.jpg`;
-export const IMG_MILESTONE_SOIREE = `${import.meta.env.BASE_URL}src/assets/images/service_milestone_soiree_1794948632179.jpg`;
-export const IMG_CORPORATE_GALA = `${import.meta.env.BASE_URL}src/assets/images/service_corporate_gala_1794948633026.jpg`;
-export const IMG_LOUNGE_LIGHTING = `${import.meta.env.BASE_URL}src/assets/images/service_lounge_lighting_1794948633528.jpg`;
+export const OFFICIAL_LOGO_SRC = `${BASE_URL}assets/celebration-sisters-logo.png`;
+
+export const HERO_BALLROOM_IMAGE = `${BASE_URL}src/assets/images/hero_luxury_ballroom_1794948632249.jpg`;
+export const IMG_WEDDING_FLORAL = `${BASE_URL}src/assets/images/service_wedding_floral_1794948632464.jpg`;
+export const IMG_MILESTONE_SOIREE = `${BASE_URL}src/assets/images/service_milestone_soiree_1794948632179.jpg`;
+export const IMG_CORPORATE_GALA = `${BASE_URL}src/assets/images/service_corporate_gala_1794948633026.jpg`;
+export const IMG_LOUNGE_LIGHTING = `${BASE_URL}src/assets/images/service_lounge_lighting_1794948633528.jpg`;
 
 export const SERVICE_DIVISIONS: ServiceDivision[] = [
   {

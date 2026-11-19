@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import {
   AlertTriangle,
+  CalendarClock,
   CheckCircle2,
   ClipboardCheck,
   FileSignature,
@@ -29,6 +30,7 @@ import {
 } from '../types/domain';
 import { apiFetch, isBackendConfigured } from '../lib/apiClient';
 import { toArchitecturalStage } from '../types/lifecycle';
+import { AdminConsultationCommandCenter } from './AdminConsultationCommandCenter';
 import { BrandLogo } from './BrandLogo';
 
 interface PortalsWorkspaceProps {
@@ -80,7 +82,10 @@ export function PortalsWorkspace({
   const [portalMessage, setPortalMessage] = useState('');
   const [issueSummary, setIssueSummary] = useState('');
   const [issueSeverity, setIssueSeverity] = useState<'Low' | 'Medium' | 'High'>('Low');
-  const [adminTab, setAdminTab] = useState<'bookings' | 'inventory' | 'ai' | 'automation' | 'audit'>('bookings');
+  const [staffTab, setStaffTab] = useState<'consultations' | 'checklists'>('consultations');
+  const [adminTab, setAdminTab] = useState<
+    'consultations' | 'bookings' | 'inventory' | 'ai' | 'automation' | 'audit'
+  >('consultations');
 
   const [quoteDesc, setQuoteDesc] = useState('Custom Floral & Production Enhancement');
   const [quotePrice, setQuotePrice] = useState(2500);
@@ -903,6 +908,40 @@ export function PortalsWorkspace({
         ) : currentUser.role === 'staff' || currentUser.role === 'event_planner' ? (
           /* STAFF & EVENT PLANNER PRODUCTION PORTAL */
           <div className="space-y-6">
+            <div className="flex flex-wrap gap-1.5 bg-white border border-[var(--cs-border)] p-1.5 rounded-lg">
+              <button
+                type="button"
+                onClick={() => setStaffTab('consultations')}
+                className={`px-3.5 py-2 text-xs font-medium rounded-md inline-flex items-center gap-2 transition-colors cursor-pointer ${
+                  staffTab === 'consultations'
+                    ? 'bg-[var(--cs-purple)] text-white'
+                    : 'text-[var(--cs-charcoal-muted)] hover:text-[var(--cs-purple)]'
+                }`}
+              >
+                <CalendarClock className="w-3.5 h-3.5" />
+                Consultation & CRM Command Center
+              </button>
+              <button
+                type="button"
+                onClick={() => setStaffTab('checklists')}
+                className={`px-3.5 py-2 text-xs font-medium rounded-md inline-flex items-center gap-2 transition-colors cursor-pointer ${
+                  staffTab === 'checklists'
+                    ? 'bg-[var(--cs-purple)] text-white'
+                    : 'text-[var(--cs-charcoal-muted)] hover:text-[var(--cs-purple)]'
+                }`}
+              >
+                <ClipboardCheck className="w-3.5 h-3.5" />
+                Event-Day Setup Checklists
+              </button>
+            </div>
+
+            {staffTab === 'consultations' ? (
+              <AdminConsultationCommandCenter
+                currentRole={currentUser.role}
+                onWorkspaceRefresh={loadWorkspaceData}
+              />
+            ) : (
+            <div className="space-y-6">
             {checklists.map((chk) => (
               <div key={chk.id} className="bg-white border border-[var(--cs-border)] rounded-lg p-6 space-y-5">
                 <div className="flex flex-wrap items-center justify-between gap-4 border-b border-[var(--cs-border)] pb-4">
@@ -976,6 +1015,8 @@ export function PortalsWorkspace({
                 </form>
               </div>
             ))}
+            </div>
+            )}
           </div>
         ) : (
           /* EXECUTIVE ADMINISTRATION DASHBOARD */
@@ -1017,6 +1058,7 @@ export function PortalsWorkspace({
 
             <div className="flex flex-wrap gap-1.5 bg-white border border-[var(--cs-border)] p-1.5 rounded-lg">
               {[
+                { id: 'consultations', label: 'Consultation Command Center', icon: CalendarClock },
                 { id: 'bookings', label: 'Booking & Quote Oversight', icon: Users },
                 { id: 'inventory', label: 'Rental Inventory', icon: Package },
                 { id: 'ai', label: 'AI Concierge Logs', icon: ClipboardCheck },
@@ -1038,6 +1080,13 @@ export function PortalsWorkspace({
                 </button>
               ))}
             </div>
+
+            {adminTab === 'consultations' && (
+              <AdminConsultationCommandCenter
+                currentRole={currentUser.role}
+                onWorkspaceRefresh={loadWorkspaceData}
+              />
+            )}
 
             {adminTab === 'bookings' && (
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">

@@ -52,14 +52,28 @@ export interface UserSession {
   mfaRecoveryCodeHashes?: string[];
 }
 
+export type NotificationCategory =
+  | 'consultation_confirmation'
+  | 'consultation_confirmed'
+  | 'consultation_rescheduled'
+  | 'consultation_cancelled'
+  | 'consultation_reminder'
+  | 'consultation_followup'
+  | 'proposal_available'
+  | 'staff_new_booking_alert'
+  | 'staff_appointment_assigned'
+  | 'staff_upcoming_consultation'
+  | 'staff_reschedule_alert'
+  | 'staff_cancellation_alert'
+  | 'staff_followup_required'
+  | 'staff_proposal_awaiting_action'
+  | 'booking_status_update'
+  | 'admin_security_alert';
+
 export interface NotificationDeliveryRecord {
   id: string;
   idempotencyKey: string;
-  category:
-    | 'consultation_confirmation'
-    | 'staff_new_booking_alert'
-    | 'booking_status_update'
-    | 'admin_security_alert';
+  category: NotificationCategory;
   channel: 'Email' | 'SMS' | 'Internal Task';
   provider: 'resend' | 'unconfigured';
   recipient: string;
@@ -92,11 +106,7 @@ export type OutboxJobStatus =
 export interface OutboxNotificationJob {
   id: string;
   idempotencyKey: string;
-  category:
-    | 'consultation_confirmation'
-    | 'staff_new_booking_alert'
-    | 'booking_status_update'
-    | 'admin_security_alert';
+  category: NotificationCategory;
   channel: 'Email' | 'SMS' | 'Internal Task';
   recipient: string;
   bookingReference?: string;
@@ -380,4 +390,136 @@ export interface AuditLogEntry {
   targetType: string;
   targetId: string;
   details: string;
+}
+
+export const CONSULTATION_STATUSES = [
+  'Draft',
+  'Pending',
+  'Confirmed',
+  'Rescheduled',
+  'Completed',
+  'Cancelled',
+  'No-show',
+] as const;
+
+export type ConsultationStatus = (typeof CONSULTATION_STATUSES)[number];
+
+export const VALID_CONSULTATION_TRANSITIONS: Record<ConsultationStatus, ConsultationStatus[]> = {
+  Draft: ['Pending', 'Confirmed', 'Cancelled'],
+  Pending: ['Confirmed', 'Rescheduled', 'Cancelled'],
+  Confirmed: ['Rescheduled', 'Completed', 'Cancelled', 'No-show'],
+  Rescheduled: ['Confirmed', 'Rescheduled', 'Completed', 'Cancelled', 'No-show'],
+  Completed: [],
+  Cancelled: [],
+  'No-show': ['Rescheduled', 'Cancelled'],
+};
+
+export type ConsultationMethod = 'in_person_columbia' | 'video' | 'phone';
+
+export type PreferredContactMethod = 'email' | 'phone' | 'sms';
+
+export const CRM_PIPELINE_STAGES = [
+  'New Inquiry',
+  'Qualified Lead',
+  'Consultation Scheduled',
+  'Consultation Completed',
+  'Proposal Prepared',
+  'Proposal Sent',
+  'Client Decision',
+  'Event Booked',
+] as const;
+
+export type CrmPipelineStage = (typeof CRM_PIPELINE_STAGES)[number];
+
+export interface StaffAvailabilityRule {
+  id: string;
+  plannerId: string;
+  plannerName: string;
+  dayOfWeek: number; // 0 = Sun ... 6 = Sat
+  startTimeLocal: string; // HH:MM
+  endTimeLocal: string; // HH:MM
+  timezone: string;
+  slotDurationMinutes: number;
+  bufferBeforeMinutes: number;
+  bufferAfterMinutes: number;
+  allowedMethods: ConsultationMethod[];
+  isActive: boolean;
+}
+
+export interface ConsultationSlotHold {
+  id: string;
+  plannerId: string;
+  slotStartUtc: string;
+  slotEndUtc: string;
+  holderFingerprintHash: string;
+  expiresAt: string;
+  createdAt: string;
+}
+
+export interface ConsultationAppointment {
+  id: string;
+  referenceCode: string;
+  bookingId: string;
+  clientId: string;
+  clientName: string;
+  clientEmail: string;
+  clientPhone: string;
+  preferredContactMethod: PreferredContactMethod;
+  eventTitle: string;
+  eventCategory: string;
+  eventTheme?: string;
+  eventDate: string;
+  eventLocation: string;
+  venueName: string;
+  guestCount: number;
+  budgetRange: string;
+  serviceDivisionIds: string[];
+  additionalPreferences?: string;
+  consultationNotes: string;
+  method: ConsultationMethod;
+  status: ConsultationStatus;
+  crmStage: CrmPipelineStage;
+  assignedPlannerId: string;
+  assignedPlannerName: string;
+  startUtc: string;
+  endUtc: string;
+  durationMinutes: number;
+  bufferBeforeMinutes: number;
+  bufferAfterMinutes: number;
+  clientTimezone: string;
+  privacyConsentAccepted: boolean;
+  privacyConsentAt: string;
+  privacyConsentVersion: string;
+  /** SHA-256 hash of scoped public verification token; raw token is never persisted. */
+  accessTokenHash: string;
+  idempotencyKey?: string;
+  outcomeSummary?: string;
+  clientDecision?: 'Pending' | 'Approved' | 'Declined' | 'Revision Requested';
+  clientDecisionNotes?: string;
+  followUpDueAt?: string;
+  rescheduledFromStartUtc?: string;
+  rescheduleCount: number;
+  completedAt?: string;
+  cancelledAt?: string;
+  cancelReason?: string;
+  reminderSentAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CrmFollowUpTask {
+  id: string;
+  consultationId: string;
+  bookingId: string;
+  bookingReference: string;
+  clientName: string;
+  assignedToUserId: string;
+  assignedToName: string;
+  title: string;
+  notes: string;
+  dueAt: string;
+  status: 'Open' | 'Completed' | 'Cancelled';
+  completedAt?: string;
+  createdAt: string;
+  updatedAt: string;
 }

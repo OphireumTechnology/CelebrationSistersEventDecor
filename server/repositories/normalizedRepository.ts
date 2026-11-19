@@ -85,11 +85,58 @@ export interface ClaimedOutboxRow {
   max_attempts: number;
 }
 
+export interface CreateNormalizedConsultationInput {
+  idempotencyKey?: string;
+  bookingId: string;
+  clientId: string;
+  referenceCode: string;
+  assignedPlannerId: string;
+  method: 'in_person_columbia' | 'video' | 'phone';
+  startUtc: string;
+  endUtc: string;
+  bufferBeforeMinutes: number;
+  bufferAfterMinutes: number;
+  clientTimezone: string;
+  preferredContactMethod: 'email' | 'phone' | 'sms';
+  privacyConsentAt: string;
+  privacyConsentVersion: string;
+  accessTokenHash: string;
+  plannerNotes: string;
+  outboxJobs?: {
+    idempotencyKey: string;
+    category: string;
+    recipient: string;
+    subject: string;
+    htmlBody: string;
+    textBody: string;
+  }[];
+}
+
+export interface NormalizedConsultationRow {
+  id: string;
+  reference_code: string;
+  booking_id: string;
+  client_id: string;
+  assigned_planner_id: string | null;
+  status: string;
+  meeting_channel: string;
+  consultation_start_utc: string;
+  consultation_end_utc: string;
+  buffer_before_minutes: number;
+  buffer_after_minutes: number;
+  client_timezone: string;
+  crm_stage: string;
+}
+
 export interface NormalizedPersistenceRepository {
   createBookingAtomic(input: CreateNormalizedBookingInput): Promise<{ booking: NormalizedBookingRow; deduplicated: boolean }>;
   listBookingsForActor(actor: NormalizedActorContext): Promise<NormalizedBookingRow[]>;
   createQuotationAtomic(input: CreateNormalizedQuoteInput): Promise<{ quotationId: string; versionNumber: number; subtotalCents: number; totalCents: number }>;
   claimDueOutboxJobs(workerId: string, batchSize?: number, leaseSeconds?: number): Promise<ClaimedOutboxRow[]>;
+  createConsultationAtomic(
+    input: CreateNormalizedConsultationInput,
+  ): Promise<{ consultation: NormalizedConsultationRow; deduplicated: boolean }>;
+  listConsultationsForActor(actor: NormalizedActorContext): Promise<NormalizedConsultationRow[]>;
 }
 
 /**
@@ -361,6 +408,142 @@ export class PostgresNormalizedRepository implements NormalizedPersistenceReposi
         [workerId, batchSize, leaseSeconds],
       );
       return res.rows;
+    });
+  }
+
+  async createConsultationAtomic(
+    input: CreateNormalizedConsultationInput,
+  ): Promise<{ consultation: NormalizedConsultationRow; deduplicated: boolean }> {
+    return this.runTx(async (client) => {
+      if (input.idempotencyKey) {
+        const existing = await client.query<NormalizedConsultationRow>(
+          'SELECT * FROM consultations WHERE idempotency_key = $1',
+          [input.idempotencyKey],
+        );
+        if (existing.rows[0]) {
+          return { consultation: existing.rows[0], deduplicated: true };
+        }
+      }
+
+      // Lock planner's active consultations to prevent simultaneous slot races before INSERT
+      const conflicts = await client.query<{ id: string }>(
+        `SELECT id
+         FROM consultations
+         WHERE assigned_planner_id = $1
+           AND status IN ('Pending', 'Confirmed', 'Rescheduled')
+           AND (
+             tstzrange(
+               consultation_start_utc - (buffer_before_minutes * INTERVAL '1 minute'),
+               consultation_end_utc + (buffer_after_minutes * INTERVAL '1 minute'),
+               '[)'
+             ) && tstzrange($2::timestamptz, $3::timestamptz, '[)')
+             OR tstzrange(consultation_start_utc, consultation_end_utc, '[)') && tstzrange(
+               $2::timestamptz - ($4 * INTERVAL '1 minute'),
+               $3::timestamptz + ($5 * INTERVAL '1 minute'),
+               '[)'
+             )
+           )
+         FOR UPDATE`,
+        [
+          input.assignedPlannerId,
+          input.startUtc,
+          input.endUtc,
+          input.bufferBeforeMinutes,
+          input.bufferAfterMinutes,
+        ],
+      );
+
+      if (conflicts.rows.length > 0) {
+        throw new Error('SLOT_CONFLICT:Selected consultation slot overlaps an existing scheduled appointment.');
+      }
+
+      const inserted = await client.query<NormalizedConsultationRow>(
+        `INSERT INTO consultations (
+           reference_code, booking_id, client_id, assigned_planner_id, status,
+           meeting_channel, scheduled_for, consultation_start_utc, consultation_end_utc,
+           buffer_before_minutes, buffer_after_minutes, client_timezone,
+           preferred_contact_method, privacy_consent_at, privacy_consent_version,
+           access_token_hash, idempotency_key, planner_notes, crm_stage
+         ) VALUES (
+           $1, $2, $3, $4, 'Pending',
+           $5, $6, $6, $7,
+           $8, $9, $10,
+           $11, $12, $13,
+           $14, $15, $16, 'Consultation Scheduled'
+         )
+         RETURNING *`,
+        [
+          input.referenceCode,
+          input.bookingId,
+          input.clientId,
+          input.assignedPlannerId,
+          input.method,
+          input.startUtc,
+          input.endUtc,
+          input.bufferBeforeMinutes,
+          input.bufferAfterMinutes,
+          input.clientTimezone,
+          input.preferredContactMethod,
+          input.privacyConsentAt,
+          input.privacyConsentVersion,
+          input.accessTokenHash,
+          input.idempotencyKey ?? null,
+          input.plannerNotes,
+        ],
+      );
+
+      const consultation = inserted.rows[0];
+      if (!consultation) {
+        throw new Error('Failed to insert normalized consultation record.');
+      }
+
+      for (const job of input.outboxJobs || []) {
+        await client.query(
+          `INSERT INTO notification_outbox (
+             idempotency_key, category, channel, recipient, booking_reference,
+             subject, html_body, text_body, status
+           ) VALUES ($1, $2, 'Email', $3, $4, $5, $6, $7, 'Pending')
+           ON CONFLICT (idempotency_key) DO NOTHING`,
+          [
+            job.idempotencyKey,
+            job.category,
+            job.recipient,
+            input.referenceCode,
+            job.subject,
+            job.htmlBody,
+            job.textBody,
+          ],
+        );
+      }
+
+      return { consultation, deduplicated: false };
+    });
+  }
+
+  async listConsultationsForActor(actor: NormalizedActorContext): Promise<NormalizedConsultationRow[]> {
+    return this.runTx(async (client) => {
+      await applyTransactionActorContext(client, actor);
+
+      if (actor.role === 'admin' || actor.role === 'staff' || actor.role === 'event_planner') {
+        const res = await client.query<NormalizedConsultationRow>(
+          'SELECT * FROM consultations ORDER BY consultation_start_utc ASC NULLS LAST, created_at DESC',
+        );
+        return res.rows;
+      }
+
+      if (actor.role === 'client') {
+        const res = await client.query<NormalizedConsultationRow>(
+          `SELECT con.*
+           FROM consultations con
+           JOIN clients c ON c.id = con.client_id
+           WHERE c.user_id = $1
+           ORDER BY con.consultation_start_utc DESC NULLS LAST`,
+          [actor.userId],
+        );
+        return res.rows;
+      }
+
+      return [];
     });
   }
 }

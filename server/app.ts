@@ -3,9 +3,14 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import { z } from 'zod';
 import {
   BOOKING_STATUSES,
+  CRM_PIPELINE_STAGES,
   type AuthSecurityEvent,
   type BookingRecord,
   type BookingStatus,
+  type ConsultationAppointment,
+  type ConsultationMethod,
+  type CrmFollowUpTask,
+  type StaffAvailabilityRule,
 } from '../src/types/domain.ts';
 import { LEGACY_TO_ARCH_STATUS } from '../src/types/lifecycle.ts';
 import {
@@ -33,7 +38,14 @@ import {
 import { generateConceptProposal, getGeminiConfigStatus, runConciergeTurn } from './gemini.ts';
 import { getIdentityProviderStatus, type VerifyProviderTokenOptions } from './identityProvider.ts';
 import {
+  buildConsultationCancelledTemplate,
   buildConsultationConfirmationTemplate,
+  buildConsultationConfirmedTemplate,
+  buildConsultationFollowUpTemplate,
+  buildConsultationReminderTemplate,
+  buildConsultationRescheduledTemplate,
+  buildInternalOperationsAlertTemplate,
+  buildProposalAvailableTemplate,
   buildStaffAlertTemplate,
   buildStatusUpdateTemplate,
   getEmailProviderStatus,
@@ -53,14 +65,28 @@ import {
   getPgPool,
 } from './repositories/postgresRepository.ts';
 import {
+  canTransitionConsultationStatus,
+  computeConsultationAvailability,
+  findPlannerSlotConflict,
+  formatFullDateTimeForTimezone,
+  generateConsultationAccessToken,
+  isValidIanaTimezone,
+  STUDIO_TIMEZONE,
+  SUPPORTED_TIMEZONES,
+  validateRequestedConsultationSlot,
+  verifyConsultationAccessToken,
+} from './scheduling.ts';
+import {
   appendAudit,
   appendSecurityEvent,
   canTransitionBookingStatus,
   isAuthorizedForBooking,
   readDb,
   sanitizeBookingForRole,
+  sanitizeConsultationForClient,
   sanitizeUserForClient,
   withTransaction,
+  type DatabaseSchema,
 } from './store.ts';
 import { buildTotpProvisioningUri, generateTotpSecret } from './totp.ts';
 
@@ -1954,6 +1980,8 @@ export function createApp(options: CreateAppOptions = {}) {
       0,
     );
 
+    const consultationMetrics = computeConsultationMetrics(db);
+
     res.json({
       metrics: {
         activeBookings: db.bookings.filter((b) => b.status !== 'Cancelled' && b.status !== 'Completed').length,
@@ -1962,12 +1990,17 @@ export function createApp(options: CreateAppOptions = {}) {
         aiSessionsCount: db.aiSessions.length,
         pendingApprovals: db.concepts.filter((c) => !c.clientApproved || !c.staffApproved).length,
       },
+      consultationMetrics,
+      consultations: db.consultations.map(sanitizeConsultationForClient),
+      staffAvailabilityRules: db.staffAvailabilityRules,
+      crmFollowUpTasks: db.crmFollowUpTasks,
       aiSessions: db.aiSessions,
       automationWorkflows: db.automationWorkflows,
       automationLogs: db.automationLogs,
       auditLogs: db.auditLogs,
       authSecurityEvents: db.authSecurityEvents,
       notificationDeliveries: db.notificationDeliveries,
+      notificationOutbox: db.notificationOutbox,
       blackoutDates: db.blackoutDates,
       availabilityHolds: db.availabilityHolds,
       users: db.users.map(sanitizeUserForClient),
@@ -2187,6 +2220,1654 @@ export function createApp(options: CreateAppOptions = {}) {
     });
     if (!result) return res.status(404).json({ error: 'Workflow not found.' });
     res.json(result);
+  });
+
+  // =========================================================================
+  // PHASE 14 — ENTERPRISE CONSULTATION SCHEDULING, CRM & COMMAND CENTER API
+  // =========================================================================
+
+  function formatConsultationMethodLabel(method: ConsultationMethod): string {
+    if (method === 'in_person_columbia') return 'In-Person (Columbia, SC Studio)';
+    if (method === 'phone') return 'Executive Phone Consultation';
+    return 'Private Video Consultation';
+  }
+
+  function computeConsultationMetrics(db: DatabaseSchema) {
+    const nowMs = Date.now();
+    const list = db.consultations;
+    return {
+      total: list.length,
+      newRequests: list.filter((c) => c.status === 'Pending' || c.status === 'Draft').length,
+      pending: list.filter((c) => c.status === 'Pending').length,
+      confirmed: list.filter((c) => c.status === 'Confirmed').length,
+      rescheduled: list.filter((c) => c.status === 'Rescheduled').length,
+      upcoming: list.filter(
+        (c) =>
+          (c.status === 'Pending' || c.status === 'Confirmed' || c.status === 'Rescheduled') &&
+          new Date(c.startUtc).getTime() >= nowMs,
+      ).length,
+      completed: list.filter((c) => c.status === 'Completed').length,
+      cancelled: list.filter((c) => c.status === 'Cancelled').length,
+      noShow: list.filter((c) => c.status === 'No-show').length,
+      overdueFollowUps: db.crmFollowUpTasks.filter(
+        (t) => t.status === 'Open' && new Date(t.dueAt).getTime() < nowMs,
+      ).length,
+    };
+  }
+
+  function requireStaffOrAdminMfa(ctx: AuthenticatedContext, res: Response, message = 'Operations clearance required.'): boolean {
+    if (!requireRoles(ctx, ['event_planner', 'staff', 'admin'], res, message)) return false;
+    if (ctx.session.role === 'admin' && !requireAdminMfa(ctx, res)) return false;
+    return true;
+  }
+
+  function resolveConsultationActorAccess(
+    req: Request,
+    ctx: AuthenticatedContext,
+    consultation: ConsultationAppointment,
+  ): 'staff_or_admin' | 'client_owner' | 'scoped_token' | null {
+    if (ctx.authMethod !== 'guest' && (ctx.session.accountStatus ?? 'active') === 'active') {
+      if (ctx.session.role === 'event_planner' || ctx.session.role === 'staff') {
+        return 'staff_or_admin';
+      }
+      if (ctx.session.role === 'admin' && ctx.mfaVerified) {
+        return 'staff_or_admin';
+      }
+      if (
+        ctx.session.role === 'client' &&
+        (consultation.clientId === ctx.session.id ||
+          consultation.clientEmail.toLowerCase() === ctx.session.email.toLowerCase())
+      ) {
+        return 'client_owner';
+      }
+    }
+    const providedToken =
+      (typeof req.body?.accessToken === 'string' ? req.body.accessToken : undefined) ||
+      (typeof req.query?.accessToken === 'string' ? req.query.accessToken : undefined) ||
+      req.header('x-consultation-token') ||
+      undefined;
+    if (verifyConsultationAccessToken(providedToken, consultation.accessTokenHash)) {
+      return 'scoped_token';
+    }
+    return null;
+  }
+
+  // 1. Real-time server-authoritative consultation availability calendar
+  app.get(
+    '/api/consultations/availability',
+    rateLimit(90, 60_000, { endpointGroup: 'consultations:availability', failClosed: false }),
+    async (req: Request, res: Response) => {
+      const startDate =
+        typeof req.query.startDate === 'string' && isValidIsoCalendarDate(req.query.startDate)
+          ? req.query.startDate
+          : new Date().toISOString().slice(0, 10);
+      const daysRaw = Number(req.query.days ?? 14);
+      const days = Number.isFinite(daysRaw) ? Math.min(31, Math.max(1, Math.floor(daysRaw))) : 14;
+      const requestedTz =
+        typeof req.query.timezone === 'string' && req.query.timezone.trim()
+          ? req.query.timezone.trim()
+          : STUDIO_TIMEZONE;
+      if (!isValidIanaTimezone(requestedTz)) {
+        return res.status(400).json({ error: 'Invalid IANA timezone identifier.', supportedTimezones: SUPPORTED_TIMEZONES });
+      }
+      const methodRaw = typeof req.query.method === 'string' ? req.query.method.trim() : undefined;
+      const methodParsed = methodRaw ? z.enum(['video', 'in_person_columbia', 'phone']).safeParse(methodRaw) : null;
+      if (methodParsed && !methodParsed.success) {
+        return res.status(400).json({ error: 'Invalid consultation method. Use video, in_person_columbia, or phone.' });
+      }
+      const plannerId =
+        typeof req.query.plannerId === 'string' && req.query.plannerId.trim() ? req.query.plannerId.trim() : undefined;
+      const excludeConsultationId =
+        typeof req.query.excludeConsultationId === 'string' && req.query.excludeConsultationId.trim()
+          ? req.query.excludeConsultationId.trim()
+          : undefined;
+
+      const db = await readDb();
+      const availability = computeConsultationAvailability({
+        startDate,
+        days,
+        clientTimezone: requestedTz,
+        method: methodParsed?.success ? methodParsed.data : undefined,
+        plannerId,
+        excludeConsultationId,
+        rules: db.staffAvailabilityRules,
+        blackoutDates: db.blackoutDates,
+        consultations: db.consultations,
+        slotHolds: db.consultationSlotHolds,
+        users: db.users,
+      });
+
+      const planners = db.users
+        .filter((u) => ['event_planner', 'staff', 'admin'].includes(u.role) && (u.accountStatus ?? 'active') === 'active')
+        .map((u) => ({ id: u.id, name: u.name, role: u.role }));
+
+      res.json({
+        studioTimezone: STUDIO_TIMEZONE,
+        clientTimezone: requestedTz,
+        supportedTimezones: SUPPORTED_TIMEZONES,
+        planners,
+        days: availability,
+      });
+    },
+  );
+
+  // 2. Temporary 10-minute consultation slot hold
+  app.post(
+    '/api/consultations/holds',
+    rateLimit(25, 60_000, { endpointGroup: 'consultations:holds', failClosed: false }),
+    async (req: Request, res: Response) => {
+      const parsed = z
+        .object({
+          plannerId: z.string().trim().min(2).max(120),
+          startUtc: z.string().datetime(),
+          method: z.enum(['video', 'in_person_columbia', 'phone']).default('video'),
+          holderKey: z.string().trim().min(6).max(160),
+        })
+        .safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Valid plannerId, startUtc (ISO-8601 UTC), method, and holderKey are required.' });
+      }
+
+      const holderHash = sha256Hex(parsed.data.holderKey);
+      const nowMs = Date.now();
+      const outcome = await withTransaction((db) => {
+        db.consultationSlotHolds = db.consultationSlotHolds.filter((h) => new Date(h.expiresAt).getTime() > nowMs);
+
+        const check = validateRequestedConsultationSlot({
+          plannerId: parsed.data.plannerId,
+          startUtc: parsed.data.startUtc,
+          method: parsed.data.method,
+          rules: db.staffAvailabilityRules,
+          blackoutDates: db.blackoutDates,
+          consultations: db.consultations,
+          slotHolds: db.consultationSlotHolds,
+          ignoreHolderHash: holderHash,
+          nowMs,
+        });
+        if (!check.valid || !check.endUtc) {
+          return {
+            ok: false as const,
+            error: check.error || 'Selected slot is unavailable.',
+            code: check.errorCode || 'SLOT_CONFLICT',
+          };
+        }
+
+        db.consultationSlotHolds = db.consultationSlotHolds.filter((h) => h.holderFingerprintHash !== holderHash);
+        const hold = {
+          id: `chold-${crypto.randomUUID().slice(0, 12)}`,
+          plannerId: parsed.data.plannerId,
+          slotStartUtc: new Date(parsed.data.startUtc).toISOString(),
+          slotEndUtc: check.endUtc,
+          holderFingerprintHash: holderHash,
+          expiresAt: new Date(nowMs + 10 * 60_000).toISOString(),
+          createdAt: new Date(nowMs).toISOString(),
+        };
+        db.consultationSlotHolds.push(hold);
+        return { ok: true as const, hold };
+      });
+
+      if (!outcome.ok) {
+        const status = outcome.code === 'SLOT_CONFLICT' || outcome.code === 'BLACKOUT' ? 409 : 400;
+        return res.status(status).json({ error: outcome.error, code: outcome.code });
+      }
+
+      res.status(201).json({
+        hold: {
+          id: outcome.hold.id,
+          plannerId: outcome.hold.plannerId,
+          startUtc: outcome.hold.slotStartUtc,
+          endUtc: outcome.hold.slotEndUtc,
+          expiresAt: outcome.hold.expiresAt,
+        },
+      });
+    },
+  );
+
+  // 3. Create Consultation Booking (Atomic scheduling + linked CRM/booking + transactional outbox)
+  const createConsultationSchema = z.object({
+    eventType: z.string().trim().min(2).max(120),
+    eventTitle: z.string().trim().min(3).max(180).optional(),
+    serviceDivisionIds: z.array(z.string().trim().min(1)).min(1).max(12),
+    eventDate: z.string().refine(isValidIsoCalendarDate, 'Target event date must be a valid YYYY-MM-DD calendar date.'),
+    guestCount: z.coerce.number().int().min(10).max(5000),
+    budgetRange: z.string().trim().min(2).max(80),
+    location: z.string().trim().min(2).max(160),
+    venueName: z.string().trim().min(2).max(180).default('Venue To Be Finalized'),
+    consultationStartUtc: z.string().datetime(),
+    consultationMethod: z.enum(['video', 'in_person_columbia', 'phone']).default('video'),
+    plannerId: z.string().trim().min(2).max(120).optional(),
+    clientTimezone: z.string().trim().min(2).max(80).default(STUDIO_TIMEZONE),
+    holderKey: z.string().trim().min(6).max(160).optional(),
+    clientName: z.string().trim().min(2).max(140),
+    clientEmail: z.string().trim().email().max(180),
+    clientPhone: z.string().trim().min(7).max(40),
+    preferredContactMethod: z.enum(['email', 'phone', 'sms']).default('email'),
+    notes: z.string().trim().max(3000).default(''),
+    privacyConsentAccepted: z.literal(true),
+  });
+
+  app.post(
+    '/api/consultations',
+    rateLimit(20, 60_000, { endpointGroup: 'consultations:create', failClosed: false }),
+    async (req: Request, res: Response) => {
+      const { ctx } = await getAuth(req);
+      const parsed = createConsultationSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({
+          error: 'Please complete all required consultation fields and accept the privacy consent notice.',
+          details: parsed.error.flatten().fieldErrors,
+        });
+      }
+      const input = parsed.data;
+      if (!isValidIanaTimezone(input.clientTimezone)) {
+        return res.status(400).json({ error: 'Unsupported timezone provided.' });
+      }
+      const todayIso = new Date().toISOString().slice(0, 10);
+      if (input.eventDate < todayIso) {
+        return res.status(400).json({ error: 'Target event date cannot be in the past.' });
+      }
+
+      const rawIdempotency = (req.header('idempotency-key') || '').trim().slice(0, 128);
+      const idempotencyKey = rawIdempotency || undefined;
+      const holderHash = input.holderKey ? sha256Hex(input.holderKey) : undefined;
+      const nowIso = new Date().toISOString();
+      const nowMs = Date.now();
+
+      const result = await withTransaction((db) => {
+        if (idempotencyKey && db.consultationIdempotencyKeys[idempotencyKey]) {
+          const existingId = db.consultationIdempotencyKeys[idempotencyKey];
+          const existingConsultation = db.consultations.find((c) => c.id === existingId);
+          const existingBooking = existingConsultation
+            ? db.bookings.find((b) => b.id === existingConsultation.bookingId)
+            : undefined;
+          if (existingConsultation) {
+            return {
+              ok: true as const,
+              deduplicated: true,
+              consultation: existingConsultation,
+              booking: existingBooking,
+              accessToken: undefined,
+              outboxJobs: db.notificationOutbox.filter((j) => j.bookingReference === existingConsultation.referenceCode),
+            };
+          }
+        }
+
+        db.consultationSlotHolds = db.consultationSlotHolds.filter((h) => new Date(h.expiresAt).getTime() > nowMs);
+
+        const candidatePlannerIds = input.plannerId
+          ? [input.plannerId]
+          : Array.from(new Set(db.staffAvailabilityRules.filter((r) => r.isActive).map((r) => r.plannerId)));
+
+        let chosenPlannerId: string | null = null;
+        let slotValidation: ReturnType<typeof validateRequestedConsultationSlot> | null = null;
+
+        for (const pid of candidatePlannerIds) {
+          const check = validateRequestedConsultationSlot({
+            plannerId: pid,
+            startUtc: input.consultationStartUtc,
+            method: input.consultationMethod,
+            rules: db.staffAvailabilityRules,
+            blackoutDates: db.blackoutDates,
+            consultations: db.consultations,
+            slotHolds: db.consultationSlotHolds,
+            ignoreHolderHash: holderHash,
+            nowMs,
+          });
+          if (check.valid) {
+            chosenPlannerId = pid;
+            slotValidation = check;
+            break;
+          }
+          if (!slotValidation) slotValidation = check;
+        }
+
+        if (!chosenPlannerId || !slotValidation?.valid || !slotValidation.endUtc) {
+          const startDateFallback = new Date(input.consultationStartUtc).toISOString().slice(0, 10);
+          const suggestedDays = computeConsultationAvailability({
+            startDate: startDateFallback >= todayIso ? startDateFallback : todayIso,
+            days: 7,
+            clientTimezone: input.clientTimezone,
+            method: input.consultationMethod,
+            rules: db.staffAvailabilityRules,
+            blackoutDates: db.blackoutDates,
+            consultations: db.consultations,
+            slotHolds: db.consultationSlotHolds,
+            users: db.users,
+            nowMs,
+          });
+          const suggestedSlots = suggestedDays
+            .flatMap((d) => d.slots)
+            .filter((s) => s.available)
+            .slice(0, 6);
+          return {
+            ok: false as const,
+            code: slotValidation?.errorCode || 'SLOT_CONFLICT',
+            error: slotValidation?.error || 'Selected consultation slot is no longer available.',
+            suggestedSlots,
+          };
+        }
+
+        const refCode = generateUniqueBookingReference(db.bookings, input.eventDate);
+        const bookingId = `bkg-${crypto.randomUUID().slice(0, 10)}`;
+        const consultationId = `con-${crypto.randomUUID().slice(0, 10)}`;
+        const plannerName = slotValidation.plannerName || 'Maya Brooks';
+        const resolvedEventTitle = (input.eventTitle || `${input.clientName} ${input.eventType}`).trim();
+        const { token: accessToken, hash: accessTokenHash } = generateConsultationAccessToken();
+
+        const linkedClientId =
+          ctx.authMethod !== 'guest' && ctx.session.role === 'client'
+            ? ctx.session.id
+            : db.users.find((u) => u.email.toLowerCase() === input.clientEmail.toLowerCase())?.id || 'user-client-guest';
+
+        const newBooking: BookingRecord = {
+          id: bookingId,
+          referenceCode: refCode,
+          clientId: linkedClientId,
+          clientName: input.clientName,
+          clientEmail: input.clientEmail,
+          clientPhone: input.clientPhone,
+          eventTitle: resolvedEventTitle,
+          eventType: input.eventType,
+          serviceDivisionIds: input.serviceDivisionIds,
+          packageTier: 'Bespoke Consultation',
+          eventDate: input.eventDate,
+          location: input.location,
+          venueName: input.venueName,
+          guestCount: input.guestCount,
+          budgetRange: input.budgetRange,
+          status: 'Consultation Scheduled',
+          architecturalStage: LEGACY_TO_ARCH_STATUS['Consultation Scheduled'],
+          assignedLeadPlanner: plannerName,
+          assignedVendorIds: [],
+          notes: input.notes,
+          quotations: [],
+          contract: {
+            id: `ctr-${bookingId}`,
+            bookingId,
+            title: `${resolvedEventTitle} — Preliminary Consultation Record`,
+            termsSummary:
+              'Preliminary consultation scheduled. Final binding event agreement issued upon approved itemized proposal.',
+            clientSigned: false,
+            staffCountersigned: false,
+          },
+          payments: [],
+          milestones: [
+            {
+              id: `ms-${Date.now()}-1`,
+              title: 'Private Design Consultation',
+              dueDate: new Date(input.consultationStartUtc).toISOString().slice(0, 10),
+              completed: false,
+              owner: 'Planner',
+            },
+            {
+              id: `ms-${Date.now()}-2`,
+              title: 'Itemized Proposal & Design Direction Delivery',
+              dueDate: input.eventDate,
+              completed: false,
+              owner: 'Planner',
+            },
+          ],
+          scheduleItems: [],
+          messages: [
+            {
+              id: `msg-${Date.now()}`,
+              sender: 'Celebration Sisters Concierge',
+              role: 'staff',
+              text: `Private consultation requested for ${formatFullDateTimeForTimezone(input.consultationStartUtc, STUDIO_TIMEZONE)} (${formatConsultationMethodLabel(input.consultationMethod)}).`,
+              createdAt: nowIso,
+            },
+          ],
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        };
+
+        const newConsultation: ConsultationAppointment = {
+          id: consultationId,
+          bookingId,
+          referenceCode: refCode,
+          clientId: linkedClientId,
+          clientName: input.clientName,
+          clientEmail: input.clientEmail,
+          clientPhone: input.clientPhone,
+          preferredContactMethod: input.preferredContactMethod,
+          eventTitle: resolvedEventTitle,
+          eventCategory: input.eventType,
+          serviceDivisionIds: input.serviceDivisionIds,
+          eventDate: input.eventDate,
+          venueName: input.venueName,
+          eventLocation: input.location,
+          guestCount: input.guestCount,
+          budgetRange: input.budgetRange,
+          consultationNotes: input.notes,
+          method: input.consultationMethod,
+          status: 'Pending',
+          assignedPlannerId: chosenPlannerId,
+          assignedPlannerName: plannerName,
+          startUtc: new Date(input.consultationStartUtc).toISOString(),
+          endUtc: slotValidation.endUtc,
+          durationMinutes: slotValidation.durationMinutes || 45,
+          bufferBeforeMinutes: slotValidation.bufferBeforeMinutes ?? 15,
+          bufferAfterMinutes: slotValidation.bufferAfterMinutes ?? 15,
+          clientTimezone: input.clientTimezone,
+          privacyConsentAccepted: true,
+          privacyConsentAt: nowIso,
+          privacyConsentVersion: '2026-04-v1',
+          accessTokenHash,
+          idempotencyKey,
+          crmStage: 'Consultation Scheduled',
+          rescheduleCount: 0,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        };
+
+        db.bookings.unshift(newBooking);
+        db.consultations.unshift(newConsultation);
+        if (idempotencyKey) {
+          db.consultationIdempotencyKeys[idempotencyKey] = consultationId;
+          db.bookingIdempotencyKeys[idempotencyKey] = bookingId;
+        }
+        if (holderHash) {
+          db.consultationSlotHolds = db.consultationSlotHolds.filter((h) => h.holderFingerprintHash !== holderHash);
+        }
+
+        const clientWindow = formatFullDateTimeForTimezone(newConsultation.startUtc, input.clientTimezone);
+        const studioWindow = formatFullDateTimeForTimezone(newConsultation.startUtc, STUDIO_TIMEZONE);
+        const methodLabel = formatConsultationMethodLabel(input.consultationMethod);
+
+        const clientTpl = buildConsultationConfirmationTemplate({
+          clientName: input.clientName,
+          referenceCode: refCode,
+          eventTitle: resolvedEventTitle,
+          eventDate: input.eventDate,
+          venueName: input.venueName,
+          location: input.location,
+          consultationWindow: clientWindow,
+          consultationMethod: methodLabel,
+          assignedPlanner: plannerName,
+        });
+        const staffTpl = buildStaffAlertTemplate({
+          referenceCode: refCode,
+          clientName: input.clientName,
+          eventTitle: resolvedEventTitle,
+          eventDate: input.eventDate,
+          venueName: input.venueName,
+          budgetRange: input.budgetRange,
+          consultationWindow: studioWindow,
+          assignedPlanner: plannerName,
+        });
+
+        const outboxJobs = [
+          enqueueOutboxNotification(db, {
+            idempotencyKey: `consultation:${consultationId}:confirmation`,
+            category: 'consultation_confirmation',
+            recipient: input.clientEmail,
+            bookingReference: refCode,
+            subject: clientTpl.subject,
+            htmlBody: clientTpl.htmlBody,
+            textBody: clientTpl.textBody,
+          }),
+        ];
+
+        const staffEmail = (process.env.STAFF_NOTIFICATION_EMAIL || 'maya@celebrationsisters.example.com').trim();
+        if (staffEmail) {
+          outboxJobs.push(
+            enqueueOutboxNotification(db, {
+              idempotencyKey: `consultation:${consultationId}:staff_new_booking_alert`,
+              category: 'staff_new_booking_alert',
+              recipient: staffEmail,
+              bookingReference: refCode,
+              subject: staffTpl.subject,
+              htmlBody: staffTpl.htmlBody,
+              textBody: staffTpl.textBody,
+            }),
+          );
+        }
+
+        appendAudit(
+          db,
+          ctx.session,
+          'CONSULTATION_BOOKED',
+          'Consultation',
+          refCode,
+          `${resolvedEventTitle} scheduled for ${studioWindow} with ${plannerName} (${methodLabel})`,
+        );
+
+        return {
+          ok: true as const,
+          deduplicated: false,
+          consultation: newConsultation,
+          booking: newBooking,
+          accessToken,
+          outboxJobs,
+        };
+      });
+
+      if (!result.ok) {
+        const httpStatus = result.code === 'SLOT_CONFLICT' || result.code === 'BLACKOUT' ? 409 : 400;
+        return res.status(httpStatus).json({
+          error: result.error,
+          code: result.code,
+          suggestedSlots: result.suggestedSlots,
+        });
+      }
+
+      await outboxWorker.processOnce().catch(() => {});
+
+      const refreshedDb = await readDb();
+      const deliveryRecords = refreshedDb.notificationDeliveries.filter(
+        (d) => d.bookingReference === result.consultation.referenceCode,
+      );
+
+      res.status(result.deduplicated ? 200 : 201).json({
+        deduplicated: result.deduplicated,
+        consultation: sanitizeConsultationForClient(result.consultation),
+        booking: result.booking,
+        ...(result.accessToken ? { accessToken: result.accessToken } : {}),
+        scheduleDisplay: {
+          clientWindow: formatFullDateTimeForTimezone(result.consultation.startUtc, result.consultation.clientTimezone),
+          studioWindow: formatFullDateTimeForTimezone(result.consultation.startUtc, STUDIO_TIMEZONE),
+        },
+        notificationStatus: {
+          provider: getEmailProviderStatus(),
+          outboxQueued: result.outboxJobs.length,
+          deliveries: deliveryRecords.map((d) => ({
+            id: d.id,
+            category: d.category,
+            status: d.status,
+            provider: d.provider,
+          })),
+        },
+      });
+    },
+  );
+
+  // 4. Scoped-token public consultation status lookup (blocks predictable reference-only enumeration)
+  app.get(
+    '/api/consultations/status',
+    rateLimit(30, 60_000, { endpointGroup: 'consultations:status', failClosed: true }),
+    async (req: Request, res: Response) => {
+      const referenceCode = typeof req.query.referenceCode === 'string' ? req.query.referenceCode.trim().toUpperCase() : '';
+      const accessToken =
+        (typeof req.query.accessToken === 'string' ? req.query.accessToken.trim() : '') ||
+        (req.header('x-consultation-token') || '').trim();
+
+      if (!referenceCode || !accessToken) {
+        return res.status(400).json({
+          error: 'Both referenceCode and scoped verification accessToken are required to view consultation details.',
+          code: 'SCOPED_TOKEN_REQUIRED',
+        });
+      }
+
+      const db = await readDb();
+      const consultation = db.consultations.find((c) => c.referenceCode.toUpperCase() === referenceCode);
+      if (!consultation || !verifyConsultationAccessToken(accessToken, consultation.accessTokenHash)) {
+        return res.status(403).json({
+          error: 'Consultation record not found or verification token is invalid.',
+          code: 'INVALID_CONSULTATION_TOKEN',
+        });
+      }
+
+      const canReschedule = canTransitionConsultationStatus(consultation.status, 'Rescheduled');
+      const canCancel = canTransitionConsultationStatus(consultation.status, 'Cancelled');
+
+      res.json({
+        consultation: {
+          id: consultation.id,
+          referenceCode: consultation.referenceCode,
+          eventTitle: consultation.eventTitle,
+          eventType: consultation.eventCategory,
+          eventDate: consultation.eventDate,
+          venueName: consultation.venueName,
+          location: consultation.eventLocation,
+          method: consultation.method,
+          methodLabel: formatConsultationMethodLabel(consultation.method),
+          status: consultation.status,
+          crmStage: consultation.crmStage,
+          assignedPlannerId: consultation.assignedPlannerId,
+          assignedPlannerName: consultation.assignedPlannerName,
+          startUtc: consultation.startUtc,
+          endUtc: consultation.endUtc,
+          durationMinutes: consultation.durationMinutes,
+          clientTimezone: consultation.clientTimezone,
+          clientWindow: formatFullDateTimeForTimezone(consultation.startUtc, consultation.clientTimezone),
+          studioWindow: formatFullDateTimeForTimezone(consultation.startUtc, STUDIO_TIMEZONE),
+          rescheduleCount: consultation.rescheduleCount,
+          canReschedule,
+          canCancel,
+          updatedAt: consultation.updatedAt,
+        },
+      });
+    },
+  );
+
+  // 5. Reschedule Consultation (Client with scoped token/session OR Staff/Admin)
+  app.post(
+    '/api/consultations/:id/reschedule',
+    rateLimit(25, 60_000, { endpointGroup: 'consultations:reschedule', failClosed: true }),
+    async (req: Request, res: Response) => {
+      const { ctx } = await getAuth(req);
+      const parsed = z
+        .object({
+          newStartUtc: z.string().datetime(),
+          plannerId: z.string().trim().min(2).max(120).optional(),
+          method: z.enum(['video', 'in_person_columbia', 'phone']).optional(),
+          clientTimezone: z.string().trim().min(2).max(80).optional(),
+          reason: z.string().trim().max(400).optional(),
+          accessToken: z.string().trim().max(256).optional(),
+        })
+        .safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Valid newStartUtc (ISO-8601 UTC) is required to reschedule.' });
+      }
+      if (parsed.data.clientTimezone && !isValidIanaTimezone(parsed.data.clientTimezone)) {
+        return res.status(400).json({ error: 'Invalid timezone identifier.' });
+      }
+
+      const nowIso = new Date().toISOString();
+      const nowMs = Date.now();
+      const targetId = String(req.params.id);
+      const outcome = await withTransaction((db) => {
+        const consultation = db.consultations.find(
+          (c) => c.id === targetId || c.referenceCode.toUpperCase() === targetId.toUpperCase(),
+        );
+        if (!consultation) return { ok: false as const, status: 404, error: 'Consultation not found.' };
+
+        const access = resolveConsultationActorAccess(req, ctx, consultation);
+        if (!access) {
+          return {
+            ok: false as const,
+            status: 403,
+            error: 'Valid consultation verification token or authorized session required to reschedule.',
+          };
+        }
+        if (!canTransitionConsultationStatus(consultation.status, 'Rescheduled')) {
+          return {
+            ok: false as const,
+            status: 409,
+            error: `Consultations in "${consultation.status}" status cannot be rescheduled.`,
+          };
+        }
+
+        const targetPlannerId = parsed.data.plannerId || consultation.assignedPlannerId;
+        const targetMethod = parsed.data.method || consultation.method;
+        const check = validateRequestedConsultationSlot({
+          plannerId: targetPlannerId,
+          startUtc: parsed.data.newStartUtc,
+          method: targetMethod,
+          rules: db.staffAvailabilityRules,
+          blackoutDates: db.blackoutDates,
+          consultations: db.consultations,
+          slotHolds: db.consultationSlotHolds,
+          excludeConsultationId: consultation.id,
+          nowMs,
+        });
+        if (!check.valid || !check.endUtc) {
+          return {
+            ok: false as const,
+            status: check.errorCode === 'SLOT_CONFLICT' || check.errorCode === 'BLACKOUT' ? 409 : 400,
+            error: check.error || 'Requested reschedule slot is unavailable.',
+            code: check.errorCode,
+          };
+        }
+
+        const prevStartUtc = consultation.startUtc;
+        const prevWindowClient = formatFullDateTimeForTimezone(prevStartUtc, consultation.clientTimezone);
+        const prevWindowStudio = formatFullDateTimeForTimezone(prevStartUtc, STUDIO_TIMEZONE);
+
+        consultation.rescheduledFromStartUtc = prevStartUtc;
+        consultation.startUtc = new Date(parsed.data.newStartUtc).toISOString();
+        consultation.endUtc = check.endUtc;
+        consultation.durationMinutes = check.durationMinutes || consultation.durationMinutes;
+        consultation.bufferBeforeMinutes = check.bufferBeforeMinutes ?? consultation.bufferBeforeMinutes;
+        consultation.bufferAfterMinutes = check.bufferAfterMinutes ?? consultation.bufferAfterMinutes;
+        consultation.assignedPlannerId = targetPlannerId;
+        consultation.assignedPlannerName = check.plannerName || consultation.assignedPlannerName;
+        consultation.method = targetMethod;
+        if (parsed.data.clientTimezone) consultation.clientTimezone = parsed.data.clientTimezone;
+        consultation.status = 'Rescheduled';
+        consultation.rescheduleCount += 1;
+        consultation.updatedAt = nowIso;
+
+        const linkedBooking = db.bookings.find((b) => b.id === consultation.bookingId);
+        if (linkedBooking) {
+          linkedBooking.assignedLeadPlanner = consultation.assignedPlannerName;
+          linkedBooking.updatedAt = nowIso;
+          linkedBooking.messages.push({
+            id: `msg-${Date.now()}`,
+            sender: access === 'staff_or_admin' ? ctx.session.name : consultation.clientName,
+            role: access === 'staff_or_admin' ? 'staff' : 'client',
+            text: `Consultation rescheduled to ${formatFullDateTimeForTimezone(consultation.startUtc, STUDIO_TIMEZONE)}.${parsed.data.reason ? ` Reason: ${parsed.data.reason}` : ''}`,
+            createdAt: nowIso,
+          });
+        }
+
+        const newWindowClient = formatFullDateTimeForTimezone(consultation.startUtc, consultation.clientTimezone);
+        const newWindowStudio = formatFullDateTimeForTimezone(consultation.startUtc, STUDIO_TIMEZONE);
+        const clientTpl = buildConsultationRescheduledTemplate({
+          clientName: consultation.clientName,
+          referenceCode: consultation.referenceCode,
+          eventTitle: consultation.eventTitle,
+          previousWindow: prevWindowClient,
+          newWindow: newWindowClient,
+          consultationMethod: formatConsultationMethodLabel(consultation.method),
+          assignedPlanner: consultation.assignedPlannerName,
+        });
+        enqueueOutboxNotification(db, {
+          idempotencyKey: `consultation:${consultation.id}:rescheduled:${consultation.rescheduleCount}`,
+          category: 'consultation_rescheduled',
+          recipient: consultation.clientEmail,
+          bookingReference: consultation.referenceCode,
+          subject: clientTpl.subject,
+          htmlBody: clientTpl.htmlBody,
+          textBody: clientTpl.textBody,
+        });
+
+        const staffEmail = (process.env.STAFF_NOTIFICATION_EMAIL || 'maya@celebrationsisters.example.com').trim();
+        const staffTpl = buildInternalOperationsAlertTemplate({
+          heading: 'Consultation Rescheduled',
+          referenceCode: consultation.referenceCode,
+          clientName: consultation.clientName,
+          eventTitle: consultation.eventTitle,
+          details: `Moved from ${prevWindowStudio} to ${newWindowStudio} (Planner: ${consultation.assignedPlannerName}).${parsed.data.reason ? ` Reason: ${parsed.data.reason}` : ''}`,
+        });
+        enqueueOutboxNotification(db, {
+          idempotencyKey: `consultation:${consultation.id}:staff_reschedule_alert:${consultation.rescheduleCount}`,
+          category: 'staff_reschedule_alert',
+          recipient: staffEmail,
+          bookingReference: consultation.referenceCode,
+          subject: staffTpl.subject,
+          htmlBody: staffTpl.htmlBody,
+          textBody: staffTpl.textBody,
+        });
+
+        appendAudit(
+          db,
+          ctx.session,
+          'CONSULTATION_RESCHEDULED',
+          'Consultation',
+          consultation.referenceCode,
+          `${prevWindowStudio} -> ${newWindowStudio} via ${access}`,
+        );
+
+        return { ok: true as const, consultation };
+      });
+
+      if (!outcome.ok) {
+        return res.status(outcome.status).json({ error: outcome.error, code: outcome.code });
+      }
+      await outboxWorker.processOnce().catch(() => {});
+      res.json({
+        consultation: sanitizeConsultationForClient(outcome.consultation),
+        scheduleDisplay: {
+          clientWindow: formatFullDateTimeForTimezone(outcome.consultation.startUtc, outcome.consultation.clientTimezone),
+          studioWindow: formatFullDateTimeForTimezone(outcome.consultation.startUtc, STUDIO_TIMEZONE),
+        },
+      });
+    },
+  );
+
+  // 6. Cancel Consultation (releases slot immediately + dispatches client & staff alerts)
+  app.post(
+    '/api/consultations/:id/cancel',
+    rateLimit(25, 60_000, { endpointGroup: 'consultations:cancel', failClosed: true }),
+    async (req: Request, res: Response) => {
+      const { ctx } = await getAuth(req);
+      const parsed = z
+        .object({
+          reason: z.string().trim().max(400).optional(),
+          accessToken: z.string().trim().max(256).optional(),
+        })
+        .safeParse(req.body ?? {});
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Invalid cancellation payload.' });
+      }
+
+      const nowIso = new Date().toISOString();
+      const targetId = String(req.params.id);
+      const outcome = await withTransaction((db) => {
+        const consultation = db.consultations.find(
+          (c) => c.id === targetId || c.referenceCode.toUpperCase() === targetId.toUpperCase(),
+        );
+        if (!consultation) return { ok: false as const, status: 404, error: 'Consultation not found.' };
+
+        const access = resolveConsultationActorAccess(req, ctx, consultation);
+        if (!access) {
+          return {
+            ok: false as const,
+            status: 403,
+            error: 'Valid consultation verification token or authorized session required to cancel.',
+          };
+        }
+        if (!canTransitionConsultationStatus(consultation.status, 'Cancelled')) {
+          return {
+            ok: false as const,
+            status: 409,
+            error: `Consultations in "${consultation.status}" status cannot be cancelled.`,
+          };
+        }
+
+        const prevWindowClient = formatFullDateTimeForTimezone(consultation.startUtc, consultation.clientTimezone);
+        const prevWindowStudio = formatFullDateTimeForTimezone(consultation.startUtc, STUDIO_TIMEZONE);
+        consultation.status = 'Cancelled';
+        consultation.cancelledAt = nowIso;
+        consultation.cancelReason = parsed.data.reason || 'Cancelled upon request';
+        consultation.updatedAt = nowIso;
+
+        const linkedBooking = db.bookings.find((b) => b.id === consultation.bookingId);
+        if (linkedBooking) {
+          linkedBooking.updatedAt = nowIso;
+          linkedBooking.messages.push({
+            id: `msg-${Date.now()}`,
+            sender: access === 'staff_or_admin' ? ctx.session.name : consultation.clientName,
+            role: access === 'staff_or_admin' ? 'staff' : 'client',
+            text: `Consultation cancelled (${consultation.cancelReason}). Slot ${prevWindowStudio} released.`,
+            createdAt: nowIso,
+          });
+        }
+
+        const clientTpl = buildConsultationCancelledTemplate({
+          clientName: consultation.clientName,
+          referenceCode: consultation.referenceCode,
+          eventTitle: consultation.eventTitle,
+          cancelledWindow: prevWindowClient,
+          reason: consultation.cancelReason,
+        });
+        enqueueOutboxNotification(db, {
+          idempotencyKey: `consultation:${consultation.id}:cancelled`,
+          category: 'consultation_cancelled',
+          recipient: consultation.clientEmail,
+          bookingReference: consultation.referenceCode,
+          subject: clientTpl.subject,
+          htmlBody: clientTpl.htmlBody,
+          textBody: clientTpl.textBody,
+        });
+
+        const staffEmail = (process.env.STAFF_NOTIFICATION_EMAIL || 'maya@celebrationsisters.example.com').trim();
+        const staffTpl = buildInternalOperationsAlertTemplate({
+          heading: 'Consultation Cancelled',
+          referenceCode: consultation.referenceCode,
+          clientName: consultation.clientName,
+          eventTitle: consultation.eventTitle,
+          details: `Slot ${prevWindowStudio} released. Reason: ${consultation.cancelReason}`,
+        });
+        enqueueOutboxNotification(db, {
+          idempotencyKey: `consultation:${consultation.id}:staff_cancellation_alert`,
+          category: 'staff_cancellation_alert',
+          recipient: staffEmail,
+          bookingReference: consultation.referenceCode,
+          subject: staffTpl.subject,
+          htmlBody: staffTpl.htmlBody,
+          textBody: staffTpl.textBody,
+        });
+
+        appendAudit(
+          db,
+          ctx.session,
+          'CONSULTATION_CANCELLED',
+          'Consultation',
+          consultation.referenceCode,
+          `Slot ${prevWindowStudio} released via ${access}: ${consultation.cancelReason}`,
+        );
+
+        return { ok: true as const, consultation };
+      });
+
+      if (!outcome.ok) {
+        return res.status(outcome.status).json({ error: outcome.error });
+      }
+      await outboxWorker.processOnce().catch(() => {});
+      res.json({ consultation: sanitizeConsultationForClient(outcome.consultation) });
+    },
+  );
+
+  // 7. Authenticated Consultation Listing (RBAC isolated: client=own, planner/staff/admin=all, vendor=403)
+  app.get('/api/consultations', async (req: Request, res: Response) => {
+    const { db, ctx } = await getAuth(req);
+    if (!requireActiveAccount(ctx, res)) return;
+    if (ctx.session.role === 'vendor') {
+      await logSecurityIncident(ctx, 'TOKEN_REJECTED', '/api/consultations', 'Vendor denied consultation CRM access');
+      return res.status(403).json({ error: 'Vendors do not have access to client consultation records.' });
+    }
+    if (ctx.session.role === 'admin' && !requireAdminMfa(ctx, res)) return;
+
+    const isStaffOrAdmin = ['event_planner', 'staff', 'admin'].includes(ctx.session.role);
+    let list = db.consultations.filter((c) => {
+      if (isStaffOrAdmin) return true;
+      return c.clientId === ctx.session.id || c.clientEmail.toLowerCase() === ctx.session.email.toLowerCase();
+    });
+
+    const statusFilter = typeof req.query.status === 'string' ? req.query.status.trim() : '';
+    const plannerFilter = typeof req.query.plannerId === 'string' ? req.query.plannerId.trim() : '';
+    const crmFilter = typeof req.query.crmStage === 'string' ? req.query.crmStage.trim() : '';
+    if (statusFilter) list = list.filter((c) => c.status === statusFilter);
+    if (plannerFilter) list = list.filter((c) => c.assignedPlannerId === plannerFilter);
+    if (crmFilter) list = list.filter((c) => c.crmStage === crmFilter);
+
+    const sanitized = list.map(sanitizeConsultationForClient);
+    if (!isStaffOrAdmin) {
+      return res.json({ consultations: sanitized });
+    }
+
+    const planners = db.users
+      .filter((u) => ['event_planner', 'staff', 'admin'].includes(u.role) && (u.accountStatus ?? 'active') === 'active')
+      .map((u) => ({ id: u.id, name: u.name, role: u.role, email: u.email }));
+
+    res.json({
+      consultations: sanitized,
+      metrics: computeConsultationMetrics(db),
+      planners,
+      staffAvailabilityRules: db.staffAvailabilityRules,
+      crmFollowUpTasks: db.crmFollowUpTasks,
+      blackoutDates: db.blackoutDates,
+      notificationOutbox: db.notificationOutbox,
+      auditLogs: db.auditLogs.filter(
+        (a) => a.targetType === 'Consultation' || a.targetType === 'CrmTask' || a.targetType === 'StaffAvailability',
+      ),
+    });
+  });
+
+  // 8. Admin / Planner Confirm Consultation
+  app.patch('/api/consultations/:id/confirm', async (req: Request, res: Response) => {
+    const { ctx } = await getAuth(req);
+    if (!requireStaffOrAdminMfa(ctx, res, 'Planner or Executive clearance required to confirm consultations.')) return;
+
+    const nowIso = new Date().toISOString();
+    const outcome = await withTransaction((db) => {
+      const consultation = db.consultations.find((c) => c.id === req.params.id);
+      if (!consultation) return { ok: false as const, status: 404, error: 'Consultation not found.' };
+      if (!canTransitionConsultationStatus(consultation.status, 'Confirmed')) {
+        return {
+          ok: false as const,
+          status: 409,
+          error: `Cannot transition consultation from ${consultation.status} to Confirmed.`,
+        };
+      }
+
+      const prev = consultation.status;
+      consultation.status = 'Confirmed';
+      consultation.updatedAt = nowIso;
+
+      const clientTpl = buildConsultationConfirmedTemplate({
+        clientName: consultation.clientName,
+        referenceCode: consultation.referenceCode,
+        eventTitle: consultation.eventTitle,
+        consultationWindow: formatFullDateTimeForTimezone(consultation.startUtc, consultation.clientTimezone),
+        consultationMethod: formatConsultationMethodLabel(consultation.method),
+        assignedPlanner: consultation.assignedPlannerName,
+      });
+      enqueueOutboxNotification(db, {
+        idempotencyKey: `consultation:${consultation.id}:confirmed:${nowIso.slice(0, 13)}`,
+        category: 'consultation_confirmed',
+        recipient: consultation.clientEmail,
+        bookingReference: consultation.referenceCode,
+        subject: clientTpl.subject,
+        htmlBody: clientTpl.htmlBody,
+        textBody: clientTpl.textBody,
+      });
+
+      appendAudit(db, ctx.session, 'CONSULTATION_CONFIRMED', 'Consultation', consultation.referenceCode, `${prev} -> Confirmed`);
+      return { ok: true as const, consultation };
+    });
+
+    if (!outcome.ok) return res.status(outcome.status).json({ error: outcome.error });
+    await outboxWorker.processOnce().catch(() => {});
+    res.json({ consultation: sanitizeConsultationForClient(outcome.consultation) });
+  });
+
+  // 9. Admin / Planner Reassign Staff Planner (with conflict validation)
+  app.patch('/api/consultations/:id/assign', async (req: Request, res: Response) => {
+    const { ctx } = await getAuth(req);
+    if (!requireStaffOrAdminMfa(ctx, res, 'Planner or Executive clearance required to assign staff.')) return;
+
+    const parsed = z.object({ plannerId: z.string().trim().min(2).max(120) }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'Valid plannerId is required.' });
+
+    const nowIso = new Date().toISOString();
+    const outcome = await withTransaction((db) => {
+      const consultation = db.consultations.find((c) => c.id === req.params.id);
+      if (!consultation) return { ok: false as const, status: 404, error: 'Consultation not found.' };
+
+      const targetPlanner = db.users.find(
+        (u) =>
+          u.id === parsed.data.plannerId &&
+          ['event_planner', 'staff', 'admin'].includes(u.role) &&
+          (u.accountStatus ?? 'active') === 'active',
+      );
+      if (!targetPlanner) {
+        return { ok: false as const, status: 404, error: 'Target planner account not found or inactive.' };
+      }
+
+      const conflict = findPlannerSlotConflict({
+        plannerId: targetPlanner.id,
+        startUtc: consultation.startUtc,
+        endUtc: consultation.endUtc,
+        bufferBeforeMinutes: consultation.bufferBeforeMinutes,
+        bufferAfterMinutes: consultation.bufferAfterMinutes,
+        consultations: db.consultations,
+        slotHolds: db.consultationSlotHolds,
+        excludeConsultationId: consultation.id,
+      });
+      if (conflict.conflict) {
+        return {
+          ok: false as const,
+          status: 409,
+          error: `${targetPlanner.name} already has a conflicting appointment during this window.`,
+        };
+      }
+
+      const prevPlanner = consultation.assignedPlannerName;
+      consultation.assignedPlannerId = targetPlanner.id;
+      consultation.assignedPlannerName = targetPlanner.name;
+      consultation.updatedAt = nowIso;
+
+      const linkedBooking = db.bookings.find((b) => b.id === consultation.bookingId);
+      if (linkedBooking) {
+        linkedBooking.assignedLeadPlanner = targetPlanner.name;
+        linkedBooking.updatedAt = nowIso;
+      }
+
+      const staffTpl = buildInternalOperationsAlertTemplate({
+        heading: 'Consultation Assigned to You',
+        referenceCode: consultation.referenceCode,
+        clientName: consultation.clientName,
+        eventTitle: consultation.eventTitle,
+        details: `Reassigned from ${prevPlanner} to ${targetPlanner.name}. Scheduled: ${formatFullDateTimeForTimezone(consultation.startUtc, STUDIO_TIMEZONE)}.`,
+      });
+      enqueueOutboxNotification(db, {
+        idempotencyKey: `consultation:${consultation.id}:assigned:${targetPlanner.id}:${nowIso.slice(0, 16)}`,
+        category: 'staff_appointment_assigned',
+        recipient: targetPlanner.email,
+        bookingReference: consultation.referenceCode,
+        subject: staffTpl.subject,
+        htmlBody: staffTpl.htmlBody,
+        textBody: staffTpl.textBody,
+      });
+
+      appendAudit(
+        db,
+        ctx.session,
+        'CONSULTATION_PLANNER_ASSIGNED',
+        'Consultation',
+        consultation.referenceCode,
+        `${prevPlanner} -> ${targetPlanner.name}`,
+      );
+      return { ok: true as const, consultation };
+    });
+
+    if (!outcome.ok) return res.status(outcome.status).json({ error: outcome.error });
+    await outboxWorker.processOnce().catch(() => {});
+    res.json({ consultation: sanitizeConsultationForClient(outcome.consultation) });
+  });
+
+  // 10. Complete Consultation (or mark No-show), record outcome, advance CRM & create follow-up task
+  app.post('/api/consultations/:id/complete', async (req: Request, res: Response) => {
+    const { ctx } = await getAuth(req);
+    if (!requireStaffOrAdminMfa(ctx, res, 'Planner or Executive clearance required.')) return;
+
+    const parsed = z
+      .object({
+        status: z.enum(['Completed', 'No-show']).default('Completed'),
+        outcomeSummary: z.string().trim().min(5).max(2000),
+        followUpTitle: z.string().trim().min(3).max(200).optional(),
+        followUpDueAt: z.string().datetime().optional(),
+      })
+      .safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Consultation outcomeSummary (min 5 characters) is required.' });
+    }
+
+    const nowIso = new Date().toISOString();
+    const outcome = await withTransaction((db) => {
+      const consultation = db.consultations.find((c) => c.id === req.params.id);
+      if (!consultation) return { ok: false as const, status: 404, error: 'Consultation not found.' };
+      if (!canTransitionConsultationStatus(consultation.status, parsed.data.status)) {
+        return {
+          ok: false as const,
+          status: 409,
+          error: `Cannot transition consultation from ${consultation.status} to ${parsed.data.status}.`,
+        };
+      }
+
+      consultation.status = parsed.data.status;
+      consultation.outcomeSummary = parsed.data.outcomeSummary;
+      consultation.completedAt = parsed.data.status === 'Completed' ? nowIso : undefined;
+      consultation.updatedAt = nowIso;
+      if (parsed.data.status === 'Completed') {
+        consultation.crmStage = 'Consultation Completed';
+      }
+
+      const linkedBooking = db.bookings.find((b) => b.id === consultation.bookingId);
+      if (linkedBooking && parsed.data.status === 'Completed') {
+        if (canTransitionBookingStatus(linkedBooking.status, 'Proposal in Preparation')) {
+          linkedBooking.status = 'Proposal in Preparation';
+          linkedBooking.architecturalStage = LEGACY_TO_ARCH_STATUS['Proposal in Preparation'];
+        }
+        linkedBooking.updatedAt = nowIso;
+      }
+
+      let createdTask: CrmFollowUpTask | undefined;
+      if (parsed.data.followUpTitle) {
+        const dueAt = parsed.data.followUpDueAt || new Date(Date.now() + 48 * 60 * 60_000).toISOString();
+        consultation.followUpDueAt = dueAt;
+        createdTask = {
+          id: `crm-task-${crypto.randomUUID().slice(0, 10)}`,
+          consultationId: consultation.id,
+          bookingId: consultation.bookingId,
+          bookingReference: consultation.referenceCode,
+          clientName: consultation.clientName,
+          assignedToUserId: consultation.assignedPlannerId,
+          assignedToName: consultation.assignedPlannerName,
+          title: parsed.data.followUpTitle,
+          notes: parsed.data.outcomeSummary,
+          dueAt,
+          status: 'Open',
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        };
+        db.crmFollowUpTasks.unshift(createdTask);
+      }
+
+      if (parsed.data.status === 'Completed') {
+        const followTpl = buildConsultationFollowUpTemplate({
+          clientName: consultation.clientName,
+          referenceCode: consultation.referenceCode,
+          eventTitle: consultation.eventTitle,
+          outcomeSummary: parsed.data.outcomeSummary,
+          assignedPlanner: consultation.assignedPlannerName,
+        });
+        enqueueOutboxNotification(db, {
+          idempotencyKey: `consultation:${consultation.id}:followup`,
+          category: 'consultation_followup',
+          recipient: consultation.clientEmail,
+          bookingReference: consultation.referenceCode,
+          subject: followTpl.subject,
+          htmlBody: followTpl.htmlBody,
+          textBody: followTpl.textBody,
+        });
+      }
+
+      const staffEmail = (process.env.STAFF_NOTIFICATION_EMAIL || 'maya@celebrationsisters.example.com').trim();
+      const staffTpl = buildInternalOperationsAlertTemplate({
+        heading: parsed.data.status === 'Completed' ? 'Follow-Up Required Post-Consultation' : 'Consultation Marked No-Show',
+        referenceCode: consultation.referenceCode,
+        clientName: consultation.clientName,
+        eventTitle: consultation.eventTitle,
+        details: `${parsed.data.outcomeSummary}${createdTask ? ` · Follow-up task created: ${createdTask.title}` : ''}`,
+      });
+      enqueueOutboxNotification(db, {
+        idempotencyKey: `consultation:${consultation.id}:staff_followup:${parsed.data.status}`,
+        category: 'staff_followup_required',
+        recipient: staffEmail,
+        bookingReference: consultation.referenceCode,
+        subject: staffTpl.subject,
+        htmlBody: staffTpl.htmlBody,
+        textBody: staffTpl.textBody,
+      });
+
+      appendAudit(
+        db,
+        ctx.session,
+        'CONSULTATION_OUTCOME_RECORDED',
+        'Consultation',
+        consultation.referenceCode,
+        `Marked ${parsed.data.status}; CRM stage: ${consultation.crmStage}`,
+      );
+      return { ok: true as const, consultation, task: createdTask };
+    });
+
+    if (!outcome.ok) return res.status(outcome.status).json({ error: outcome.error });
+    await outboxWorker.processOnce().catch(() => {});
+    res.json({
+      consultation: sanitizeConsultationForClient(outcome.consultation),
+      ...(outcome.task ? { followUpTask: outcome.task } : {}),
+    });
+  });
+
+  // 11. Consultation-to-Proposal Handoff (exact integer-cent quotation math + CRM transition + email outbox)
+  app.post('/api/consultations/:id/proposal-handoff', async (req: Request, res: Response) => {
+    const { ctx } = await getAuth(req);
+    if (!requireStaffOrAdminMfa(ctx, res, 'Planner or Executive clearance required to issue proposals.')) return;
+
+    const lineItemSchema = z.object({
+      description: z.string().trim().min(2).max(240),
+      division: z.string().trim().min(2).max(120).optional(),
+      quantity: z.coerce.number().int().min(1).max(500).default(1),
+      unitPriceCents: z.coerce.number().int().min(0).optional(),
+      unitPrice: z.coerce.number().min(0).optional(),
+    });
+    const parsed = z
+      .object({
+        lineItems: z.array(lineItemSchema).min(1).max(40),
+        discountCents: z.coerce.number().int().min(0).optional(),
+        discountAmount: z.coerce.number().min(0).optional(),
+        notes: z.string().trim().max(1500).default('Tailored luxury decor & event production proposal.'),
+        markAsSent: z.boolean().default(true),
+      })
+      .safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'At least one valid itemized line item is required for proposal handoff.' });
+    }
+
+    const nowIso = new Date().toISOString();
+    const outcome = await withTransaction((db) => {
+      const consultation = db.consultations.find((c) => c.id === req.params.id);
+      if (!consultation) return { ok: false as const, status: 404, error: 'Consultation not found.' };
+      if (!['Completed', 'Confirmed'].includes(consultation.status)) {
+        return {
+          ok: false as const,
+          status: 409,
+          error: 'Proposal handoff requires a Confirmed or Completed consultation.',
+        };
+      }
+      const booking = db.bookings.find((b) => b.id === consultation.bookingId);
+      if (!booking) return { ok: false as const, status: 404, error: 'Linked booking record not found.' };
+
+      let subtotalCents = 0;
+      const computedItems = parsed.data.lineItems.map((item, index) => {
+        const unitCents =
+          item.unitPriceCents !== undefined ? item.unitPriceCents : Math.round((item.unitPrice ?? 0) * 100);
+        const lineCents = unitCents * item.quantity;
+        subtotalCents += lineCents;
+        return {
+          id: `li-${Date.now()}-${index + 1}`,
+          description: item.description,
+          division: item.division || consultation.eventCategory,
+          quantity: item.quantity,
+          unitPrice: unitCents / 100,
+        };
+      });
+
+      const discountCents =
+        parsed.data.discountCents !== undefined
+          ? parsed.data.discountCents
+          : Math.round((parsed.data.discountAmount ?? 0) * 100);
+      if (discountCents > subtotalCents) {
+        return { ok: false as const, status: 400, error: 'Discount cannot exceed proposal subtotal.' };
+      }
+
+      const totalCents = subtotalCents - discountCents;
+      const nextVersion = booking.quotations.length + 1;
+      const quote = {
+        version: nextVersion,
+        createdAt: nowIso,
+        items: computedItems,
+        discountAmount: discountCents / 100,
+        discountApproved: true,
+        discountApprovedBy: ctx.session.name,
+        totalAmount: totalCents / 100,
+        notes: parsed.data.notes,
+      };
+      booking.quotations.push(quote);
+      booking.updatedAt = nowIso;
+
+      if (parsed.data.markAsSent) {
+        consultation.crmStage = 'Proposal Sent';
+        if (canTransitionBookingStatus(booking.status, 'Quote Sent') || booking.status === 'Consultation Scheduled') {
+          booking.status = 'Quote Sent';
+          booking.architecturalStage = LEGACY_TO_ARCH_STATUS['Quote Sent'];
+        }
+      } else {
+        consultation.crmStage = 'Proposal Prepared';
+      }
+      consultation.updatedAt = nowIso;
+
+      const totalFormatted = new Intl.NumberFormat('en-US', {
+        style: 'currency',
+        currency: 'USD',
+      }).format(totalCents / 100);
+
+      if (parsed.data.markAsSent) {
+        const propTpl = buildProposalAvailableTemplate({
+          clientName: consultation.clientName,
+          referenceCode: consultation.referenceCode,
+          eventTitle: consultation.eventTitle,
+          quoteVersion: nextVersion,
+          totalAmountFormatted: totalFormatted,
+        });
+        enqueueOutboxNotification(db, {
+          idempotencyKey: `consultation:${consultation.id}:proposal:v${nextVersion}`,
+          category: 'proposal_available',
+          recipient: consultation.clientEmail,
+          bookingReference: consultation.referenceCode,
+          subject: propTpl.subject,
+          htmlBody: propTpl.htmlBody,
+          textBody: propTpl.textBody,
+        });
+
+        const staffEmail = (process.env.STAFF_NOTIFICATION_EMAIL || 'maya@celebrationsisters.example.com').trim();
+        const staffTpl = buildInternalOperationsAlertTemplate({
+          heading: 'Proposal Sent — Awaiting Client Decision',
+          referenceCode: consultation.referenceCode,
+          clientName: consultation.clientName,
+          eventTitle: consultation.eventTitle,
+          details: `Proposal v${nextVersion} (${totalFormatted}) delivered to client portal.`,
+        });
+        enqueueOutboxNotification(db, {
+          idempotencyKey: `consultation:${consultation.id}:staff_proposal_awaiting:v${nextVersion}`,
+          category: 'staff_proposal_awaiting_action',
+          recipient: staffEmail,
+          bookingReference: consultation.referenceCode,
+          subject: staffTpl.subject,
+          htmlBody: staffTpl.htmlBody,
+          textBody: staffTpl.textBody,
+        });
+      }
+
+      appendAudit(
+        db,
+        ctx.session,
+        'CONSULTATION_PROPOSAL_HANDOFF',
+        'Consultation',
+        consultation.referenceCode,
+        `Issued proposal v${nextVersion} (${totalFormatted}); CRM stage -> ${consultation.crmStage}`,
+      );
+
+      return {
+        ok: true as const,
+        consultation,
+        quote,
+        amountsCents: { subtotalCents, discountCents, totalCents },
+      };
+    });
+
+    if (!outcome.ok) return res.status(outcome.status).json({ error: outcome.error });
+    await outboxWorker.processOnce().catch(() => {});
+    res.status(201).json({
+      consultation: sanitizeConsultationForClient(outcome.consultation),
+      quotation: {
+        ...outcome.quote,
+        subtotal: outcome.amountsCents.subtotalCents / 100,
+      },
+      amountsCents: outcome.amountsCents,
+    });
+  });
+
+  // 12. Record Client Decision / Final CRM Conversion to Event Booked
+  app.post('/api/consultations/:id/decision', async (req: Request, res: Response) => {
+    const { ctx } = await getAuth(req);
+    if (!requireStaffOrAdminMfa(ctx, res, 'Planner or Executive clearance required.')) return;
+
+    const parsed = z
+      .object({
+        decision: z.enum(['Approved', 'Revision Requested', 'Declined']),
+        notes: z.string().trim().max(1000).optional(),
+      })
+      .safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'Valid decision (Approved, Revision Requested, Declined) required.' });
+
+    const nowIso = new Date().toISOString();
+    const outcome = await withTransaction((db) => {
+      const consultation = db.consultations.find((c) => c.id === req.params.id);
+      if (!consultation) return { ok: false as const, status: 404, error: 'Consultation not found.' };
+      const booking = db.bookings.find((b) => b.id === consultation.bookingId);
+
+      consultation.clientDecision = parsed.data.decision;
+      consultation.clientDecisionNotes = parsed.data.notes;
+
+      if (parsed.data.decision === 'Approved') {
+        consultation.crmStage = 'Event Booked';
+        if (booking) {
+          if (booking.status === 'Quote Sent' || booking.status === 'Awaiting Approval') {
+            booking.status = 'Confirmed';
+            booking.architecturalStage = LEGACY_TO_ARCH_STATUS['Confirmed'];
+          }
+          booking.updatedAt = nowIso;
+        }
+      } else {
+        consultation.crmStage = 'Client Decision';
+        if (booking && parsed.data.decision === 'Revision Requested') {
+          booking.updatedAt = nowIso;
+        }
+      }
+      consultation.updatedAt = nowIso;
+
+      appendAudit(
+        db,
+        ctx.session,
+        'CRM_CLIENT_DECISION_RECORDED',
+        'Consultation',
+        consultation.referenceCode,
+        `Decision: ${parsed.data.decision}; CRM stage: ${consultation.crmStage}${parsed.data.notes ? ` (${parsed.data.notes})` : ''}`,
+      );
+      return { ok: true as const, consultation };
+    });
+
+    if (!outcome.ok) return res.status(outcome.status).json({ error: outcome.error });
+    res.json({ consultation: sanitizeConsultationForClient(outcome.consultation) });
+  });
+
+  // 13. Staff Availability Rules Management
+  app.get('/api/staff/availability', async (req: Request, res: Response) => {
+    const { db, ctx } = await getAuth(req);
+    if (!requireStaffOrAdminMfa(ctx, res)) return;
+    res.json({
+      studioTimezone: STUDIO_TIMEZONE,
+      rules: db.staffAvailabilityRules,
+      blackoutDates: db.blackoutDates,
+    });
+  });
+
+  app.put('/api/staff/availability/:plannerId', async (req: Request, res: Response) => {
+    const { ctx } = await getAuth(req);
+    if (!requireStaffOrAdminMfa(ctx, res, 'Planner or Executive clearance required to manage schedules.')) return;
+
+    const ruleInputSchema = z.object({
+      dayOfWeek: z.coerce.number().int().min(0).max(6),
+      startTimeLocal: z.string().regex(/^\d{2}:\d{2}$/),
+      endTimeLocal: z.string().regex(/^\d{2}:\d{2}$/),
+      slotDurationMinutes: z.coerce.number().int().min(15).max(180).default(45),
+      bufferBeforeMinutes: z.coerce.number().int().min(0).max(120).default(15),
+      bufferAfterMinutes: z.coerce.number().int().min(0).max(120).default(15),
+      allowedMethods: z.array(z.enum(['video', 'in_person_columbia', 'phone'])).min(1),
+      isActive: z.boolean().default(true),
+    });
+    const parsed = z.object({ rules: z.array(ruleInputSchema).max(7) }).safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Invalid staff availability schedule rules.' });
+    }
+    for (const r of parsed.data.rules) {
+      if (r.endTimeLocal <= r.startTimeLocal) {
+        return res.status(400).json({ error: `End time (${r.endTimeLocal}) must be after start time (${r.startTimeLocal}).` });
+      }
+    }
+
+    const updated = await withTransaction((db) => {
+      const planner = db.users.find(
+        (u) => u.id === req.params.plannerId && ['event_planner', 'staff', 'admin'].includes(u.role),
+      );
+      if (!planner) return null;
+
+      db.staffAvailabilityRules = db.staffAvailabilityRules.filter((r) => r.plannerId !== planner.id);
+      const nextRules: StaffAvailabilityRule[] = parsed.data.rules.map((r) => ({
+        id: `sar-${planner.id}-${r.dayOfWeek}`,
+        plannerId: planner.id,
+        plannerName: planner.name,
+        dayOfWeek: r.dayOfWeek,
+        startTimeLocal: r.startTimeLocal,
+        endTimeLocal: r.endTimeLocal,
+        timezone: STUDIO_TIMEZONE,
+        slotDurationMinutes: r.slotDurationMinutes,
+        bufferBeforeMinutes: r.bufferBeforeMinutes,
+        bufferAfterMinutes: r.bufferAfterMinutes,
+        allowedMethods: r.allowedMethods,
+        isActive: r.isActive,
+      }));
+      db.staffAvailabilityRules.push(...nextRules);
+      appendAudit(
+        db,
+        ctx.session,
+        'STAFF_AVAILABILITY_UPDATED',
+        'StaffAvailability',
+        planner.id,
+        `Updated ${nextRules.length} weekly schedule rule(s) for ${planner.name}`,
+      );
+      return nextRules;
+    });
+
+    if (!updated) return res.status(404).json({ error: 'Planner not found.' });
+    res.json({ rules: updated });
+  });
+
+  // 14. CRM Conversion Pipeline & Follow-Up Tasks
+  app.get('/api/crm/pipeline', async (req: Request, res: Response) => {
+    const { db, ctx } = await getAuth(req);
+    if (!requireStaffOrAdminMfa(ctx, res)) return;
+
+    const stageCounts = CRM_PIPELINE_STAGES.map((stage) => ({
+      stage,
+      count: db.consultations.filter((c) => c.crmStage === stage).length,
+    }));
+    const totalConsultations = db.consultations.length;
+    const completedCount = db.consultations.filter((c) =>
+      ['Consultation Completed', 'Proposal Prepared', 'Proposal Sent', 'Client Decision', 'Event Booked'].includes(c.crmStage),
+    ).length;
+    const bookedCount = db.consultations.filter((c) => c.crmStage === 'Event Booked').length;
+
+    res.json({
+      stages: stageCounts,
+      conversionMetrics: {
+        totalLeads: totalConsultations,
+        consultationCompletionRatePct: totalConsultations > 0 ? Math.round((completedCount / totalConsultations) * 100) : 0,
+        bookingConversionRatePct: totalConsultations > 0 ? Math.round((bookedCount / totalConsultations) * 100) : 0,
+      },
+      tasks: db.crmFollowUpTasks,
+    });
+  });
+
+  app.post('/api/crm/tasks', async (req: Request, res: Response) => {
+    const { ctx } = await getAuth(req);
+    if (!requireStaffOrAdminMfa(ctx, res)) return;
+    const parsed = z
+      .object({
+        consultationId: z.string().trim().min(2),
+        title: z.string().trim().min(3).max(200),
+        dueAt: z.string().datetime(),
+        notes: z.string().trim().max(1000).default(''),
+        assignedStaffId: z.string().trim().min(2).optional(),
+      })
+      .safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'Valid consultationId, title, and dueAt are required.' });
+
+    const nowIso = new Date().toISOString();
+    const created = await withTransaction((db) => {
+      const consultation = db.consultations.find((c) => c.id === parsed.data.consultationId);
+      if (!consultation) return null;
+      const staff = db.users.find((u) => u.id === (parsed.data.assignedStaffId || consultation.assignedPlannerId));
+      const task: CrmFollowUpTask = {
+        id: `crm-task-${crypto.randomUUID().slice(0, 10)}`,
+        consultationId: consultation.id,
+        bookingId: consultation.bookingId,
+        bookingReference: consultation.referenceCode,
+        clientName: consultation.clientName,
+        assignedToUserId: staff?.id || consultation.assignedPlannerId,
+        assignedToName: staff?.name || consultation.assignedPlannerName,
+        title: parsed.data.title,
+        notes: parsed.data.notes,
+        dueAt: parsed.data.dueAt,
+        status: 'Open',
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+      db.crmFollowUpTasks.unshift(task);
+      appendAudit(db, ctx.session, 'CRM_TASK_CREATED', 'CrmTask', task.id, `${task.title} (${consultation.referenceCode})`);
+      return task;
+    });
+    if (!created) return res.status(404).json({ error: 'Consultation not found.' });
+    res.status(201).json({ task: created });
+  });
+
+  app.patch('/api/crm/tasks/:taskId', async (req: Request, res: Response) => {
+    const { ctx } = await getAuth(req);
+    if (!requireStaffOrAdminMfa(ctx, res)) return;
+    const parsed = z
+      .object({
+        status: z.enum(['Open', 'Completed', 'Cancelled']),
+        notes: z.string().trim().max(1000).optional(),
+      })
+      .safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'Valid task status required.' });
+
+    const updated = await withTransaction((db) => {
+      const task = db.crmFollowUpTasks.find((t) => t.id === req.params.taskId);
+      if (!task) return null;
+      task.status = parsed.data.status;
+      if (parsed.data.notes !== undefined) task.notes = parsed.data.notes;
+      task.completedAt = parsed.data.status === 'Completed' ? new Date().toISOString() : undefined;
+      task.updatedAt = new Date().toISOString();
+      appendAudit(db, ctx.session, 'CRM_TASK_UPDATED', 'CrmTask', task.id, `Status -> ${task.status}`);
+      return task;
+    });
+    if (!updated) return res.status(404).json({ error: 'Follow-up task not found.' });
+    res.json({ task: updated });
+  });
+
+  // 15. Scheduled Upcoming Consultation Reminder Dispatcher (idempotent 24-48h window)
+  app.post('/api/admin/consultations/reminders/dispatch', async (req: Request, res: Response) => {
+    const { ctx } = await getAuth(req);
+    if (!requireAdminMfa(ctx, res)) return;
+
+    const horizonHoursRaw = Number(req.body?.horizonHours ?? 48);
+    const horizonHours = Number.isFinite(horizonHoursRaw) ? Math.min(168, Math.max(1, horizonHoursRaw)) : 48;
+    const nowMs = Date.now();
+    const horizonMs = nowMs + horizonHours * 60 * 60_000;
+
+    const queued = await withTransaction((db) => {
+      let count = 0;
+      const staffEmail = (process.env.STAFF_NOTIFICATION_EMAIL || 'maya@celebrationsisters.example.com').trim();
+      for (const c of db.consultations) {
+        if (!['Pending', 'Confirmed', 'Rescheduled'].includes(c.status)) continue;
+        const startMs = new Date(c.startUtc).getTime();
+        if (startMs < nowMs || startMs > horizonMs) continue;
+
+        const clientTpl = buildConsultationReminderTemplate({
+          clientName: c.clientName,
+          referenceCode: c.referenceCode,
+          eventTitle: c.eventTitle,
+          consultationWindow: formatFullDateTimeForTimezone(c.startUtc, c.clientTimezone),
+          consultationMethod: formatConsultationMethodLabel(c.method),
+          assignedPlanner: c.assignedPlannerName,
+        });
+        enqueueOutboxNotification(db, {
+          idempotencyKey: `consultation:${c.id}:reminder:${c.startUtc.slice(0, 13)}`,
+          category: 'consultation_reminder',
+          recipient: c.clientEmail,
+          bookingReference: c.referenceCode,
+          subject: clientTpl.subject,
+          htmlBody: clientTpl.htmlBody,
+          textBody: clientTpl.textBody,
+        });
+
+        const staffTpl = buildInternalOperationsAlertTemplate({
+          heading: 'Upcoming Consultation Reminder',
+          referenceCode: c.referenceCode,
+          clientName: c.clientName,
+          eventTitle: c.eventTitle,
+          details: `Scheduled with ${c.assignedPlannerName} at ${formatFullDateTimeForTimezone(c.startUtc, STUDIO_TIMEZONE)} (${formatConsultationMethodLabel(c.method)}).`,
+        });
+        enqueueOutboxNotification(db, {
+          idempotencyKey: `consultation:${c.id}:staff_upcoming:${c.startUtc.slice(0, 13)}`,
+          category: 'staff_upcoming_consultation',
+          recipient: staffEmail,
+          bookingReference: c.referenceCode,
+          subject: staffTpl.subject,
+          htmlBody: staffTpl.htmlBody,
+          textBody: staffTpl.textBody,
+        });
+        count += 1;
+      }
+      appendAudit(
+        db,
+        ctx.session,
+        'CONSULTATION_REMINDERS_DISPATCHED',
+        'Consultation',
+        'batch',
+        `Evaluated ${count} upcoming consultation(s) within ${horizonHours}h`,
+      );
+      return count;
+    });
+
+    const summary = await outboxWorker.processOnce();
+    res.json({ remindersEvaluated: queued, outboxSummary: summary });
   });
 
   // Global safe error handler — prevents hung sockets, unhandled rejections, stack trace leaks, or raw SQL errors

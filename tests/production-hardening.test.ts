@@ -515,6 +515,11 @@ test('PostgreSQL repository executes live SELECT 1 health check, atomic BEGIN/FO
     notificationOutbox: [],
     revokedSessionIds: {},
     bookingIdempotencyKeys: {},
+    consultations: [],
+    staffAvailabilityRules: [],
+    consultationSlotHolds: [],
+    crmFollowUpTasks: [],
+    consultationIdempotencyKeys: {},
   });
 
   try {

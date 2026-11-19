@@ -10,10 +10,14 @@ import type {
   BlackoutDate,
   BookingRecord,
   BookingStatus,
+  ConsultationAppointment,
+  ConsultationSlotHold,
+  CrmFollowUpTask,
   DesignConceptRecord,
   InventoryItem,
   NotificationDeliveryRecord,
   OutboxNotificationJob,
+  StaffAvailabilityRule,
   StaffChecklistRecord,
   StaffVendorInvitation,
   UserRole,
@@ -32,6 +36,10 @@ import {
 export interface DatabaseSchema {
   users: UserSession[];
   bookings: BookingRecord[];
+  consultations: ConsultationAppointment[];
+  staffAvailabilityRules: StaffAvailabilityRule[];
+  consultationSlotHolds: ConsultationSlotHold[];
+  crmFollowUpTasks: CrmFollowUpTask[];
   availabilityHolds: AvailabilityHold[];
   blackoutDates: BlackoutDate[];
   concepts: DesignConceptRecord[];
@@ -48,6 +56,7 @@ export interface DatabaseSchema {
   notificationOutbox: OutboxNotificationJob[];
   revokedSessionIds: Record<string, number>;
   bookingIdempotencyKeys: Record<string, string>;
+  consultationIdempotencyKeys: Record<string, string>;
 }
 
 function getDbPath(): string {
@@ -452,6 +461,160 @@ function buildInitialSeed(): DatabaseSchema {
         details: 'Outbound client email/SMS workflows held in authorized-pause state awaiting owner live activation.',
       },
     ],
+    consultations: [
+      {
+        id: 'con-101',
+        referenceCode: 'CS-2026-041',
+        bookingId: 'bkg-101',
+        clientId: 'user-client-camille',
+        clientName: 'Camille Mercer',
+        clientEmail: 'camille.mercer@example.com',
+        clientPhone: '(803) 555-0148',
+        preferredContactMethod: 'email',
+        eventTitle: 'Mercer Autumn Estate Wedding & Reception',
+        eventCategory: 'Wedding Planning and Design',
+        eventTheme: 'Royal Heirloom Ballroom',
+        eventDate: '2026-12-12',
+        eventLocation: 'Columbia, SC',
+        venueName: 'Lace House & Governor’s Gardens',
+        guestCount: 210,
+        budgetRange: '$28,000 – $36,000',
+        serviceDivisionIds: ['wedding-planning', 'luxury-decor', 'event-lighting', 'photo-booths'],
+        additionalPreferences: 'Royal purple velvet lounge accents, ivory garden roses, brass hurricane lanterns.',
+        consultationNotes: 'Completed full bridal design walkthrough and floral tower selection.',
+        method: 'in_person_columbia',
+        status: 'Completed',
+        crmStage: 'Event Booked',
+        assignedPlannerId: 'user-staff-maya',
+        assignedPlannerName: 'Maya Jenkins',
+        startUtc: '2026-10-12T14:00:00.000Z',
+        endUtc: '2026-10-12T14:45:00.000Z',
+        durationMinutes: 45,
+        bufferBeforeMinutes: 15,
+        bufferAfterMinutes: 15,
+        clientTimezone: 'America/New_York',
+        privacyConsentAccepted: true,
+        privacyConsentAt: '2026-10-10T09:00:00.000Z',
+        privacyConsentVersion: '2026-11-v1',
+        accessTokenHash: 'seeded-completed-hash-101',
+        outcomeSummary: 'Client approved full-service wedding design scope; moved into proposal and signed agreement.',
+        clientDecision: 'Approved',
+        rescheduleCount: 0,
+        completedAt: '2026-10-12T15:00:00.000Z',
+        createdAt: '2026-10-10T09:00:00.000Z',
+        updatedAt: '2026-10-19T14:12:00.000Z',
+      },
+      {
+        id: 'con-102',
+        referenceCode: 'CS-2026-054',
+        bookingId: 'bkg-102',
+        clientId: 'user-client-elena',
+        clientName: 'Elena Vance',
+        clientEmail: 'evance@palmettohealth-demo.org',
+        clientPhone: '(803) 555-0192',
+        preferredContactMethod: 'email',
+        eventTitle: 'Palmetto Leadership Annual Awards Gala',
+        eventCategory: 'Corporate Events',
+        eventTheme: 'Executive Black-Tie & Champagne Gold',
+        eventDate: '2027-01-23',
+        eventLocation: 'Columbia, SC',
+        venueName: 'Columbia Metropolitan Convention Center',
+        guestCount: 350,
+        budgetRange: '$35,000 – $48,000',
+        serviceDivisionIds: ['corporate-events', 'event-lighting', 'dj-entertainment'],
+        additionalPreferences: 'Keynote stage lighting wash and dual screen projection alignment.',
+        consultationNotes: 'Reviewed convention center rigging specs and AV requirements.',
+        method: 'video',
+        status: 'Completed',
+        crmStage: 'Proposal Sent',
+        assignedPlannerId: 'user-staff-maya',
+        assignedPlannerName: 'Maya Jenkins',
+        startUtc: '2026-11-10T16:00:00.000Z',
+        endUtc: '2026-11-10T16:45:00.000Z',
+        durationMinutes: 45,
+        bufferBeforeMinutes: 15,
+        bufferAfterMinutes: 15,
+        clientTimezone: 'America/New_York',
+        privacyConsentAccepted: true,
+        privacyConsentAt: '2026-11-08T11:20:00.000Z',
+        privacyConsentVersion: '2026-11-v1',
+        accessTokenHash: 'seeded-completed-hash-102',
+        outcomeSummary: 'Scoped 35 banquet rounds + executive stage production; corporate quotation v1 dispatched.',
+        clientDecision: 'Pending',
+        followUpDueAt: '2026-11-18T17:00:00.000Z',
+        rescheduleCount: 0,
+        completedAt: '2026-11-10T16:50:00.000Z',
+        createdAt: '2026-11-08T11:20:00.000Z',
+        updatedAt: '2026-11-14T09:15:00.000Z',
+      },
+      {
+        id: 'con-103',
+        referenceCode: 'CS-2026-062',
+        bookingId: 'bkg-103',
+        clientId: 'user-client-camille',
+        clientName: 'Camille Mercer',
+        clientEmail: 'camille.mercer@example.com',
+        clientPhone: '(803) 555-0148',
+        preferredContactMethod: 'phone',
+        eventTitle: 'Mercer Pre-Wedding Champagne Welcome Soirée',
+        eventCategory: 'Anniversaries and Private Events',
+        eventTheme: 'Lakefront Silk & Taper Candlelight',
+        eventDate: '2026-12-11',
+        eventLocation: 'Lexington, SC',
+        venueName: 'Lake Murray Private Conservatory',
+        guestCount: 45,
+        budgetRange: '$6,500 – $8,500',
+        serviceDivisionIds: ['luxury-decor', 'event-rentals'],
+        additionalPreferences: 'Plum velvet lounge vignette overlooking the terrace.',
+        consultationNotes: 'Confirming final floral count and champagne wall placement.',
+        method: 'video',
+        status: 'Confirmed',
+        crmStage: 'Consultation Scheduled',
+        assignedPlannerId: 'user-staff-maya',
+        assignedPlannerName: 'Maya Jenkins',
+        startUtc: '2026-11-24T15:00:00.000Z',
+        endUtc: '2026-11-24T15:45:00.000Z',
+        durationMinutes: 45,
+        bufferBeforeMinutes: 15,
+        bufferAfterMinutes: 15,
+        clientTimezone: 'America/New_York',
+        privacyConsentAccepted: true,
+        privacyConsentAt: '2026-11-15T11:30:00.000Z',
+        privacyConsentVersion: '2026-11-v1',
+        accessTokenHash: 'seeded-confirmed-hash-103',
+        rescheduleCount: 0,
+        createdAt: '2026-11-15T11:30:00.000Z',
+        updatedAt: '2026-11-15T12:00:00.000Z',
+      },
+    ],
+    staffAvailabilityRules: [
+      { id: 'sar-maya-1', plannerId: 'user-staff-maya', plannerName: 'Maya Jenkins', dayOfWeek: 1, startTimeLocal: '09:00', endTimeLocal: '17:00', timezone: 'America/New_York', slotDurationMinutes: 45, bufferBeforeMinutes: 15, bufferAfterMinutes: 15, allowedMethods: ['in_person_columbia', 'video', 'phone'], isActive: true },
+      { id: 'sar-maya-2', plannerId: 'user-staff-maya', plannerName: 'Maya Jenkins', dayOfWeek: 2, startTimeLocal: '09:00', endTimeLocal: '17:00', timezone: 'America/New_York', slotDurationMinutes: 45, bufferBeforeMinutes: 15, bufferAfterMinutes: 15, allowedMethods: ['in_person_columbia', 'video', 'phone'], isActive: true },
+      { id: 'sar-maya-3', plannerId: 'user-staff-maya', plannerName: 'Maya Jenkins', dayOfWeek: 3, startTimeLocal: '09:00', endTimeLocal: '17:00', timezone: 'America/New_York', slotDurationMinutes: 45, bufferBeforeMinutes: 15, bufferAfterMinutes: 15, allowedMethods: ['in_person_columbia', 'video', 'phone'], isActive: true },
+      { id: 'sar-maya-4', plannerId: 'user-staff-maya', plannerName: 'Maya Jenkins', dayOfWeek: 4, startTimeLocal: '09:00', endTimeLocal: '17:00', timezone: 'America/New_York', slotDurationMinutes: 45, bufferBeforeMinutes: 15, bufferAfterMinutes: 15, allowedMethods: ['in_person_columbia', 'video', 'phone'], isActive: true },
+      { id: 'sar-maya-5', plannerId: 'user-staff-maya', plannerName: 'Maya Jenkins', dayOfWeek: 5, startTimeLocal: '09:00', endTimeLocal: '16:00', timezone: 'America/New_York', slotDurationMinutes: 45, bufferBeforeMinutes: 15, bufferAfterMinutes: 15, allowedMethods: ['in_person_columbia', 'video', 'phone'], isActive: true },
+      { id: 'sar-maya-6', plannerId: 'user-staff-maya', plannerName: 'Maya Jenkins', dayOfWeek: 6, startTimeLocal: '10:00', endTimeLocal: '14:00', timezone: 'America/New_York', slotDurationMinutes: 45, bufferBeforeMinutes: 15, bufferAfterMinutes: 15, allowedMethods: ['in_person_columbia', 'video'], isActive: true },
+      { id: 'sar-dir-2', plannerId: 'user-admin-director', plannerName: 'Victoria & Simone (Managing Sisters)', dayOfWeek: 2, startTimeLocal: '10:00', endTimeLocal: '16:00', timezone: 'America/New_York', slotDurationMinutes: 45, bufferBeforeMinutes: 15, bufferAfterMinutes: 15, allowedMethods: ['in_person_columbia', 'video', 'phone'], isActive: true },
+      { id: 'sar-dir-4', plannerId: 'user-admin-director', plannerName: 'Victoria & Simone (Managing Sisters)', dayOfWeek: 4, startTimeLocal: '10:00', endTimeLocal: '16:00', timezone: 'America/New_York', slotDurationMinutes: 45, bufferBeforeMinutes: 15, bufferAfterMinutes: 15, allowedMethods: ['in_person_columbia', 'video', 'phone'], isActive: true },
+    ],
+    consultationSlotHolds: [],
+    crmFollowUpTasks: [
+      {
+        id: 'crm-task-101',
+        consultationId: 'con-102',
+        bookingId: 'bkg-102',
+        bookingReference: 'CS-2026-054',
+        clientName: 'Elena Vance',
+        assignedToUserId: 'user-staff-maya',
+        assignedToName: 'Maya Jenkins',
+        title: 'Follow up on Palmetto Awards Gala digital contract signature',
+        notes: 'Confirm W-9 receipt and executive approval window before November 25.',
+        dueAt: '2026-11-18T17:00:00.000Z',
+        status: 'Open',
+        createdAt: '2026-11-14T09:20:00.000Z',
+        updatedAt: '2026-11-14T09:20:00.000Z',
+      },
+    ],
     availabilityHolds: [],
     blackoutDates: [
       {
@@ -468,10 +631,16 @@ function buildInitialSeed(): DatabaseSchema {
     notificationOutbox: [],
     revokedSessionIds: {},
     bookingIdempotencyKeys: {},
+    consultationIdempotencyKeys: {},
   };
 }
 
 function normalizeSchema(parsed: DatabaseSchema): DatabaseSchema {
+  const seedDefaults = buildInitialSeed();
+  parsed.consultations = parsed.consultations || seedDefaults.consultations;
+  parsed.staffAvailabilityRules = parsed.staffAvailabilityRules || seedDefaults.staffAvailabilityRules;
+  parsed.consultationSlotHolds = parsed.consultationSlotHolds || [];
+  parsed.crmFollowUpTasks = parsed.crmFollowUpTasks || seedDefaults.crmFollowUpTasks;
   parsed.availabilityHolds = parsed.availabilityHolds || [];
   parsed.blackoutDates = parsed.blackoutDates || [];
   parsed.invitations = parsed.invitations || [];
@@ -480,6 +649,7 @@ function normalizeSchema(parsed: DatabaseSchema): DatabaseSchema {
   parsed.notificationOutbox = parsed.notificationOutbox || [];
   parsed.revokedSessionIds = parsed.revokedSessionIds || {};
   parsed.bookingIdempotencyKeys = parsed.bookingIdempotencyKeys || {};
+  parsed.consultationIdempotencyKeys = parsed.consultationIdempotencyKeys || {};
   for (const b of parsed.bookings || []) {
     if (!b.architecturalStage) {
       b.architecturalStage = LEGACY_TO_ARCH_STATUS[b.status] ?? 'INQUIRY';
@@ -546,6 +716,13 @@ export function sanitizeUserForClient(
 ): Omit<UserSession, 'totpSecret' | 'mfaRecoveryCodeHashes'> {
   const { totpSecret: _omittedSecret, mfaRecoveryCodeHashes: _omittedRecovery, ...safeUser } = user;
   return safeUser;
+}
+
+export function sanitizeConsultationForClient(
+  consultation: ConsultationAppointment,
+): Omit<ConsultationAppointment, 'accessTokenHash'> {
+  const { accessTokenHash: _omittedTokenHash, ...safe } = consultation;
+  return safe;
 }
 
 export function appendAudit(

@@ -2,7 +2,7 @@ name: CI Verification & Production Hardening Checks
 
 on:
   push:
-    branches: [main, 'development/**', 'repair/**']
+    branches: [main, 'development/**', 'repair/**', 'feature/**']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -52,7 +52,7 @@ jobs:
       - name: Dependency security audit (blocking high/critical threshold)
         run: npm audit --audit-level=high
 
-      - name: Validate SQL migrations 001-006 ordering & RLS coverage
+      - name: Validate SQL migrations 001-007 ordering & RLS coverage
         run: npx tsx scripts/verify-migrations.ts
 
       - name: Verify snapshot-to-normalized reconciliation dry-run

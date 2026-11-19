@@ -1,11 +1,7 @@
 import crypto from 'node:crypto';
-import type { NotificationDeliveryRecord } from '../src/types/domain.ts';
+import type { NotificationCategory, NotificationDeliveryRecord } from '../src/types/domain.ts';
 
-export type NotificationCategory =
-  | 'consultation_confirmation'
-  | 'staff_new_booking_alert'
-  | 'booking_status_update'
-  | 'admin_security_alert';
+export type { NotificationCategory };
 
 export interface EmailProviderStatus {
   provider: 'resend' | 'unconfigured';
@@ -71,6 +67,21 @@ export function getEmailProviderStatus(): EmailProviderStatus {
   };
 }
 
+function wrapLuxuryEmailHtml(title: string, bodyHtml: string): string {
+  return `
+    <div style="font-family:Georgia,serif;color:#292929;max-width:600px;margin:0 auto;padding:24px;border:1px solid #e6dfd5;background:#FFFFFF;">
+      <h1 style="color:#4B2087;font-size:22px;margin:0 0 6px;">Celebration Sisters Event Decor</h1>
+      <p style="font-family:sans-serif;font-size:12px;color:#9C7835;margin:0 0 18px;letter-spacing:0.04em;">${escapeHtml(title)}</p>
+      <div style="font-family:sans-serif;font-size:14px;line-height:1.6;color:#292929;">
+        ${bodyHtml}
+      </div>
+      <p style="font-family:sans-serif;font-size:12px;color:#595550;margin-top:24px;padding-top:14px;border-top:1px solid #E8E1D6;">
+        Celebration Sisters Event Decor · Columbia, South Carolina · https://celebrationsistersdecor.com
+      </p>
+    </div>
+  `.trim();
+}
+
 export function buildConsultationConfirmationTemplate(params: {
   clientName: string;
   referenceCode: string;
@@ -78,43 +89,194 @@ export function buildConsultationConfirmationTemplate(params: {
   eventDate: string;
   venueName: string;
   location: string;
+  consultationWindow?: string;
+  consultationMethod?: string;
+  assignedPlanner?: string;
 }): { subject: string; htmlBody: string; textBody: string } {
   const subject = `Celebration Sisters Consultation Request Received — ${params.referenceCode}`;
-  const safeName = escapeHtml(params.clientName);
-  const safeRef = escapeHtml(params.referenceCode);
-  const safeTitle = escapeHtml(params.eventTitle);
-  const safeDate = escapeHtml(params.eventDate);
-  const safeVenue = escapeHtml(params.venueName);
-  const safeLocation = escapeHtml(params.location);
+  const rows = [
+    `<tr><td style="padding:8px 12px;color:#595550;">Reference Code</td><td style="padding:8px 12px;font-weight:bold;color:#4B2087;">${escapeHtml(params.referenceCode)}</td></tr>`,
+    `<tr><td style="padding:8px 12px;color:#595550;">Target Event Date</td><td style="padding:8px 12px;">${escapeHtml(params.eventDate)}</td></tr>`,
+    `<tr><td style="padding:8px 12px;color:#595550;">Venue &amp; Location</td><td style="padding:8px 12px;">${escapeHtml(params.venueName)} (${escapeHtml(params.location)})</td></tr>`,
+  ];
+  if (params.consultationWindow) {
+    rows.push(
+      `<tr><td style="padding:8px 12px;color:#595550;">Consultation Schedule</td><td style="padding:8px 12px;font-weight:600;">${escapeHtml(params.consultationWindow)}</td></tr>`,
+    );
+  }
+  if (params.consultationMethod) {
+    rows.push(
+      `<tr><td style="padding:8px 12px;color:#595550;">Appointment Method</td><td style="padding:8px 12px;">${escapeHtml(params.consultationMethod)}</td></tr>`,
+    );
+  }
+  if (params.assignedPlanner) {
+    rows.push(
+      `<tr><td style="padding:8px 12px;color:#595550;">Lead Planner</td><td style="padding:8px 12px;">${escapeHtml(params.assignedPlanner)}</td></tr>`,
+    );
+  }
 
-  const htmlBody = `
-    <div style="font-family:Georgia,serif;color:#292929;max-width:600px;margin:0 auto;padding:24px;border:1px solid #e6dfd5;">
-      <h1 style="color:#4B2087;font-size:22px;margin:0 0 12px;">Celebration Sisters Event Decor</h1>
-      <p style="font-family:sans-serif;font-size:14px;line-height:1.6;">Dear ${safeName},</p>
-      <p style="font-family:sans-serif;font-size:14px;line-height:1.6;">
-        We have received your consultation inquiry for <strong>${safeTitle}</strong>.
-      </p>
-      <table style="font-family:sans-serif;font-size:13px;width:100%;border-collapse:collapse;margin:16px 0;background:#FAF8F4;">
-        <tr><td style="padding:8px 12px;color:#666;">Reference Code</td><td style="padding:8px 12px;font-weight:bold;color:#4B2087;">${safeRef}</td></tr>
-        <tr><td style="padding:8px 12px;color:#666;">Target Date</td><td style="padding:8px 12px;">${safeDate}</td></tr>
-        <tr><td style="padding:8px 12px;color:#666;">Venue &amp; Location</td><td style="padding:8px 12px;">${safeVenue} (${safeLocation})</td></tr>
+  const htmlBody = wrapLuxuryEmailHtml(
+    'Private Consultation Request Received',
+    `
+      <p>Dear ${escapeHtml(params.clientName)},</p>
+      <p>We have received your private consultation booking for <strong>${escapeHtml(params.eventTitle)}</strong>.</p>
+      <table style="font-size:13px;width:100%;border-collapse:collapse;margin:16px 0;background:#FAF8F4;">
+        ${rows.join('')}
       </table>
-      <p style="font-family:sans-serif;font-size:13px;color:#555;line-height:1.6;">
-        A lead planner from our Columbia, South Carolina studio will confirm date capacity and coordinate your private consultation.
-      </p>
-    </div>
-  `.trim();
+      <p>A lead planner from our Columbia, South Carolina studio has reserved your requested time window and will follow up with your confirmation details.</p>
+    `,
+  );
 
   const textBody = [
     'Celebration Sisters Event Decor — Consultation Request Received',
     `Dear ${params.clientName},`,
     `Reference Code: ${params.referenceCode}`,
     `Event: ${params.eventTitle}`,
-    `Target Date: ${params.eventDate}`,
+    `Target Event Date: ${params.eventDate}`,
     `Venue: ${params.venueName} (${params.location})`,
-    'A Columbia, SC lead planner will verify date capacity and reach out to confirm your consultation time.',
-  ].join('\n');
+    params.consultationWindow ? `Consultation Schedule: ${params.consultationWindow}` : null,
+    params.consultationMethod ? `Appointment Method: ${params.consultationMethod}` : null,
+    params.assignedPlanner ? `Lead Planner: ${params.assignedPlanner}` : null,
+    'A Columbia, SC lead planner will verify details and confirm your private consultation.',
+  ]
+    .filter(Boolean)
+    .join('\n');
 
+  return { subject, htmlBody, textBody };
+}
+
+export function buildConsultationConfirmedTemplate(params: {
+  clientName: string;
+  referenceCode: string;
+  eventTitle: string;
+  consultationWindow: string;
+  consultationMethod: string;
+  assignedPlanner: string;
+}): { subject: string; htmlBody: string; textBody: string } {
+  const subject = `Private Consultation Confirmed — ${params.referenceCode}`;
+  const htmlBody = wrapLuxuryEmailHtml(
+    'Appointment Confirmed',
+    `
+      <p>Dear ${escapeHtml(params.clientName)},</p>
+      <p>Your private consultation for <strong>${escapeHtml(params.eventTitle)}</strong> (${escapeHtml(params.referenceCode)}) is now confirmed.</p>
+      <table style="font-size:13px;width:100%;border-collapse:collapse;margin:16px 0;background:#FAF8F4;">
+        <tr><td style="padding:8px 12px;color:#595550;">Confirmed Time</td><td style="padding:8px 12px;font-weight:bold;color:#4B2087;">${escapeHtml(params.consultationWindow)}</td></tr>
+        <tr><td style="padding:8px 12px;color:#595550;">Method</td><td style="padding:8px 12px;">${escapeHtml(params.consultationMethod)}</td></tr>
+        <tr><td style="padding:8px 12px;color:#595550;">Lead Planner</td><td style="padding:8px 12px;">${escapeHtml(params.assignedPlanner)}</td></tr>
+      </table>
+    `,
+  );
+  const textBody = `Consultation Confirmed (${params.referenceCode})\nEvent: ${params.eventTitle}\nTime: ${params.consultationWindow}\nMethod: ${params.consultationMethod}\nLead Planner: ${params.assignedPlanner}`;
+  return { subject, htmlBody, textBody };
+}
+
+export function buildConsultationRescheduledTemplate(params: {
+  clientName: string;
+  referenceCode: string;
+  eventTitle: string;
+  previousWindow: string;
+  newWindow: string;
+  consultationMethod: string;
+  assignedPlanner: string;
+}): { subject: string; htmlBody: string; textBody: string } {
+  const subject = `Consultation Rescheduled — ${params.referenceCode}`;
+  const htmlBody = wrapLuxuryEmailHtml(
+    'Appointment Rescheduled',
+    `
+      <p>Dear ${escapeHtml(params.clientName)},</p>
+      <p>Your consultation for <strong>${escapeHtml(params.eventTitle)}</strong> (${escapeHtml(params.referenceCode)}) has been rescheduled.</p>
+      <table style="font-size:13px;width:100%;border-collapse:collapse;margin:16px 0;background:#FAF8F4;">
+        <tr><td style="padding:8px 12px;color:#595550;">Previous Time</td><td style="padding:8px 12px;text-decoration:line-through;">${escapeHtml(params.previousWindow)}</td></tr>
+        <tr><td style="padding:8px 12px;color:#595550;">New Time</td><td style="padding:8px 12px;font-weight:bold;color:#4B2087;">${escapeHtml(params.newWindow)}</td></tr>
+        <tr><td style="padding:8px 12px;color:#595550;">Method</td><td style="padding:8px 12px;">${escapeHtml(params.consultationMethod)}</td></tr>
+        <tr><td style="padding:8px 12px;color:#595550;">Lead Planner</td><td style="padding:8px 12px;">${escapeHtml(params.assignedPlanner)}</td></tr>
+      </table>
+    `,
+  );
+  const textBody = `Consultation Rescheduled (${params.referenceCode})\nPrevious: ${params.previousWindow}\nNew: ${params.newWindow}\nMethod: ${params.consultationMethod}\nPlanner: ${params.assignedPlanner}`;
+  return { subject, htmlBody, textBody };
+}
+
+export function buildConsultationCancelledTemplate(params: {
+  clientName: string;
+  referenceCode: string;
+  eventTitle: string;
+  cancelledWindow: string;
+  reason?: string;
+}): { subject: string; htmlBody: string; textBody: string } {
+  const subject = `Consultation Cancelled — ${params.referenceCode}`;
+  const htmlBody = wrapLuxuryEmailHtml(
+    'Appointment Cancelled',
+    `
+      <p>Dear ${escapeHtml(params.clientName)},</p>
+      <p>Your consultation for <strong>${escapeHtml(params.eventTitle)}</strong> (${escapeHtml(params.referenceCode)}) previously scheduled for ${escapeHtml(params.cancelledWindow)} has been cancelled and the time slot has been released.</p>
+      ${params.reason ? `<p><strong>Reason:</strong> ${escapeHtml(params.reason)}</p>` : ''}
+      <p>Whenever you are ready, you may reserve a new private consultation time directly through our website.</p>
+    `,
+  );
+  const textBody = `Consultation Cancelled (${params.referenceCode})\nEvent: ${params.eventTitle}\nReleased Slot: ${params.cancelledWindow}${params.reason ? `\nReason: ${params.reason}` : ''}`;
+  return { subject, htmlBody, textBody };
+}
+
+export function buildConsultationReminderTemplate(params: {
+  clientName: string;
+  referenceCode: string;
+  eventTitle: string;
+  consultationWindow: string;
+  consultationMethod: string;
+  assignedPlanner: string;
+}): { subject: string; htmlBody: string; textBody: string } {
+  const subject = `Reminder: Upcoming Private Consultation — ${params.referenceCode}`;
+  const htmlBody = wrapLuxuryEmailHtml(
+    'Upcoming Consultation Reminder',
+    `
+      <p>Dear ${escapeHtml(params.clientName)},</p>
+      <p>This is a courtesy reminder of your upcoming private consultation with <strong>${escapeHtml(params.assignedPlanner)}</strong> for <strong>${escapeHtml(params.eventTitle)}</strong>.</p>
+      <p><strong>Scheduled Time:</strong> ${escapeHtml(params.consultationWindow)}<br/><strong>Method:</strong> ${escapeHtml(params.consultationMethod)}</p>
+    `,
+  );
+  const textBody = `Upcoming Consultation Reminder (${params.referenceCode})\nEvent: ${params.eventTitle}\nTime: ${params.consultationWindow}\nMethod: ${params.consultationMethod}\nPlanner: ${params.assignedPlanner}`;
+  return { subject, htmlBody, textBody };
+}
+
+export function buildConsultationFollowUpTemplate(params: {
+  clientName: string;
+  referenceCode: string;
+  eventTitle: string;
+  outcomeSummary: string;
+  assignedPlanner: string;
+}): { subject: string; htmlBody: string; textBody: string } {
+  const subject = `Thank You for Consulting With Celebration Sisters — ${params.referenceCode}`;
+  const htmlBody = wrapLuxuryEmailHtml(
+    'Post-Consultation Follow-Up',
+    `
+      <p>Dear ${escapeHtml(params.clientName)},</p>
+      <p>Thank you for meeting with ${escapeHtml(params.assignedPlanner)} regarding <strong>${escapeHtml(params.eventTitle)}</strong>.</p>
+      <p><strong>Consultation Summary:</strong> ${escapeHtml(params.outcomeSummary)}</p>
+      <p>Our Columbia studio is preparing your tailored design direction and itemized proposal.</p>
+    `,
+  );
+  const textBody = `Post-Consultation Follow-Up (${params.referenceCode})\nEvent: ${params.eventTitle}\nPlanner: ${params.assignedPlanner}\nSummary: ${params.outcomeSummary}`;
+  return { subject, htmlBody, textBody };
+}
+
+export function buildProposalAvailableTemplate(params: {
+  clientName: string;
+  referenceCode: string;
+  eventTitle: string;
+  quoteVersion: number;
+  totalAmountFormatted: string;
+}): { subject: string; htmlBody: string; textBody: string } {
+  const subject = `Your Tailored Event Proposal (v${params.quoteVersion}) Is Ready — ${params.referenceCode}`;
+  const htmlBody = wrapLuxuryEmailHtml(
+    'Proposal & Quotation Available',
+    `
+      <p>Dear ${escapeHtml(params.clientName)},</p>
+      <p>Your itemized proposal (Version ${params.quoteVersion}) for <strong>${escapeHtml(params.eventTitle)}</strong> (${escapeHtml(params.referenceCode)}) is now ready for review in your private client portal.</p>
+      <p><strong>Total Proposal Investment:</strong> ${escapeHtml(params.totalAmountFormatted)}</p>
+    `,
+  );
+  const textBody = `Proposal Ready (${params.referenceCode}) — Version ${params.quoteVersion}\nEvent: ${params.eventTitle}\nTotal: ${params.totalAmountFormatted}`;
   return { subject, htmlBody, textBody };
 }
 
@@ -125,20 +287,56 @@ export function buildStaffAlertTemplate(params: {
   eventDate: string;
   venueName: string;
   budgetRange: string;
+  consultationWindow?: string;
+  assignedPlanner?: string;
 }): { subject: string; htmlBody: string; textBody: string } {
   const subject = `[Studio Alert] New Consultation ${params.referenceCode} — ${params.eventDate}`;
-  const htmlBody = `
-    <div style="font-family:sans-serif;color:#292929;max-width:600px;padding:20px;border:1px solid #e6dfd5;">
-      <h2 style="color:#4B2087;margin:0 0 10px;">New Consultation Request Logged</h2>
+  const htmlBody = wrapLuxuryEmailHtml(
+    'Internal Studio Alert · New Consultation',
+    `
       <p><strong>Reference:</strong> ${escapeHtml(params.referenceCode)}</p>
       <p><strong>Client:</strong> ${escapeHtml(params.clientName)}</p>
       <p><strong>Celebration:</strong> ${escapeHtml(params.eventTitle)}</p>
-      <p><strong>Date &amp; Venue:</strong> ${escapeHtml(params.eventDate)} at ${escapeHtml(params.venueName)}</p>
+      <p><strong>Event Date &amp; Venue:</strong> ${escapeHtml(params.eventDate)} at ${escapeHtml(params.venueName)}</p>
+      ${params.consultationWindow ? `<p><strong>Consultation Slot:</strong> ${escapeHtml(params.consultationWindow)}</p>` : ''}
+      ${params.assignedPlanner ? `<p><strong>Assigned Planner:</strong> ${escapeHtml(params.assignedPlanner)}</p>` : ''}
       <p><strong>Estimated Budget:</strong> ${escapeHtml(params.budgetRange)}</p>
-    </div>
-  `.trim();
+    `,
+  );
 
-  const textBody = `New Consultation ${params.referenceCode}\nClient: ${params.clientName}\nEvent: ${params.eventTitle}\nDate: ${params.eventDate}\nVenue: ${params.venueName}\nBudget: ${params.budgetRange}`;
+  const textBody = [
+    `New Consultation ${params.referenceCode}`,
+    `Client: ${params.clientName}`,
+    `Event: ${params.eventTitle}`,
+    `Event Date: ${params.eventDate}`,
+    `Venue: ${params.venueName}`,
+    params.consultationWindow ? `Consultation Slot: ${params.consultationWindow}` : null,
+    params.assignedPlanner ? `Assigned Planner: ${params.assignedPlanner}` : null,
+    `Budget: ${params.budgetRange}`,
+  ]
+    .filter(Boolean)
+    .join('\n');
+  return { subject, htmlBody, textBody };
+}
+
+export function buildInternalOperationsAlertTemplate(params: {
+  heading: string;
+  referenceCode: string;
+  clientName: string;
+  eventTitle: string;
+  details: string;
+}): { subject: string; htmlBody: string; textBody: string } {
+  const subject = `[Studio Ops] ${params.heading} — ${params.referenceCode}`;
+  const htmlBody = wrapLuxuryEmailHtml(
+    `Internal Operations · ${params.heading}`,
+    `
+      <p><strong>Reference:</strong> ${escapeHtml(params.referenceCode)}</p>
+      <p><strong>Client:</strong> ${escapeHtml(params.clientName)}</p>
+      <p><strong>Event:</strong> ${escapeHtml(params.eventTitle)}</p>
+      <p><strong>Action Details:</strong> ${escapeHtml(params.details)}</p>
+    `,
+  );
+  const textBody = `[Studio Ops] ${params.heading} (${params.referenceCode})\nClient: ${params.clientName}\nEvent: ${params.eventTitle}\nDetails: ${params.details}`;
   return { subject, htmlBody, textBody };
 }
 
@@ -150,13 +348,13 @@ export function buildStatusUpdateTemplate(params: {
   newStatus: string;
 }): { subject: string; htmlBody: string; textBody: string } {
   const subject = `Celebration Sisters Update (${params.referenceCode}): ${params.newStatus}`;
-  const htmlBody = `
-    <div style="font-family:sans-serif;color:#292929;max-width:600px;padding:20px;border:1px solid #e6dfd5;">
-      <h2 style="color:#4B2087;margin:0 0 10px;">Booking Status Updated</h2>
+  const htmlBody = wrapLuxuryEmailHtml(
+    'Booking Status Updated',
+    `
       <p>Dear ${escapeHtml(params.clientName)},</p>
       <p>Your booking <strong>${escapeHtml(params.eventTitle)}</strong> (${escapeHtml(params.referenceCode)}) has transitioned from <em>${escapeHtml(params.previousStatus)}</em> to <strong>${escapeHtml(params.newStatus)}</strong>.</p>
-    </div>
-  `.trim();
+    `,
+  );
 
   const textBody = `Booking ${params.referenceCode} (${params.eventTitle}) status updated: ${params.previousStatus} -> ${params.newStatus}.`;
   return { subject, htmlBody, textBody };

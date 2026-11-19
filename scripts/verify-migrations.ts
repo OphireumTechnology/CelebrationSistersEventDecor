@@ -15,6 +15,7 @@ const EXPECTED_SEQUENCE = [
   '004_production_hardening.sql',
   '005_rls_event_planner_and_invoices.sql',
   '006_normalized_and_outbox.sql',
+  '007_consultation_scheduling_and_railway_rls.sql',
 ];
 
 const REQUIRED_RLS_TABLES = [
@@ -50,6 +51,9 @@ const REQUIRED_RLS_TABLES = [
   'user_mfa_recovery_codes',
   'payment_intents_prep',
   'payment_webhook_events',
+  'staff_availability_rules',
+  'consultation_slot_holds',
+  'crm_follow_up_tasks',
 ];
 
 export async function validateMigrationsDirectory(
@@ -100,7 +104,7 @@ export async function validateMigrationsDirectory(
     }
   }
 
-  // Verify event_planner RLS alignment, user_roles resolution, and security_invoker view protection
+  // Verify event_planner RLS alignment, user_roles resolution, Railway PG auth reconciliation, and security_invoker view protection
   if (!/app_current_role\(\)\s+IN\s*\('admin',\s*'staff',\s*'event_planner'\)/i.test(combinedSql)) {
     errors.push('RLS policies do not include operational role event_planner.');
   }
@@ -109,6 +113,12 @@ export async function validateMigrationsDirectory(
   }
   if (!/ALTER\s+VIEW\s+v_vendor_booking_briefs\s+SET\s*\(\s*security_invoker\s*=\s*true\s*\)/i.test(combinedSql)) {
     errors.push('Vendor brief view v_vendor_booking_briefs is missing security_invoker = true.');
+  }
+  if (!/to_regprocedure\('auth\.uid\(\)'\)/i.test(combinedSql)) {
+    errors.push('Migration 007 must guard auth.uid() via to_regprocedure for Railway PostgreSQL compatibility.');
+  }
+  if (!/excl_consultations_planner_buffered_overlap/i.test(combinedSql)) {
+    errors.push('Migration 007 must enforce buffered consultation overlap exclusion constraint.');
   }
 
   return {

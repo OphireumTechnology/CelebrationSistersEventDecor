@@ -59,7 +59,7 @@ export function getPersistenceStatus(): PersistenceReadinessStatus {
     return {
       adapter: 'postgres',
       ready: true,
-      reason: 'PostgreSQL connection string configured; migrations 001-006 supported.',
+      reason: 'PostgreSQL connection string configured; migrations 001-007 supported.',
     };
   }
 

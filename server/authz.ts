@@ -23,8 +23,12 @@ export function getAllowedOrigins(): string[] {
     ];
   }
 
-  // Default GitHub Pages origin if production deployment omits override, safely overridable via ALLOWED_ORIGINS
-  return ['https://ophireumtechnology.github.io'];
+  // Default custom domain & GitHub Pages origins if production deployment omits override, safely overridable via ALLOWED_ORIGINS
+  return [
+    'https://celebrationsistersdecor.com',
+    'https://www.celebrationsistersdecor.com',
+    'https://ophireumtechnology.github.io',
+  ];
 }
 
 export function isOriginAllowed(origin: string | undefined): boolean {
