@@ -106,6 +106,19 @@ export interface OperationalMetricsSnapshot {
     failClosed503: number;
     fallbackEvents: number;
   };
+  webhooks: {
+    received: number;
+    reconciled: number;
+    deduplicated: number;
+    rejectedSignature: number;
+    unconfigured503: number;
+  };
+  auth: {
+    unauthorized401: number;
+    forbidden403: number;
+    mfaRequired403: number;
+    invalidConsultationToken403: number;
+  };
 }
 
 function pushSample(arr: number[], value: number, maxSamples = 200): void {
@@ -157,6 +170,17 @@ export class ObservabilityMetrics {
   private rateFailClosed503 = 0;
   private rateFallbackEvents = 0;
 
+  private webhookReceived = 0;
+  private webhookReconciled = 0;
+  private webhookDeduplicated = 0;
+  private webhookRejectedSignature = 0;
+  private webhookUnconfigured503 = 0;
+
+  private authUnauthorized401 = 0;
+  private authForbidden403 = 0;
+  private authMfaRequired403 = 0;
+  private authInvalidConsultationToken403 = 0;
+
   recordHttpRequest(statusCode: number, durationMs: number): void {
     this.totalRequests += 1;
     if (statusCode >= 500) this.error5xx += 1;
@@ -206,6 +230,25 @@ export class ObservabilityMetrics {
     if (event === 'blocked429') this.rateBlocked429 += 1;
     else if (event === 'failClosed503') this.rateFailClosed503 += 1;
     else if (event === 'fallback') this.rateFallbackEvents += 1;
+  }
+
+  recordWebhookEvent(
+    event: 'received' | 'reconciled' | 'deduplicated' | 'rejectedSignature' | 'unconfigured503',
+  ): void {
+    if (event === 'received') this.webhookReceived += 1;
+    else if (event === 'reconciled') this.webhookReconciled += 1;
+    else if (event === 'deduplicated') this.webhookDeduplicated += 1;
+    else if (event === 'rejectedSignature') this.webhookRejectedSignature += 1;
+    else if (event === 'unconfigured503') this.webhookUnconfigured503 += 1;
+  }
+
+  recordAuthFailure(
+    kind: 'unauthorized401' | 'forbidden403' | 'mfaRequired403' | 'invalidConsultationToken403',
+  ): void {
+    if (kind === 'unauthorized401') this.authUnauthorized401 += 1;
+    else if (kind === 'forbidden403') this.authForbidden403 += 1;
+    else if (kind === 'mfaRequired403') this.authMfaRequired403 += 1;
+    else if (kind === 'invalidConsultationToken403') this.authInvalidConsultationToken403 += 1;
   }
 
   getSnapshot(): OperationalMetricsSnapshot {
@@ -260,6 +303,19 @@ export class ObservabilityMetrics {
         blocked429: this.rateBlocked429,
         failClosed503: this.rateFailClosed503,
         fallbackEvents: this.rateFallbackEvents,
+      },
+      webhooks: {
+        received: this.webhookReceived,
+        reconciled: this.webhookReconciled,
+        deduplicated: this.webhookDeduplicated,
+        rejectedSignature: this.webhookRejectedSignature,
+        unconfigured503: this.webhookUnconfigured503,
+      },
+      auth: {
+        unauthorized401: this.authUnauthorized401,
+        forbidden403: this.authForbidden403,
+        mfaRequired403: this.authMfaRequired403,
+        invalidConsultationToken403: this.authInvalidConsultationToken403,
       },
     };
   }

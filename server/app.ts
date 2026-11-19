@@ -50,6 +50,7 @@ import {
   buildStatusUpdateTemplate,
   getEmailProviderStatus,
   getEmailRuntimeConfig,
+  getStaffNotificationRecipient,
   verifyResendWebhookSignature,
   type FetchLike,
 } from './notifications.ts';
@@ -1040,8 +1041,7 @@ export function createApp(options: CreateAppOptions = {}) {
           venueName: newBooking.venueName,
           location: newBooking.location,
         });
-        const staffRecipient =
-          (process.env.STAFF_NOTIFICATION_EMAIL || '').trim() || 'directors@celebrationsisters.example.com';
+        const staffRecipient = getStaffNotificationRecipient();
         const staffTpl = buildStaffAlertTemplate({
           referenceCode: newBooking.referenceCode,
           clientName: newBooking.clientName,
@@ -2749,7 +2749,7 @@ export function createApp(options: CreateAppOptions = {}) {
           }),
         ];
 
-        const staffEmail = (process.env.STAFF_NOTIFICATION_EMAIL || 'maya@celebrationsisters.example.com').trim();
+        const staffEmail = getStaffNotificationRecipient();
         if (staffEmail) {
           outboxJobs.push(
             enqueueOutboxNotification(db, {
@@ -2784,6 +2784,7 @@ export function createApp(options: CreateAppOptions = {}) {
       });
 
       if (!result.ok) {
+        observability.recordBookingOutcome(false);
         const httpStatus = result.code === 'SLOT_CONFLICT' || result.code === 'BLACKOUT' ? 409 : 400;
         return res.status(httpStatus).json({
           error: result.error,
@@ -2792,6 +2793,7 @@ export function createApp(options: CreateAppOptions = {}) {
         });
       }
 
+      observability.recordBookingOutcome(true);
       await outboxWorker.processOnce().catch(() => {});
 
       const refreshedDb = await readDb();
@@ -2842,6 +2844,7 @@ export function createApp(options: CreateAppOptions = {}) {
       const db = await readDb();
       const consultation = db.consultations.find((c) => c.referenceCode.toUpperCase() === referenceCode);
       if (!consultation) {
+        observability.recordAuthFailure('invalidConsultationToken403');
         return res.status(403).json({
           error: 'Consultation record not found or verification token is invalid.',
           code: 'INVALID_CONSULTATION_TOKEN',
@@ -2849,6 +2852,7 @@ export function createApp(options: CreateAppOptions = {}) {
       }
       const tokenCheck = validateConsultationTokenAccess(consultation, accessToken);
       if (!tokenCheck.valid) {
+        observability.recordAuthFailure('invalidConsultationToken403');
         return res.status(403).json({
           error: tokenCheck.error || 'Consultation verification token is invalid.',
           code: tokenCheck.code || 'INVALID_CONSULTATION_TOKEN',
@@ -3193,7 +3197,7 @@ export function createApp(options: CreateAppOptions = {}) {
           textBody: clientTpl.textBody,
         });
 
-        const staffEmail = (process.env.STAFF_NOTIFICATION_EMAIL || 'maya@celebrationsisters.example.com').trim();
+        const staffEmail = getStaffNotificationRecipient();
         const staffTpl = buildInternalOperationsAlertTemplate({
           heading: 'Consultation Rescheduled',
           referenceCode: consultation.referenceCode,
@@ -3313,7 +3317,7 @@ export function createApp(options: CreateAppOptions = {}) {
           textBody: clientTpl.textBody,
         });
 
-        const staffEmail = (process.env.STAFF_NOTIFICATION_EMAIL || 'maya@celebrationsisters.example.com').trim();
+        const staffEmail = getStaffNotificationRecipient();
         const staffTpl = buildInternalOperationsAlertTemplate({
           heading: 'Consultation Cancelled',
           referenceCode: consultation.referenceCode,
@@ -3700,7 +3704,7 @@ export function createApp(options: CreateAppOptions = {}) {
         });
       }
 
-      const staffEmail = (process.env.STAFF_NOTIFICATION_EMAIL || 'maya@celebrationsisters.example.com').trim();
+      const staffEmail = getStaffNotificationRecipient();
       const staffTpl = buildInternalOperationsAlertTemplate({
         heading: parsed.data.status === 'Completed' ? 'Follow-Up Required Post-Consultation' : 'Consultation Marked No-Show',
         referenceCode: consultation.referenceCode,
@@ -3848,7 +3852,7 @@ export function createApp(options: CreateAppOptions = {}) {
           textBody: propTpl.textBody,
         });
 
-        const staffEmail = (process.env.STAFF_NOTIFICATION_EMAIL || 'maya@celebrationsisters.example.com').trim();
+        const staffEmail = getStaffNotificationRecipient();
         const staffTpl = buildInternalOperationsAlertTemplate({
           heading: 'Proposal Sent — Awaiting Client Decision',
           referenceCode: consultation.referenceCode,
@@ -4127,7 +4131,7 @@ export function createApp(options: CreateAppOptions = {}) {
 
     const queued = await withTransaction((db) => {
       let count = 0;
-      const staffEmail = (process.env.STAFF_NOTIFICATION_EMAIL || 'maya@celebrationsisters.example.com').trim();
+      const staffEmail = getStaffNotificationRecipient();
       for (const c of db.consultations) {
         if (!['Pending', 'Confirmed', 'Rescheduled'].includes(c.status)) continue;
         const startMs = new Date(c.startUtc).getTime();
@@ -4191,6 +4195,7 @@ export function createApp(options: CreateAppOptions = {}) {
     async (req: Request, res: Response) => {
       const { webhookSecret } = getEmailRuntimeConfig();
       if (!webhookSecret) {
+        observability.recordWebhookEvent('unconfigured503');
         return res.status(503).json({
           error: 'Resend webhook verification secret is not configured.',
           code: 'WEBHOOK_NOT_CONFIGURED',
@@ -4213,6 +4218,7 @@ export function createApp(options: CreateAppOptions = {}) {
       });
 
       if (!verified.valid) {
+        observability.recordWebhookEvent('rejectedSignature');
         logStructured('warn', 'resend_webhook_signature_rejected', {
           svixId: svixId || 'missing',
           reason: verified.reason,
@@ -4222,6 +4228,8 @@ export function createApp(options: CreateAppOptions = {}) {
           code: 'INVALID_WEBHOOK_SIGNATURE',
         });
       }
+
+      observability.recordWebhookEvent('received');
 
       const payload = (req.body || {}) as {
         type?: string;
@@ -4247,7 +4255,12 @@ export function createApp(options: CreateAppOptions = {}) {
       });
 
       if (atomicResult.deduplicated) {
+        observability.recordWebhookEvent('deduplicated');
         return res.status(200).json({ received: true, deduplicated: true, reconciled: false });
+      }
+
+      if (atomicResult.reconciled) {
+        observability.recordWebhookEvent('reconciled');
       }
 
       res.status(200).json({

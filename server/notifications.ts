@@ -20,6 +20,8 @@ export interface EmailRuntimeConfig {
  *   - RESEND_WEBHOOK_SECRET
  *   - STAFF_NOTIFICATION_EMAIL
  */
+export const DEFAULT_STAFF_NOTIFICATION_EMAIL = 'directors@celebrationsisters.example.com';
+
 export function getEmailRuntimeConfig(env: NodeJS.ProcessEnv = process.env): EmailRuntimeConfig {
   return {
     apiKey: (env.RESEND_API_KEY || '').trim(),
@@ -28,6 +30,11 @@ export function getEmailRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Ema
     liveDeliveryEnabled: env.EMAIL_LIVE_DELIVERY_ENABLED === 'true',
     webhookSecret: (env.RESEND_WEBHOOK_SECRET || '').trim(),
   };
+}
+
+export function getStaffNotificationRecipient(env: NodeJS.ProcessEnv = process.env): string {
+  const configured = getEmailRuntimeConfig(env).staffNotificationEmail;
+  return configured || DEFAULT_STAFF_NOTIFICATION_EMAIL;
 }
 
 export interface EmailProviderStatus {

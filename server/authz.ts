@@ -1,6 +1,7 @@
 import type { NextFunction, Request, Response } from 'express';
 import type { BookingRecord, UserRole, UserSession, VendorRecord } from '../src/types/domain.ts';
 import { verifyCsrfToken, type AuthenticatedContext } from './auth.ts';
+import { observability } from './observability.ts';
 
 const UNSAFE_HTTP_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
@@ -53,7 +54,7 @@ export function corsAllowlistMiddleware() {
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
       res.setHeader(
         'Access-Control-Allow-Headers',
-        'Content-Type, Authorization, X-Requested-With, X-Request-Id, X-CSRF-Token, Idempotency-Key',
+        'Content-Type, Authorization, X-Requested-With, X-Request-Id, X-CSRF-Token, Idempotency-Key, X-Consultation-Token',
       );
       res.setHeader('Access-Control-Expose-Headers', 'X-Request-Id, RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset, Retry-After');
     }
@@ -175,6 +176,7 @@ export function isCsrfOriginValid(
 
 export function requireActiveAccount(ctx: AuthenticatedContext, res: Response, requireVerified = false): boolean {
   if (ctx.session.role === 'guest') {
+    observability.recordAuthFailure('unauthorized401');
     res.status(401).json({
       error: ctx.sessionRevoked
         ? 'Your session has been signed out or revoked. Please sign in again.'
@@ -185,6 +187,7 @@ export function requireActiveAccount(ctx: AuthenticatedContext, res: Response, r
   }
 
   if (ctx.accountStatus === 'suspended' || ctx.accountStatus === 'deactivated') {
+    observability.recordAuthFailure('forbidden403');
     res.status(403).json({
       error: 'This account is suspended or deactivated. Contact Celebration Sisters Executive Office.',
       code: 'ACCOUNT_SUSPENDED',
@@ -193,6 +196,7 @@ export function requireActiveAccount(ctx: AuthenticatedContext, res: Response, r
   }
 
   if (requireVerified && !ctx.emailVerified) {
+    observability.recordAuthFailure('forbidden403');
     res.status(403).json({
       error: 'Please verify your email address before accessing protected portal resources.',
       code: 'EMAIL_VERIFICATION_REQUIRED',
@@ -211,6 +215,7 @@ export function requireRoles(
 ): boolean {
   if (!requireActiveAccount(ctx, res)) return false;
   if (!allowed.includes(ctx.session.role)) {
+    observability.recordAuthFailure('forbidden403');
     res.status(403).json({ error: deniedMessage, code: 'ROLE_FORBIDDEN' });
     return false;
   }
@@ -219,10 +224,12 @@ export function requireRoles(
 
 export function requireAdminWithMfa(ctx: AuthenticatedContext, res: Response): boolean {
   if (ctx.session.role !== 'admin') {
+    observability.recordAuthFailure('forbidden403');
     res.status(403).json({ error: 'Executive director clearance required.', code: 'ADMIN_REQUIRED' });
     return false;
   }
   if (ctx.accountStatus === 'suspended' || ctx.accountStatus === 'deactivated') {
+    observability.recordAuthFailure('forbidden403');
     res.status(403).json({
       error: 'This account is suspended or deactivated. Contact Celebration Sisters Executive Office.',
       code: 'ACCOUNT_SUSPENDED',
@@ -230,6 +237,7 @@ export function requireAdminWithMfa(ctx: AuthenticatedContext, res: Response): b
     return false;
   }
   if (!ctx.mfaVerified) {
+    observability.recordAuthFailure('mfaRequired403');
     res.status(403).json({
       error: 'MFA_REQUIRED: Executive director session requires multi-factor verification before accessing administrative controls.',
       code: 'MFA_REQUIRED',
