@@ -44,9 +44,7 @@ SELECT json_build_object(
       has_table_privilege('PUBLIC', format('%I.%I', schemaname, tablename), 'DELETE')
     )
   ),
-  'migration_ledger_present', to_regclass('public.schema_migrations') IS NOT NULL,
-  'migration_count', CASE WHEN to_regclass('public.schema_migrations') IS NULL THEN NULL ELSE
-    (SELECT count(*) FROM pg_catalog.pg_class WHERE oid = to_regclass('public.schema_migrations')) END
+  'migration_ledger_present', to_regclass('public.schema_migrations') IS NOT NULL
 )::text;
 COMMIT;
 '@
