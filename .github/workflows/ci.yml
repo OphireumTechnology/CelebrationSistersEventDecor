@@ -64,12 +64,17 @@ jobs:
       - name: Automated unit, integration & security regression tests
         run: npm test
 
-      - name: Verify GitHub Pages subpath build
+      - name: Verify GitHub Pages custom-domain root build
         run: |
-          GITHUB_PAGES=true npm run build:client
+          GITHUB_PAGES=true GITHUB_PAGES_CUSTOM_DOMAIN=true npm run build:client
           test -f dist/index.html
           test -f dist/assets/celebration-sisters-logo.png
-          grep -q '/CelebrationSistersEventDecor/assets/' dist/index.html
+          test "$(cat dist/CNAME)" = 'celebrationsistersdecor.com'
+          grep -q '/assets/' dist/index.html
+          if grep -q '/CelebrationSistersEventDecor/assets/' dist/index.html; then
+            echo "ERROR: GitHub Pages custom domain must use root-relative assets." >&2
+            exit 1
+          fi
 
       - name: Build frontend and compiled Express backend
         run: npm run build
