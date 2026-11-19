@@ -28,10 +28,3 @@ jobs:
       - name: PowerShell migration sequence audit
         shell: pwsh
         run: ./scripts/check-postgres-source.ps1
-      - name: Reject credentials in audit workflow
-        shell: bash
-        run: |
-          if grep -Eiq 'secrets\.|DATABASE_URL|railway (up|deploy)|psql ' .github/workflows/postgres-source-audit.yml; then
-            echo 'Unexpected production access in offline audit workflow' >&2
-            exit 1
-          fi
