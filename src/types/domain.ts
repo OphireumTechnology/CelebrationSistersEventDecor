@@ -291,6 +291,7 @@ export interface InventoryItem {
 
 export interface AISessionRecord {
   id: string;
+  ownerUserId?: string;
   createdAt: string;
   clientName?: string;
   eventCategory?: string;

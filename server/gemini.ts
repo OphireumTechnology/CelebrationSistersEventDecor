@@ -1,7 +1,67 @@
 import { GoogleGenAI, Type } from '@google/genai';
+import { z } from 'zod';
 
 const AI_MODEL_ID = 'gemini-4-hydrogen';
 const AI_REQUEST_TIMEOUT_MS = 18_000;
+
+export const conciergeOutputSchema = z.object({
+  reply: z.string().trim().min(1).max(4000),
+  extractedLead: z.object({
+    eventCategory: z.string().trim().min(1).max(200),
+    eventDate: z.string().trim().min(1).max(120),
+    location: z.string().trim().min(1).max(200),
+    guestCount: z.number().int().min(1).max(5000).nullable().optional().transform((v) => v ?? null),
+    theme: z.string().trim().min(1).max(300),
+    budgetRange: z.string().trim().min(1).max(200),
+    recommendedDivisions: z.array(z.string().trim().min(1).max(150)).max(6),
+    needsHumanEscalation: z.boolean(),
+    summary: z.string().trim().min(1).max(1000),
+  }),
+});
+
+export const conceptProposalSchema = z.object({
+  themeName: z.string().trim().min(2).max(120),
+  visionSummary: z.string().trim().min(5).max(1500),
+  colorPalette: z
+    .array(
+      z.object({
+        name: z.string().trim().min(1).max(80),
+        hex: z.string().trim().regex(/^#[0-9A-Fa-f]{6}$/, 'Color hex must be a 6-digit hex code'),
+        usage: z.string().trim().min(1).max(200),
+      }),
+    )
+    .min(1)
+    .max(6),
+  floralConcept: z.string().trim().min(3).max(1000),
+  tableArrangement: z.string().trim().min(3).max(1000),
+  stageBackdrop: z.string().trim().min(3).max(1000),
+  lightingPlan: z.string().trim().min(3).max(1000),
+  recommendedDivisions: z.array(z.string().trim().min(1).max(150)).max(8),
+});
+
+export type ConciergeStructuredOutput = z.infer<typeof conciergeOutputSchema>;
+export type ConceptStudioProposal = z.infer<typeof conceptProposalSchema>;
+
+export interface AiRawProviderOverride {
+  generateConciergeRaw?: (
+    history: { role: 'user' | 'assistant'; content: string }[],
+    userMessage: string,
+  ) => Promise<string>;
+  generateConceptRaw?: (input: {
+    eventType: string;
+    guestCount: number;
+    venueStyle: string;
+    preferredPalette: string;
+    visionDescription: string;
+  }) => Promise<string>;
+  timeoutMs?: number;
+}
+
+let testProviderOverride: AiRawProviderOverride | null = null;
+
+export function setAiProviderOverrideForTests(override: AiRawProviderOverride | null): void {
+  testProviderOverride = override;
+}
 
 export function getGeminiConfigStatus() {
   return {
@@ -40,41 +100,53 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: str
   }
 }
 
-export interface ConciergeStructuredOutput {
-  reply: string;
-  extractedLead: {
-    eventCategory: string;
-    eventDate: string;
-    location: string;
-    guestCount: number | null;
-    theme: string;
-    budgetRange: string;
-    recommendedDivisions: string[];
-    needsHumanEscalation: boolean;
-    summary: string;
-  };
+function parseValidatedAiJson<T>(rawText: string, schema: z.ZodType<T>, label: string): T {
+  const text = rawText.trim();
+  if (!text) {
+    throw new Error(`AI_INVALID_OUTPUT: Empty response received from ${label}.`);
+  }
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(text);
+  } catch {
+    throw new Error(`AI_INVALID_OUTPUT: Malformed JSON returned by ${label}.`);
+  }
+  const validated = schema.safeParse(parsedJson);
+  if (!validated.success) {
+    throw new Error(`AI_INVALID_OUTPUT: Schema validation failed for ${label}.`);
+  }
+  return validated.data;
 }
 
 export async function runConciergeTurn(
   history: { role: 'user' | 'assistant'; content: string }[],
   userMessage: string,
 ): Promise<ConciergeStructuredOutput> {
-  const ai = getGeminiClient();
   const startedAt = Date.now();
+  const timeoutMs = testProviderOverride?.timeoutMs ?? AI_REQUEST_TIMEOUT_MS;
 
-  const conversationTranscript = history
-    .slice(-8)
-    .map((m) => `${m.role === 'user' ? 'Client' : 'Concierge'}: ${m.content}`)
-    .join('\n');
+  let rawText: string;
+  if (testProviderOverride?.generateConciergeRaw) {
+    rawText = await withTimeout(
+      testProviderOverride.generateConciergeRaw(history, userMessage),
+      timeoutMs,
+      'AI Event Concierge',
+    );
+  } else {
+    const ai = getGeminiClient();
+    const conversationTranscript = history
+      .slice(-8)
+      .map((m) => `${m.role === 'user' ? 'Client' : 'Concierge'}: ${m.content}`)
+      .join('\n');
 
-  const prompt = `${conversationTranscript ? `Conversation so far:\n${conversationTranscript}\n\n` : ''}Client: ${userMessage}`;
+    const prompt = `${conversationTranscript ? `Conversation so far:\n${conversationTranscript}\n\n` : ''}Client: ${userMessage}`;
 
-  const response = await withTimeout(
-    ai.models.generateContent({
-      model: AI_MODEL_ID,
-      contents: prompt,
-      config: {
-        systemInstruction: `You are the AI Event Concierge for Celebration Sisters Event Decor, a luxury event planning, decoration, coordination, and production studio headquartered in Columbia, South Carolina (serving Columbia, Lexington, Lake Murray, Irmo, Charleston, Greenville, and Charlotte).
+    const response = await withTimeout(
+      ai.models.generateContent({
+        model: AI_MODEL_ID,
+        contents: prompt,
+        config: {
+          systemInstruction: `You are the AI Event Concierge for Celebration Sisters Event Decor, a luxury event planning, decoration, coordination, and production studio headquartered in Columbia, South Carolina (serving Columbia, Lexington, Lake Murray, Irmo, Charleston, Greenville, and Charlotte).
 
 Your tone: poised, warm, minimalist luxury hospitality — never robotic, never pushy.
 
@@ -105,53 +177,51 @@ CRITICAL SAFETY & AUTHORITY RULES (NEVER VIOLATE):
 - If the client asks for binding contract changes, custom discounts, immediate booking confirmation, or urgent human help, set needsHumanEscalation=true and offer immediate transfer to our Columbia planning directors.
 
 Keep your reply concise (2 to 4 crisp sentences) and helpful.`,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            reply: { type: Type.STRING, description: 'Natural, poised concierge response to the client.' },
-            extractedLead: {
-              type: Type.OBJECT,
-              properties: {
-                eventCategory: { type: Type.STRING, description: 'Identified service division or Unknown' },
-                eventDate: { type: Type.STRING, description: 'Target date or timeframe if mentioned, else Unspecified' },
-                location: { type: Type.STRING, description: 'City or venue if mentioned, else Columbia, SC area' },
-                guestCount: { type: Type.INTEGER, nullable: true, description: 'Estimated guest count if stated, else null' },
-                theme: { type: Type.STRING, description: 'Theme, style, or color preferences if mentioned, else Unspecified' },
-                budgetRange: { type: Type.STRING, description: 'Budget range if stated, else To be discussed in consultation' },
-                recommendedDivisions: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING },
-                  description: '1 to 4 matching Celebration Sisters service division names.',
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              reply: { type: Type.STRING, description: 'Natural, poised concierge response to the client.' },
+              extractedLead: {
+                type: Type.OBJECT,
+                properties: {
+                  eventCategory: { type: Type.STRING, description: 'Identified service division or Unknown' },
+                  eventDate: { type: Type.STRING, description: 'Target date or timeframe if mentioned, else Unspecified' },
+                  location: { type: Type.STRING, description: 'City or venue if mentioned, else Columbia, SC area' },
+                  guestCount: { type: Type.INTEGER, nullable: true, description: 'Estimated guest count if stated, else null' },
+                  theme: { type: Type.STRING, description: 'Theme, style, or color preferences if mentioned, else Unspecified' },
+                  budgetRange: { type: Type.STRING, description: 'Budget range if stated, else To be discussed in consultation' },
+                  recommendedDivisions: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                    description: '1 to 4 matching Celebration Sisters service division names.',
+                  },
+                  needsHumanEscalation: { type: Type.BOOLEAN, description: 'True if client wants a human planner or asks for binding price/date guarantees.' },
+                  summary: { type: Type.STRING, description: '1-sentence internal planner brief summarizing this lead.' },
                 },
-                needsHumanEscalation: { type: Type.BOOLEAN, description: 'True if client wants a human planner or asks for binding price/date guarantees.' },
-                summary: { type: Type.STRING, description: '1-sentence internal planner brief summarizing this lead.' },
+                required: [
+                  'eventCategory',
+                  'eventDate',
+                  'location',
+                  'theme',
+                  'budgetRange',
+                  'recommendedDivisions',
+                  'needsHumanEscalation',
+                  'summary',
+                ],
               },
-              required: [
-                'eventCategory',
-                'eventDate',
-                'location',
-                'theme',
-                'budgetRange',
-                'recommendedDivisions',
-                'needsHumanEscalation',
-                'summary',
-              ],
             },
+            required: ['reply', 'extractedLead'],
           },
-          required: ['reply', 'extractedLead'],
         },
-      },
-    }),
-    AI_REQUEST_TIMEOUT_MS,
-    'AI Event Concierge',
-  );
-
-  const text = (response.text ?? '').trim();
-  if (!text) {
-    throw new Error('Empty response received from Gemini Concierge.');
+      }),
+      timeoutMs,
+      'AI Event Concierge',
+    );
+    rawText = response.text ?? '';
   }
-  const parsed = JSON.parse(text) as ConciergeStructuredOutput;
+
+  const parsed = parseValidatedAiJson(rawText, conciergeOutputSchema, 'Gemini Concierge');
   console.info(
     JSON.stringify({
       event: 'ai_concierge_turn',
@@ -163,17 +233,6 @@ Keep your reply concise (2 to 4 crisp sentences) and helpful.`,
   return parsed;
 }
 
-export interface ConceptStudioProposal {
-  themeName: string;
-  visionSummary: string;
-  colorPalette: { name: string; hex: string; usage: string }[];
-  floralConcept: string;
-  tableArrangement: string;
-  stageBackdrop: string;
-  lightingPlan: string;
-  recommendedDivisions: string[];
-}
-
 export async function generateConceptProposal(input: {
   eventType: string;
   guestCount: number;
@@ -181,73 +240,80 @@ export async function generateConceptProposal(input: {
   preferredPalette: string;
   visionDescription: string;
 }): Promise<ConceptStudioProposal> {
-  const ai = getGeminiClient();
   const startedAt = Date.now();
+  const timeoutMs = testProviderOverride?.timeoutMs ?? AI_REQUEST_TIMEOUT_MS;
 
-  const response = await withTimeout(
-    ai.models.generateContent({
-      model: AI_MODEL_ID,
-      contents: `Design a luxury event concept proposal for Celebration Sisters Event Decor (Columbia, SC).
+  let rawText: string;
+  if (testProviderOverride?.generateConceptRaw) {
+    rawText = await withTimeout(
+      testProviderOverride.generateConceptRaw(input),
+      timeoutMs,
+      'AI Event Concept Studio',
+    );
+  } else {
+    const ai = getGeminiClient();
+    const response = await withTimeout(
+      ai.models.generateContent({
+        model: AI_MODEL_ID,
+        contents: `Design a luxury event concept proposal for Celebration Sisters Event Decor (Columbia, SC).
 Event Category: ${input.eventType}
 Guest Count: ${input.guestCount}
 Venue Setting: ${input.venueStyle}
 Preferred Palette / Accents: ${input.preferredPalette}
 Client Vision: ${input.visionDescription}`,
-      config: {
-        systemInstruction: `You are the Lead Concept Architect for Celebration Sisters Event Decor. Transform the client's natural-language event description into a refined, cohesive, quiet-luxury design proposal.
+        config: {
+          systemInstruction: `You are the Lead Concept Architect for Celebration Sisters Event Decor. Transform the client's natural-language event description into a refined, cohesive, quiet-luxury design proposal.
 - Respect luxury taste: understated elegance, intentional color harmony (4 cohesive hex colors with exact usage guidance), rich botanical textures, balanced tablescapes, architectural backdrops, and warm atmospheric lighting.
 - Never include pricing figures or availability guarantees.
 - Return valid JSON matching the schema.`,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            themeName: { type: Type.STRING, description: 'Poetic 2-4 word luxury theme title.' },
-            visionSummary: { type: Type.STRING, description: '2-3 sentence editorial summary of the design direction.' },
-            colorPalette: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  name: { type: Type.STRING },
-                  hex: { type: Type.STRING, description: 'Valid 6-digit hex code like #4B2087' },
-                  usage: { type: Type.STRING },
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              themeName: { type: Type.STRING, description: 'Poetic 2-4 word luxury theme title.' },
+              visionSummary: { type: Type.STRING, description: '2-3 sentence editorial summary of the design direction.' },
+              colorPalette: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    name: { type: Type.STRING },
+                    hex: { type: Type.STRING, description: 'Valid 6-digit hex code like #4B2087' },
+                    usage: { type: Type.STRING },
+                  },
+                  required: ['name', 'hex', 'usage'],
                 },
-                required: ['name', 'hex', 'usage'],
+              },
+              floralConcept: { type: Type.STRING, description: 'Specific floral varieties, vessels, and arrangement architecture.' },
+              tableArrangement: { type: Type.STRING, description: 'Linen, charger, flatware, napkin, and candle layout.' },
+              stageBackdrop: { type: Type.STRING, description: 'Head table, ceremony focal, or stage backdrop design.' },
+              lightingPlan: { type: Type.STRING, description: 'Color temperature, pin-spotting, and atmospheric wash plan.' },
+              recommendedDivisions: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description: 'Matching Celebration Sisters divisions.',
               },
             },
-            floralConcept: { type: Type.STRING, description: 'Specific floral varieties, vessels, and arrangement architecture.' },
-            tableArrangement: { type: Type.STRING, description: 'Linen, charger, flatware, napkin, and candle layout.' },
-            stageBackdrop: { type: Type.STRING, description: 'Head table, ceremony focal, or stage backdrop design.' },
-            lightingPlan: { type: Type.STRING, description: 'Color temperature, pin-spotting, and atmospheric wash plan.' },
-            recommendedDivisions: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
-              description: 'Matching Celebration Sisters divisions.',
-            },
+            required: [
+              'themeName',
+              'visionSummary',
+              'colorPalette',
+              'floralConcept',
+              'tableArrangement',
+              'stageBackdrop',
+              'lightingPlan',
+              'recommendedDivisions',
+            ],
           },
-          required: [
-            'themeName',
-            'visionSummary',
-            'colorPalette',
-            'floralConcept',
-            'tableArrangement',
-            'stageBackdrop',
-            'lightingPlan',
-            'recommendedDivisions',
-          ],
         },
-      },
-    }),
-    AI_REQUEST_TIMEOUT_MS,
-    'AI Event Concept Studio',
-  );
-
-  const text = (response.text ?? '').trim();
-  if (!text) {
-    throw new Error('Empty response received from Gemini Concept Studio.');
+      }),
+      timeoutMs,
+      'AI Event Concept Studio',
+    );
+    rawText = response.text ?? '';
   }
-  const parsed = JSON.parse(text) as ConceptStudioProposal;
+
+  const parsed = parseValidatedAiJson(rawText, conceptProposalSchema, 'Gemini Concept Studio');
   console.info(
     JSON.stringify({
       event: 'ai_concept_proposal',

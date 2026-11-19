@@ -106,13 +106,26 @@ export function getPgPool(): PgPoolLike {
     !databaseUrl.includes('127.0.0.1') &&
     process.env.PGSSLMODE !== 'disable';
 
-  sharedPool = new Pool({
+  const pool = new Pool({
     connectionString: databaseUrl,
     max: Number(process.env.PG_POOL_MAX) || 10,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: Number(process.env.PG_CONNECT_TIMEOUT_MS) || 5_000,
+    statement_timeout: Number(process.env.PG_STATEMENT_TIMEOUT_MS) || 10_000,
+    query_timeout: Number(process.env.PG_QUERY_TIMEOUT_MS) || 12_000,
     ssl: useSsl ? { rejectUnauthorized: process.env.PG_SSL_REJECT_UNAUTHORIZED !== 'false' } : undefined,
   });
+
+  // Prevent unhandled idle-client disconnect errors from crashing the Express process during DB restarts
+  pool.on('error', (err) => {
+    const code =
+      typeof err === 'object' && err && 'code' in err && typeof (err as { code?: unknown }).code === 'string'
+        ? (err as { code: string }).code
+        : 'PG_IDLE_CLIENT_ERROR';
+    console.error(JSON.stringify({ event: 'pg_pool_idle_error', code }));
+  });
+
+  sharedPool = pool;
   sharedPoolUrl = databaseUrl;
   return sharedPool;
 }

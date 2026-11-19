@@ -2,7 +2,7 @@ name: CI Verification & Production Hardening Checks
 
 on:
   push:
-    branches: [main, 'repair/**']
+    branches: [main, 'development/**', 'repair/**']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   verify:
-    name: Typecheck, Lint, Test, Build & Runtime Smoke
+    name: Typecheck, Lint, Test, Migrations, Audit & Runtime Smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,8 +26,8 @@ jobs:
           node-version: '22'
           cache: 'npm'
 
-      - name: Install dependencies
-        run: npm install --no-audit --no-fund
+      - name: Install deterministic dependencies
+        run: npm ci --no-audit --no-fund
 
       - name: Static secret & committed artifact hygiene check
         run: |
@@ -43,6 +43,12 @@ jobs:
             echo "ERROR: Potential hardcoded secret detected." >&2
             exit 1
           fi
+
+      - name: Dependency security audit (blocking high/critical threshold)
+        run: npm audit --audit-level=high
+
+      - name: Validate SQL migrations 001-005 ordering & RLS coverage
+        run: npx tsx scripts/verify-migrations.ts
 
       - name: TypeScript typecheck and Oxlint
         run: npm run lint
@@ -84,10 +90,6 @@ jobs:
           kill -TERM "$SERVER_PID"
           wait "$SERVER_PID"
           rm -f /tmp/ci-smoke-db.json
-
-      - name: Dependency security audit (high/critical threshold)
-        continue-on-error: true
-        run: npm audit --audit-level=high
 
   docker-build:
     name: Docker Production Image Build Check

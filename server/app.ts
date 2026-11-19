@@ -77,6 +77,36 @@ export function createApp(options: CreateAppOptions = {}) {
   const enableRateLimit = options.enableRateLimit ?? true;
   const app = express();
 
+  // Express 4 does not catch rejected promises from async route handlers automatically.
+  // Wrap route registration methods so any async DB/runtime rejection routes cleanly to the global error handler.
+  const wrapAsyncArgs = (args: unknown[]) =>
+    args.map((arg) => {
+      if (typeof arg === 'function' && arg.length <= 3) {
+        const fn = arg as (req: Request, res: Response, next: NextFunction) => unknown;
+        return (req: Request, res: Response, next: NextFunction) => {
+          try {
+            const result = fn(req, res, next);
+            if (result && typeof (result as Promise<unknown>).catch === 'function') {
+              (result as Promise<unknown>).catch(next);
+            }
+          } catch (err) {
+            next(err);
+          }
+        };
+      }
+      return arg;
+    });
+
+  for (const method of ['get', 'post', 'put', 'patch', 'delete'] as const) {
+    const original = app[method].bind(app) as (...args: unknown[]) => unknown;
+    (app as unknown as Record<string, (...args: unknown[]) => unknown>)[method] = (...args: unknown[]) => {
+      if (method === 'get' && args.length === 1) {
+        return original(...args);
+      }
+      return original(...wrapAsyncArgs(args));
+    };
+  }
+
   app.disable('x-powered-by');
   app.use(express.json({ limit: '1mb' }));
 
@@ -1018,7 +1048,7 @@ export function createApp(options: CreateAppOptions = {}) {
     }
   });
 
-  // Record payment milestone (Staging Verification Mode)
+  // Record payment milestone (Manual/Staging Ledger only — live Stripe/PayPal processing NOT YET INTEGRATED)
   app.post('/api/bookings/:id/payments/:paymentId/pay', async (req: Request, res: Response) => {
     const { ctx } = await getAuth(req);
     if (
@@ -1026,11 +1056,21 @@ export function createApp(options: CreateAppOptions = {}) {
         ctx,
         ['client', 'event_planner', 'staff', 'admin'],
         res,
-        'Not authorized to process payment milestones.',
+        'Not authorized to record payment milestones.',
       )
     ) {
       return;
     }
+
+    // Never allow client self-marking of payments in production without a verified payment gateway
+    if (process.env.NODE_ENV === 'production' && ctx.session.role === 'client') {
+      return res.status(501).json({
+        error: 'Live online payment processing is not yet activated. Please coordinate milestone settlement with your Columbia planning director.',
+        code: 'PAYMENT_PROVIDER_NOT_INTEGRATED',
+        liveProcessorVerified: false,
+      });
+    }
+
     try {
       const updated = await withTransaction(async (db) => {
         const booking = db.bookings.find((b) => b.id === req.params.id);
@@ -1046,17 +1086,28 @@ export function createApp(options: CreateAppOptions = {}) {
         }
         milestone.status = 'Paid';
         milestone.paidAt = new Date().toISOString();
-        milestone.reference = `STG-${Math.floor(10000 + Math.random() * 90000)}`;
+        milestone.reference = `LEDGER-${Math.floor(10000 + Math.random() * 90000)}`;
 
         if (booking.status === 'Payment Pending' && booking.contract.clientSigned && booking.contract.staffCountersigned) {
           booking.status = 'Confirmed';
           booking.architecturalStage = LEGACY_TO_ARCH_STATUS['Confirmed'];
         }
         booking.updatedAt = new Date().toISOString();
-        appendAudit(db, ctx.session, 'PAYMENT_MILESTONE_RECORDED', 'Payment', booking.referenceCode, `Recorded $${milestone.amount} (${milestone.label})`);
+        appendAudit(
+          db,
+          ctx.session,
+          'PAYMENT_MILESTONE_RECORDED',
+          'Payment',
+          booking.referenceCode,
+          `Recorded manual/staging ledger milestone $${milestone.amount} (${milestone.label}) — live processor not connected`,
+        );
         return booking;
       });
-      res.json({ booking: updated });
+      res.json({
+        booking: updated,
+        paymentProcessingMode: 'manual_staging_ledger',
+        liveProcessorVerified: false,
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Payment error.';
       if (msg.startsWith('FORBIDDEN:')) return res.status(403).json({ error: msg.slice(10) });
@@ -1150,17 +1201,17 @@ export function createApp(options: CreateAppOptions = {}) {
     res.json({ concept: updated });
   });
 
-  // AI Event Concierge (Server-side Gemini API with usage caps)
+  // AI Event Concierge (Server-side Gemini API with usage caps & session ownership isolation)
   app.post('/api/ai/concierge', rateLimit(15, 60_000), async (req: Request, res: Response) => {
     const schema = z.object({
       sessionId: z.string().optional(),
-      clientName: z.string().optional(),
+      clientName: z.string().max(120).optional(),
       message: z.string().trim().min(1).max(1500),
       history: z
         .array(
           z.object({
             role: z.enum(['user', 'assistant']),
-            content: z.string(),
+            content: z.string().max(2000),
           }),
         )
         .max(20)
@@ -1171,6 +1222,9 @@ export function createApp(options: CreateAppOptions = {}) {
       return res.status(400).json({ error: 'Please enter a valid message for the AI Event Concierge.' });
     }
 
+    const { ctx } = await getAuth(req);
+    const callerOwnerId = ctx.session.role === 'guest' ? undefined : ctx.session.id;
+
     try {
       const aiResult = await runConciergeTurn(parsed.data.history, parsed.data.message);
       const now = new Date().toISOString();
@@ -1180,11 +1234,17 @@ export function createApp(options: CreateAppOptions = {}) {
           ? db.aiSessions.find((s) => s.id === parsed.data.sessionId)
           : undefined;
 
+        // Prevent cross-customer AI session hijacking
+        if (existing && existing.ownerUserId && existing.ownerUserId !== callerOwnerId && !hasPlanningClearance(ctx.session)) {
+          existing = undefined;
+        }
+
         if (!existing) {
           existing = {
             id: `ais-${Date.now()}`,
+            ownerUserId: callerOwnerId,
             createdAt: now,
-            clientName: parsed.data.clientName || 'Prospective Client',
+            clientName: parsed.data.clientName || (ctx.session.role !== 'guest' ? ctx.session.name : 'Prospective Client'),
             messages: [],
             summary: aiResult.extractedLead.summary,
             escalatedToHuman: aiResult.extractedLead.needsHumanEscalation,
@@ -1216,20 +1276,25 @@ export function createApp(options: CreateAppOptions = {}) {
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'AI Concierge encountered an upstream error.';
-      const status = msg.startsWith('AI_TIMEOUT:') ? 504 : 502;
-      return res.status(status).json({ error: msg });
+      if (msg.startsWith('AI_TIMEOUT:')) {
+        return res.status(504).json({ error: 'AI Event Concierge timed out. Please try again.', code: 'AI_TIMEOUT' });
+      }
+      if (msg.startsWith('AI_INVALID_OUTPUT:')) {
+        return res.status(502).json({ error: 'AI Event Concierge returned an invalid response. Please retry.', code: 'AI_INVALID_OUTPUT' });
+      }
+      return res.status(502).json({ error: msg, code: 'AI_PROVIDER_ERROR' });
     }
   });
 
-  // AI Event Concept Studio (Server-side Gemini API)
+  // AI Event Concept Studio (Server-side Gemini API with strict concept & booking isolation)
   app.post('/api/ai/concept-studio', rateLimit(12, 60_000), async (req: Request, res: Response) => {
     const schema = z.object({
       conceptId: z.string().optional(),
       bookingId: z.string().optional(),
-      eventType: z.string().min(2),
+      eventType: z.string().min(2).max(120),
       guestCount: z.coerce.number().int().min(10).max(2000),
-      venueStyle: z.string().min(2),
-      preferredPalette: z.string().min(2),
+      venueStyle: z.string().min(2).max(200),
+      preferredPalette: z.string().min(2).max(200),
       visionDescription: z.string().min(5).max(1500),
     });
     const parsed = schema.safeParse(req.body);
@@ -1237,7 +1302,26 @@ export function createApp(options: CreateAppOptions = {}) {
       return res.status(400).json({ error: 'Please describe your event vision and venue style.' });
     }
 
-    const { ctx } = await getAuth(req);
+    const { db: preflightDb, ctx } = await getAuth(req);
+
+    // Pre-check concept revision & booking authorization BEFORE calling Gemini API
+    if (parsed.data.conceptId) {
+      const existingCheck = preflightDb.concepts.find((c) => c.id === parsed.data.conceptId);
+      if (existingCheck) {
+        const canRevise =
+          hasPlanningClearance(ctx.session) ||
+          (ctx.session.role === 'client' && existingCheck.clientId === ctx.session.id);
+        if (!canRevise) {
+          return res.status(403).json({ error: 'Cannot revise another client concept.' });
+        }
+      }
+    }
+    if (parsed.data.bookingId) {
+      const bookingCheck = preflightDb.bookings.find((b) => b.id === parsed.data.bookingId);
+      if (!bookingCheck || !isAuthorizedForBooking(bookingCheck, ctx.session, preflightDb.vendors)) {
+        return res.status(403).json({ error: 'Not authorized to attach a concept to this booking.' });
+      }
+    }
 
     try {
       const proposal = await generateConceptProposal(parsed.data);
@@ -1248,7 +1332,10 @@ export function createApp(options: CreateAppOptions = {}) {
           : undefined;
 
         if (existing) {
-          if (ctx.session.role === 'client' && existing.clientId !== ctx.session.id) {
+          const canRevise =
+            hasPlanningClearance(ctx.session) ||
+            (ctx.session.role === 'client' && existing.clientId === ctx.session.id);
+          if (!canRevise) {
             throw new Error('FORBIDDEN:Cannot revise another client concept.');
           }
           const nextVer = existing.currentVersion + 1;
@@ -1260,12 +1347,19 @@ export function createApp(options: CreateAppOptions = {}) {
             createdAt: new Date().toISOString(),
             ...proposal,
           });
+          appendAudit(db, ctx.session, 'CONCEPT_REVISED', 'DesignConcept', existing.id, `Created revision v${nextVer}`);
           return existing;
         }
 
+        const safeBookingId = parsed.data.bookingId
+          ? parsed.data.bookingId
+          : ctx.session.role === 'client'
+            ? db.bookings.find((b) => b.clientId === ctx.session.id)?.id || 'unassigned-client-concept'
+            : 'public-concierge-preview';
+
         const newConcept = {
           id: `cnc-${Date.now()}`,
-          bookingId: parsed.data.bookingId || 'bkg-101',
+          bookingId: safeBookingId,
           clientId:
             ctx.session.role === 'client'
               ? ctx.session.id
@@ -1288,6 +1382,7 @@ export function createApp(options: CreateAppOptions = {}) {
           createdAt: new Date().toISOString(),
         };
         db.concepts.unshift(newConcept);
+        appendAudit(db, ctx.session, 'CONCEPT_GENERATED', 'DesignConcept', newConcept.id, `Generated conceptual visualization (${proposal.themeName})`);
         return newConcept;
       });
 
@@ -1295,8 +1390,13 @@ export function createApp(options: CreateAppOptions = {}) {
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Concept Studio AI service error.';
       if (msg.startsWith('FORBIDDEN:')) return res.status(403).json({ error: msg.slice(10) });
-      const status = msg.startsWith('AI_TIMEOUT:') ? 504 : 502;
-      return res.status(status).json({ error: msg });
+      if (msg.startsWith('AI_TIMEOUT:')) {
+        return res.status(504).json({ error: 'AI Event Concept Studio timed out. Please try again.', code: 'AI_TIMEOUT' });
+      }
+      if (msg.startsWith('AI_INVALID_OUTPUT:')) {
+        return res.status(502).json({ error: 'AI Event Concept Studio returned an invalid proposal. Please retry.', code: 'AI_INVALID_OUTPUT' });
+      }
+      return res.status(502).json({ error: msg, code: 'AI_PROVIDER_ERROR' });
     }
   });
 
@@ -1587,12 +1687,29 @@ export function createApp(options: CreateAppOptions = {}) {
     res.json(result);
   });
 
-  // Global safe error handler — prevents leaking stack traces, secrets, or raw SQL errors
+  // Global safe error handler — prevents hung sockets, unhandled rejections, stack trace leaks, or raw SQL errors
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     if (res.headersSent) return;
     const isSyntax = err instanceof SyntaxError && 'status' in err;
     if (isSyntax) {
       res.status(400).json({ error: 'Malformed JSON request payload.', code: 'BAD_JSON' });
+      return;
+    }
+    const errMsg = err instanceof Error ? err.message : '';
+    const errCode =
+      typeof err === 'object' && err && 'code' in err && typeof (err as { code?: unknown }).code === 'string'
+        ? (err as { code: string }).code
+        : '';
+    if (
+      errMsg.includes('PERSISTENCE_READINESS_FAILURE') ||
+      errMsg.includes('DATABASE_URL is not configured') ||
+      ['ECONNREFUSED', 'ETIMEDOUT', '57P01', '57P03'].includes(errCode)
+    ) {
+      res.status(503).json({
+        error: 'Database service is temporarily unavailable. Please try again shortly.',
+        code: 'DATABASE_UNAVAILABLE',
+        requestId: res.getHeader('X-Request-Id'),
+      });
       return;
     }
     res.status(500).json({

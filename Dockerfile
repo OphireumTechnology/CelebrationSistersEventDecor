@@ -1,12 +1,13 @@
 # Multi-stage production Dockerfile for Celebration Sisters Event Decor (Railway)
+# Uses deterministic npm ci backed by committed package-lock.json.
 # Builds both the static React frontend (dist/) and compiled Express backend (dist-server/server.mjs).
 # Never runs Vite dev or Vite preview in production.
 
 FROM node:22-alpine AS builder
 WORKDIR /app
 
-COPY package.json ./
-RUN npm install --no-audit --no-fund
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
 
 COPY . .
 RUN npm run build
@@ -17,8 +18,8 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=3000
 
-COPY package.json ./
-RUN npm install --omit=dev --no-audit --no-fund
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund
 
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/dist-server ./dist-server

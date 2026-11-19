@@ -63,17 +63,22 @@ Configure under **GitHub Repository -> Settings -> Secrets and variables -> Acti
 
 ## 4. Database Migration & Admin Identity Linking Runbook
 
-1. Apply additive SQL migrations in order against Supabase PostgreSQL (see `db/MIGRATIONS.md`):
+1. Validate SQL migrations locally before applying:
+   ```bash
+   npx tsx scripts/verify-migrations.ts
+   ```
+2. Apply additive SQL migrations in order against Supabase PostgreSQL (see `db/MIGRATIONS.md`):
    - `db/migrations/001_initial_schema.sql`
-   - `db/migrations/002_auth_rbac_hardening.sql`
-   - `db/migrations/003_supabase_identity_integration.sql`
+   - `db/migrations/002_rls_policies.sql`
+   - `db/migrations/003_auth_identity.sql`
    - `db/migrations/004_production_hardening.sql`
-2. Run a read-only migration integrity check before importing any legacy JSON records:
+   - `db/migrations/005_rls_event_planner_and_invoices.sql`
+3. Run a read-only migration integrity check before importing any legacy JSON records:
    ```bash
    npx tsx scripts/migrate-json-to-postgres.ts
    ```
-3. Bind privileged accounts (`admin`, `staff`, `event_planner`, `vendor`) to their verified Supabase Auth UUIDs (`supabase_user_id` / `POST /api/admin/users/:id/link-identity`). Email-only matching never grants privileged access.
-4. Enroll each executive administrator in RFC 6238 TOTP MFA (`POST /api/auth/mfa/totp/enroll` or Supabase Auth `aal2` MFA) before relying on `/api/admin/*` endpoints.
+4. Bind privileged accounts (`admin`, `staff`, `event_planner`, `vendor`) to their verified Supabase Auth UUIDs (`supabase_user_id` / `POST /api/admin/users/:id/link-identity`). Email-only matching never grants privileged access.
+5. Enroll each executive administrator in RFC 6238 TOTP MFA (`POST /api/auth/mfa/totp/enroll` or Supabase Auth `aal2` MFA) before relying on `/api/admin/*` endpoints.
 
 ---
 
@@ -84,16 +89,16 @@ Because the AI Studio sandbox does not have a `.git` repository or write credent
 ```bash
 git checkout main
 git pull origin main
-git checkout -b repair/master-production-hardening
-# Copy/apply repaired workspace files, verify with:
-npm install && npm run lint && npm test && npm run build
+git checkout -b development/phase-11-production-integration
+# Copy/apply verified workspace files, verify with:
+npm ci && npm audit --audit-level=high && npx tsx scripts/verify-migrations.ts && npm run lint && npm test && npm run build
 git status
 git add -A
-git commit -m "chore(production): execute master bulk repair blocks 01-10"
-git push -u origin repair/master-production-hardening
-gh pr create --base main --head repair/master-production-hardening \
-  --title "Master Production Hardening: Runtime, PostgreSQL, Identity/MFA, Booking & CI" \
-  --body "Implements Blocks 01-10 of the Master Bulk Repair Directive. Do not merge until CI passes and staging verification is approved."
+git commit -m "chore(phase-11): deterministic lockfile, migration 005 RLS fixes, AI & payment hardening"
+git push -u origin development/phase-11-production-integration
+gh pr create --base main --head development/phase-11-production-integration \
+  --title "Phase 11: Deterministic Lockfile, Supabase RLS 005, AI/Payment Hardening & Release Prep" \
+  --body "Implements Phase 11 Blocks 11.1-11.11. Do not merge until CI, Docker build, and staging acceptance pass."
 ```
 
 ---
