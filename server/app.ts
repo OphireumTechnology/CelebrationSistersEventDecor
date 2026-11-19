@@ -10,6 +10,10 @@ import {
 import { LEGACY_TO_ARCH_STATUS } from '../src/types/lifecycle.ts';
 import {
   clearSessionCookie,
+  deriveCsrfToken,
+  generateMfaRecoveryCodes,
+  generateSessionId,
+  normalizeRecoveryCode,
   resolveAuthenticatedContextAsync,
   setSessionCookie,
   sha256Hex,
@@ -21,10 +25,10 @@ import {
   corsAllowlistMiddleware,
   getAllowedOrigins,
   hasPlanningClearance,
-  isCsrfOriginValid,
   requireActiveAccount,
   requireAdminWithMfa,
   requireRoles,
+  validateCsrfProtection,
 } from './authz.ts';
 import { generateConceptProposal, getGeminiConfigStatus, runConciergeTurn } from './gemini.ts';
 import { getIdentityProviderStatus, type VerifyProviderTokenOptions } from './identityProvider.ts';
@@ -32,10 +36,11 @@ import {
   buildConsultationConfirmationTemplate,
   buildStaffAlertTemplate,
   buildStatusUpdateTemplate,
-  dispatchEmailNotification,
   getEmailProviderStatus,
   type FetchLike,
 } from './notifications.ts';
+import { logStructured, observability } from './observability.ts';
+import { enqueueOutboxNotification, NotificationOutboxWorker } from './outbox.ts';
 import {
   createRateLimiter,
   InMemoryRateLimitStore,
@@ -64,6 +69,8 @@ export interface CreateAppOptions {
   providerVerifyOptions?: VerifyProviderTokenOptions;
   rateLimitStore?: RateLimitStore;
   notificationFetch?: FetchLike;
+  outboxWorker?: NotificationOutboxWorker;
+  trustProxy?: boolean | number | string;
 }
 
 function isValidIsoCalendarDate(dateStr: string): boolean {
@@ -108,10 +115,33 @@ export function createApp(options: CreateAppOptions = {}) {
   }
 
   app.disable('x-powered-by');
+
+  // Explicitly configure Express proxy trust for Railway / reverse-proxy deployment (Block 13.2).
+  // Never default to `trust proxy = true` (which blindly trusts arbitrary caller-supplied X-Forwarded-For chains).
+  if (options.trustProxy !== undefined) {
+    app.set('trust proxy', options.trustProxy);
+  } else {
+    const rawTrustProxy = (
+      process.env.TRUST_PROXY ?? (process.env.NODE_ENV === 'production' ? '1' : 'false')
+    )
+      .trim()
+      .toLowerCase();
+    if (rawTrustProxy === 'false' || rawTrustProxy === '0' || rawTrustProxy === '') {
+      app.set('trust proxy', false);
+    } else if (/^\d+$/.test(rawTrustProxy)) {
+      app.set('trust proxy', Number(rawTrustProxy));
+    } else if (rawTrustProxy === 'true') {
+      app.set('trust proxy', 1);
+    } else {
+      app.set('trust proxy', rawTrustProxy);
+    }
+  }
+
   app.use(express.json({ limit: '1mb' }));
 
-  // Security headers (OWASP ASVS aligned) & request correlation IDs
+  // Security headers (OWASP ASVS aligned), correlation IDs & structured request observability
   app.use((req: Request, res: Response, next: NextFunction) => {
+    const startedAt = Date.now();
     const incomingId = req.header('x-request-id');
     const requestId =
       incomingId && /^[a-zA-Z0-9_-]{8,64}$/.test(incomingId) ? incomingId : crypto.randomUUID();
@@ -123,6 +153,20 @@ export function createApp(options: CreateAppOptions = {}) {
     if (process.env.NODE_ENV === 'production') {
       res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
     }
+
+    res.on('finish', () => {
+      const durationMs = Date.now() - startedAt;
+      observability.recordHttpRequest(res.statusCode, durationMs);
+      if (process.env.LOG_HTTP_REQUESTS === 'true' || res.statusCode >= 500) {
+        logStructured(res.statusCode >= 500 ? 'error' : 'info', 'http_request', {
+          requestId,
+          method: req.method,
+          path: req.path,
+          statusCode: res.statusCode,
+          durationMs,
+        });
+      }
+    });
     next();
   });
 
@@ -136,9 +180,43 @@ export function createApp(options: CreateAppOptions = {}) {
       : new InMemoryRateLimitStore());
   const rateLimit = createRateLimiter(resolvedRateStore, enableRateLimit);
 
+  const outboxWorker =
+    options.outboxWorker ??
+    new NotificationOutboxWorker({
+      fetchImpl: options.notificationFetch,
+    });
+
+  function generateUniqueBookingReference(existingBookings: BookingRecord[], eventDate: string): string {
+    const year = eventDate.slice(0, 4) || String(new Date().getUTCFullYear());
+    const prefix = `CS-${year}-`;
+    const existingSet = new Set(existingBookings.map((b) => b.referenceCode.toUpperCase()));
+    let maxNum = 64;
+    for (const b of existingBookings) {
+      const match = /^CS-\d{4}-(\d+)$/i.exec(b.referenceCode);
+      if (match) {
+        const parsedNum = Number(match[1]);
+        if (Number.isFinite(parsedNum) && parsedNum > maxNum) {
+          maxNum = parsedNum;
+        }
+      }
+    }
+    let nextNum = maxNum + 1;
+    let candidate = `${prefix}${String(nextNum).padStart(4, '0')}`;
+    while (existingSet.has(candidate.toUpperCase())) {
+      nextNum += 1;
+      candidate = `${prefix}${String(nextNum).padStart(4, '0')}`;
+    }
+    return candidate;
+  }
+
   async function getAuth(req: Request) {
     const db = await readDb();
-    const ctx = await resolveAuthenticatedContextAsync(req, db.users, options.providerVerifyOptions);
+    const ctx = await resolveAuthenticatedContextAsync(
+      req,
+      db.users,
+      options.providerVerifyOptions,
+      db.revokedSessionIds,
+    );
     return { db, ctx };
   }
 
@@ -158,7 +236,7 @@ export function createApp(options: CreateAppOptions = {}) {
     });
   }
 
-  // Cookie-authenticated state-changing request CSRF Origin/Referer protection
+  // Cookie-authenticated state-changing request CSRF Origin/Referer + cryptographic synchronizer token protection
   app.use('/api', async (req: Request, res: Response, next: NextFunction) => {
     try {
       if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method.toUpperCase())) {
@@ -172,19 +250,20 @@ export function createApp(options: CreateAppOptions = {}) {
       }
 
       const { ctx } = await getAuth(req);
-      if (!isCsrfOriginValid(req, ctx.authMethod)) {
+      const csrfCheck = validateCsrfProtection(req, ctx);
+      if (!csrfCheck.valid) {
         await withTransaction((wdb) => {
           appendSecurityEvent(wdb, {
             eventType: 'CSRF_REJECTED',
             userId: ctx.session.id !== 'guest-public' ? ctx.session.id : undefined,
             outcome: 'denied',
-            details: `Rejected cookie-authenticated ${req.method} ${req.path} from untrusted origin/referer`,
+            details: `Rejected cookie-authenticated ${req.method} ${req.path}: ${csrfCheck.reason}`,
           });
-          appendAudit(wdb, ctx.session, 'CSRF_ORIGIN_REJECTED', 'API', req.path, 'Cross-site cookie mutation rejected');
+          appendAudit(wdb, ctx.session, 'CSRF_ORIGIN_REJECTED', 'API', req.path, csrfCheck.reason || 'Cross-site cookie mutation rejected');
         });
         return res.status(403).json({
-          error: 'Cross-site state-changing request rejected by CSRF origin policy.',
-          code: 'CSRF_ORIGIN_REJECTED',
+          error: 'Cross-site state-changing request rejected by CSRF protection policy.',
+          code: csrfCheck.code || 'CSRF_ORIGIN_REJECTED',
         });
       }
       return next();
@@ -285,133 +364,324 @@ export function createApp(options: CreateAppOptions = {}) {
       accountStatus: ctx.accountStatus,
       aal: ctx.aal,
       authMethod: ctx.authMethod,
+      csrfToken: ctx.sessionJti ? deriveCsrfToken(ctx.sessionJti) : undefined,
     });
   });
 
-  app.post('/api/auth/switch', rateLimit(20, 60_000), async (req: Request, res: Response) => {
-    if (process.env.NODE_ENV === 'production') {
-      return res.status(404).json({ error: 'Demo account switching is unavailable in production.' });
-    }
-    const parsed = z.object({ userId: z.string().min(1) }).safeParse(req.body);
-    if (!parsed.success) {
-      return res.status(400).json({ error: 'Valid userId is required.' });
-    }
-    const db = await readDb();
-    const user = db.users.find((u) => u.id === parsed.data.userId);
-    if (!user) {
-      return res.status(404).json({ error: 'Account not found.' });
-    }
-    if (user.accountStatus === 'suspended' || user.accountStatus === 'deactivated') {
-      return res.status(403).json({
-        error: 'This account is suspended or deactivated.',
-        code: 'ACCOUNT_SUSPENDED',
-      });
-    }
-
-    const token = signSessionToken({
-      userId: user.id,
-      role: user.role,
-      mfaVerified: user.role !== 'admin',
-      issuedAt: Date.now(),
-      expiresAt: Date.now() + 1000 * 60 * 60 * 8,
-    });
-
-    setSessionCookie(res, token);
-    res.json({
-      user: sanitizeUserForClient(user),
-      token,
-      mfaRequired: user.role === 'admin',
-      mfaVerified: user.role !== 'admin',
-    });
-  });
-
-  // Enroll RFC 6238 TOTP factor for authenticated administrator
-  app.post('/api/auth/mfa/totp/enroll', rateLimit(5, 60_000), async (req: Request, res: Response) => {
-    const { ctx } = await getAuth(req);
-    if (!requireActiveAccount(ctx, res)) return;
-    if (ctx.session.role !== 'admin') {
-      return res.status(403).json({ error: 'Executive director clearance required to enroll admin TOTP MFA.' });
-    }
-
-    const secret = generateTotpSecret();
-    const otpauthUri = buildTotpProvisioningUri(ctx.session.email, secret);
-
-    await withTransaction((db) => {
-      const target = db.users.find((u) => u.id === ctx.session.id);
-      if (target) {
-        target.totpSecret = secret;
-        target.mfaEnrolled = true;
+  app.post(
+    '/api/auth/switch',
+    rateLimit(20, 60_000, { failClosed: true, endpointGroup: 'auth' }),
+    async (req: Request, res: Response) => {
+      if (process.env.NODE_ENV === 'production') {
+        return res.status(404).json({ error: 'Demo account switching is unavailable in production.' });
       }
-      appendAudit(db, ctx.session, 'MFA_TOTP_ENROLLED', 'AuthSession', ctx.session.id, 'Enrolled RFC 6238 TOTP authenticator factor');
-    });
+      const parsed = z.object({ userId: z.string().min(1) }).safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Valid userId is required.' });
+      }
+      const db = await readDb();
+      const user = db.users.find((u) => u.id === parsed.data.userId);
+      if (!user) {
+        return res.status(404).json({ error: 'Account not found.' });
+      }
+      if (user.accountStatus === 'suspended' || user.accountStatus === 'deactivated') {
+        return res.status(403).json({
+          error: 'This account is suspended or deactivated.',
+          code: 'ACCOUNT_SUSPENDED',
+        });
+      }
 
-    res.json({
-      enrolled: true,
-      algorithm: 'SHA1',
-      digits: 6,
-      periodSeconds: 30,
-      secret,
-      otpauthUri,
-    });
-  });
+      const jti = generateSessionId();
+      const csrfToken = deriveCsrfToken(jti);
+      const token = signSessionToken({
+        jti,
+        userId: user.id,
+        role: user.role,
+        mfaVerified: user.role !== 'admin',
+        issuedAt: Date.now(),
+        expiresAt: Date.now() + 1000 * 60 * 60 * 8,
+      });
 
-  app.post('/api/auth/mfa/verify', rateLimit(10, 60_000), async (req: Request, res: Response) => {
-    const { ctx } = await getAuth(req);
-    if (!requireActiveAccount(ctx, res)) return;
-    const parsed = z.object({ code: z.string().min(6).max(12) }).safeParse(req.body);
-    const challenge = parsed.success ? verifyAdminMfaChallenge(ctx.session, parsed.data.code) : { verified: false, method: 'none' as const };
-    if (!parsed.success || !challenge.verified) {
+      setSessionCookie(res, token, { req, csrfToken });
+      res.json({
+        user: sanitizeUserForClient(user),
+        token,
+        csrfToken,
+        mfaRequired: user.role === 'admin',
+        mfaVerified: user.role !== 'admin',
+      });
+    },
+  );
+
+  // Enroll or rotate RFC 6238 TOTP factor for authenticated administrator.
+  // Replacing an existing MFA factor strictly requires step-up auth (aal2 / mfaVerified) or a valid single-use recovery code.
+  app.post(
+    '/api/auth/mfa/totp/enroll',
+    rateLimit(5, 60_000, { failClosed: true, endpointGroup: 'mfa' }),
+    async (req: Request, res: Response) => {
+      const { db: preflightDb, ctx } = await getAuth(req);
+      if (!requireActiveAccount(ctx, res)) return;
+      if (ctx.session.role !== 'admin') {
+        return res.status(403).json({ error: 'Executive director clearance required to enroll admin TOTP MFA.' });
+      }
+
+      const bodyParsed = z
+        .object({ recoveryCode: z.string().trim().min(6).max(32).optional() })
+        .safeParse(req.body ?? {});
+      const providedRecoveryCode = bodyParsed.success ? bodyParsed.data.recoveryCode : undefined;
+
+      const existingTarget = preflightDb.users.find((u) => u.id === ctx.session.id);
+      const alreadyEnrolled = Boolean(existingTarget?.mfaEnrolled && existingTarget?.totpSecret);
+
+      if (alreadyEnrolled && !ctx.mfaVerified) {
+        let recoveryMatched = false;
+        if (providedRecoveryCode && existingTarget?.mfaRecoveryCodeHashes?.length) {
+          const candidateHash = sha256Hex(normalizeRecoveryCode(providedRecoveryCode));
+          recoveryMatched = existingTarget.mfaRecoveryCodeHashes.includes(candidateHash);
+        }
+        if (!recoveryMatched) {
+          await logSecurityIncident(
+            ctx,
+            'MFA_FAILED',
+            '/api/auth/mfa/totp/enroll',
+            'Blocked attempt to replace existing admin TOTP factor without step-up MFA or valid recovery code',
+          );
+          return res.status(403).json({
+            error: 'Step-up MFA verification or a valid single-use recovery code is required to replace an existing TOTP factor.',
+            code: 'STEP_UP_MFA_REQUIRED',
+          });
+        }
+      }
+
+      const secret = generateTotpSecret();
+      const otpauthUri = buildTotpProvisioningUri(ctx.session.email, secret);
+      const recovery = generateMfaRecoveryCodes(8);
+
       await withTransaction((db) => {
-        appendAudit(db, ctx.session, 'MFA_VERIFICATION_FAILED', 'AuthSession', ctx.session.id, 'Invalid MFA code entered');
+        const target = db.users.find((u) => u.id === ctx.session.id);
+        if (target) {
+          target.totpSecret = secret;
+          target.mfaEnrolled = true;
+          target.mfaRecoveryCodeHashes = recovery.hashes;
+        }
+        appendAudit(
+          db,
+          ctx.session,
+          alreadyEnrolled ? 'MFA_TOTP_ROTATED' : 'MFA_TOTP_ENROLLED',
+          'AuthSession',
+          ctx.session.id,
+          alreadyEnrolled
+            ? 'Rotated RFC 6238 TOTP authenticator factor after step-up verification'
+            : 'Enrolled RFC 6238 TOTP authenticator factor and issued 8 single-use recovery codes',
+        );
         appendSecurityEvent(db, {
-          eventType: 'MFA_FAILED',
+          eventType: 'MFA_ENROLLED',
           userId: ctx.session.id,
-          outcome: 'denied',
-          details: 'Invalid director MFA verification code entered',
+          outcome: 'allowed',
+          details: alreadyEnrolled ? 'Admin TOTP factor rotated via step-up auth' : 'Admin TOTP factor enrolled',
         });
       });
-      return res.status(403).json({ error: 'Invalid director MFA verification code.', code: 'MFA_INVALID' });
-    }
 
-    const token = signSessionToken({
-      userId: ctx.session.id,
-      role: ctx.session.role,
-      mfaVerified: true,
-      issuedAt: Date.now(),
-      expiresAt: Date.now() + 1000 * 60 * 60 * 8,
-    });
-    setSessionCookie(res, token);
-    await withTransaction((db) => {
-      appendAudit(
-        db,
-        ctx.session,
-        'MFA_VERIFIED',
-        'AuthSession',
-        ctx.session.id,
-        `Privileged MFA verified (${challenge.method})`,
-      );
-      appendSecurityEvent(db, {
-        eventType: 'MFA_VERIFIED',
-        userId: ctx.session.id,
-        outcome: 'allowed',
-        details: `Privileged MFA verified via ${challenge.method}`,
+      res.json({
+        enrolled: true,
+        algorithm: 'SHA1',
+        digits: 6,
+        periodSeconds: 30,
+        secret,
+        otpauthUri,
+        recoveryCodes: recovery.plainCodes,
       });
-    });
+    },
+  );
 
-    res.json({
-      user: sanitizeUserForClient(ctx.session),
-      token,
-      mfaVerified: true,
-      mfaRequired: false,
-      method: challenge.method,
-    });
-  });
+  app.post(
+    '/api/auth/mfa/verify',
+    rateLimit(10, 60_000, { failClosed: true, endpointGroup: 'mfa' }),
+    async (req: Request, res: Response) => {
+      const { ctx } = await getAuth(req);
+      if (!requireActiveAccount(ctx, res)) return;
+      const parsed = z.object({ code: z.string().min(6).max(12) }).safeParse(req.body);
+      const challenge = parsed.success
+        ? verifyAdminMfaChallenge(ctx.session, parsed.data.code)
+        : { verified: false, method: 'none' as const };
+      if (!parsed.success || !challenge.verified) {
+        await withTransaction((db) => {
+          appendAudit(db, ctx.session, 'MFA_VERIFICATION_FAILED', 'AuthSession', ctx.session.id, 'Invalid MFA code entered');
+          appendSecurityEvent(db, {
+            eventType: 'MFA_FAILED',
+            userId: ctx.session.id,
+            outcome: 'denied',
+            details: 'Invalid director MFA verification code entered',
+          });
+        });
+        return res.status(403).json({ error: 'Invalid director MFA verification code.', code: 'MFA_INVALID' });
+      }
+
+      const jti = generateSessionId();
+      const csrfToken = deriveCsrfToken(jti);
+      const token = signSessionToken({
+        jti,
+        userId: ctx.session.id,
+        role: ctx.session.role,
+        mfaVerified: true,
+        issuedAt: Date.now(),
+        expiresAt: Date.now() + 1000 * 60 * 60 * 8,
+      });
+      setSessionCookie(res, token, { req, csrfToken });
+      await withTransaction((db) => {
+        appendAudit(
+          db,
+          ctx.session,
+          'MFA_VERIFIED',
+          'AuthSession',
+          ctx.session.id,
+          `Privileged MFA verified (${challenge.method})`,
+        );
+        appendSecurityEvent(db, {
+          eventType: 'MFA_VERIFIED',
+          userId: ctx.session.id,
+          outcome: 'allowed',
+          details: `Privileged MFA verified via ${challenge.method}`,
+        });
+      });
+
+      res.json({
+        user: sanitizeUserForClient(ctx.session),
+        token,
+        csrfToken,
+        mfaVerified: true,
+        mfaRequired: false,
+        method: challenge.method,
+      });
+    },
+  );
+
+  // Single-use MFA recovery code verification (Block 13.4)
+  app.post(
+    '/api/auth/mfa/recover',
+    rateLimit(5, 60_000, { failClosed: true, endpointGroup: 'mfa_recovery' }),
+    async (req: Request, res: Response) => {
+      const { ctx } = await getAuth(req);
+      if (!requireActiveAccount(ctx, res)) return;
+      if (ctx.session.role !== 'admin') {
+        return res.status(403).json({ error: 'Executive director clearance required.' });
+      }
+
+      const parsed = z.object({ recoveryCode: z.string().trim().min(6).max(32) }).safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Valid single-use recovery code required.' });
+      }
+
+      const candidateHash = sha256Hex(normalizeRecoveryCode(parsed.data.recoveryCode));
+      const outcome = await withTransaction((db) => {
+        const target = db.users.find((u) => u.id === ctx.session.id);
+        const hashes = target?.mfaRecoveryCodeHashes || [];
+        const matchIdx = hashes.findIndex((h) => h === candidateHash);
+        if (!target || matchIdx === -1) {
+          appendSecurityEvent(db, {
+            eventType: 'MFA_FAILED',
+            userId: ctx.session.id,
+            outcome: 'denied',
+            details: 'Invalid or already-used MFA recovery code submitted',
+          });
+          return null;
+        }
+        hashes.splice(matchIdx, 1);
+        target.mfaRecoveryCodeHashes = hashes;
+        appendAudit(
+          db,
+          ctx.session,
+          'MFA_RECOVERY_CODE_USED',
+          'AuthSession',
+          ctx.session.id,
+          `Consumed single-use MFA recovery code (${hashes.length} remaining)`,
+        );
+        appendSecurityEvent(db, {
+          eventType: 'MFA_RECOVERY_USED',
+          userId: ctx.session.id,
+          outcome: 'allowed',
+          details: `Admin MFA recovery code accepted (${hashes.length} remaining)`,
+        });
+        return { remaining: hashes.length };
+      });
+
+      if (!outcome) {
+        return res.status(403).json({ error: 'Invalid or already-consumed MFA recovery code.', code: 'MFA_RECOVERY_INVALID' });
+      }
+
+      const jti = generateSessionId();
+      const csrfToken = deriveCsrfToken(jti);
+      const token = signSessionToken({
+        jti,
+        userId: ctx.session.id,
+        role: ctx.session.role,
+        mfaVerified: true,
+        issuedAt: Date.now(),
+        expiresAt: Date.now() + 1000 * 60 * 60 * 8,
+      });
+      setSessionCookie(res, token, { req, csrfToken });
+
+      res.json({
+        user: sanitizeUserForClient(ctx.session),
+        token,
+        csrfToken,
+        mfaVerified: true,
+        mfaRequired: false,
+        remainingRecoveryCodes: outcome.remaining,
+      });
+    },
+  );
+
+  // Authenticated MFA factor revocation (requires step-up aal2 session)
+  app.post(
+    '/api/auth/mfa/totp/revoke',
+    rateLimit(5, 60_000, { failClosed: true, endpointGroup: 'mfa' }),
+    async (req: Request, res: Response) => {
+      const { ctx } = await getAuth(req);
+      if (!requireAdminMfa(ctx, res)) return;
+
+      await withTransaction((db) => {
+        const target = db.users.find((u) => u.id === ctx.session.id);
+        if (target) {
+          target.totpSecret = undefined;
+          target.mfaEnrolled = false;
+          target.mfaRecoveryCodeHashes = [];
+        }
+        if (ctx.sessionJti) {
+          db.revokedSessionIds[ctx.sessionJti] = ctx.sessionExpiresAt ?? Date.now() + 1000 * 60 * 60 * 8;
+        }
+        appendAudit(db, ctx.session, 'MFA_TOTP_REVOKED', 'AuthSession', ctx.session.id, 'Revoked admin TOTP MFA factor and invalidated current session');
+        appendSecurityEvent(db, {
+          eventType: 'MFA_REVOKED',
+          userId: ctx.session.id,
+          outcome: 'allowed',
+          details: 'Admin TOTP MFA factor revoked after aal2 verification',
+        });
+      });
+
+      clearSessionCookie(res, { req });
+      res.json({ revoked: true, reenrollmentRequired: true });
+    },
+  );
 
   app.post('/api/auth/logout', async (req: Request, res: Response) => {
     const { ctx } = await getAuth(req);
-    clearSessionCookie(res);
+    clearSessionCookie(res, { req });
     if (ctx.session.role !== 'guest') {
       await withTransaction((db) => {
+        if (ctx.sessionJti) {
+          const now = Date.now();
+          for (const [k, exp] of Object.entries(db.revokedSessionIds)) {
+            if (exp < now) delete db.revokedSessionIds[k];
+          }
+          db.revokedSessionIds[ctx.sessionJti] = ctx.sessionExpiresAt ?? now + 1000 * 60 * 60 * 8;
+          appendSecurityEvent(db, {
+            eventType: 'SESSION_REVOKED',
+            userId: ctx.session.id,
+            outcome: 'allowed',
+            details: 'Server-side session JTI revoked on logout',
+          });
+        }
         appendSecurityEvent(db, {
           eventType: 'LOGOUT',
           userId: ctx.session.id,
@@ -645,8 +915,7 @@ export function createApp(options: CreateAppOptions = {}) {
           throw new Error('CAPACITY:Our production calendar for this date has reached maximum simultaneous events.');
         }
 
-        const nextNum = 65 + db.bookings.length;
-        const refCode = `CS-2026-0${nextNum}`;
+        const refCode = generateUniqueBookingReference(db.bookings, input.eventDate);
         const id = `bkg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
         const initialStatus: BookingStatus = input.requestConsultation ? 'Consultation Requested' : 'Inquiry';
         const clientId =
@@ -721,6 +990,42 @@ export function createApp(options: CreateAppOptions = {}) {
         if (idempotencyKey) {
           db.bookingIdempotencyKeys[idempotencyKey] = newBooking.id;
         }
+
+        // Persist notification intent atomically in the SAME transaction as the booking (Block 13.7)
+        const clientTpl = buildConsultationConfirmationTemplate({
+          clientName: newBooking.clientName,
+          referenceCode: newBooking.referenceCode,
+          eventTitle: newBooking.eventTitle,
+          eventDate: newBooking.eventDate,
+          venueName: newBooking.venueName,
+          location: newBooking.location,
+        });
+        const staffRecipient =
+          (process.env.STAFF_NOTIFICATION_EMAIL || '').trim() || 'directors@celebrationsisters.example.com';
+        const staffTpl = buildStaffAlertTemplate({
+          referenceCode: newBooking.referenceCode,
+          clientName: newBooking.clientName,
+          eventTitle: newBooking.eventTitle,
+          eventDate: newBooking.eventDate,
+          venueName: newBooking.venueName,
+          budgetRange: newBooking.budgetRange,
+        });
+
+        enqueueOutboxNotification(db, {
+          idempotencyKey: `booking-confirm:${newBooking.id}`,
+          category: 'consultation_confirmation',
+          recipient: newBooking.clientEmail,
+          bookingReference: newBooking.referenceCode,
+          ...clientTpl,
+        });
+        enqueueOutboxNotification(db, {
+          idempotencyKey: `booking-staff-alert:${newBooking.id}`,
+          category: 'staff_new_booking_alert',
+          recipient: staffRecipient,
+          bookingReference: newBooking.referenceCode,
+          ...staffTpl,
+        });
+
         appendAudit(
           db,
           ctx.session,
@@ -732,64 +1037,18 @@ export function createApp(options: CreateAppOptions = {}) {
         return { booking: newBooking, deduplicated: false };
       });
 
+      observability.recordBookingOutcome(true);
+
+      // Trigger best-effort outbox worker drain; durable intent already committed safely inside transaction
       if (!outcome.deduplicated) {
-        const createdBooking = outcome.booking;
-        const clientTpl = buildConsultationConfirmationTemplate({
-          clientName: createdBooking.clientName,
-          referenceCode: createdBooking.referenceCode,
-          eventTitle: createdBooking.eventTitle,
-          eventDate: createdBooking.eventDate,
-          venueName: createdBooking.venueName,
-          location: createdBooking.location,
-        });
-        const staffRecipient =
-          (process.env.STAFF_NOTIFICATION_EMAIL || '').trim() || 'directors@celebrationsisters.example.com';
-        const staffTpl = buildStaffAlertTemplate({
-          referenceCode: createdBooking.referenceCode,
-          clientName: createdBooking.clientName,
-          eventTitle: createdBooking.eventTitle,
-          eventDate: createdBooking.eventDate,
-          venueName: createdBooking.venueName,
-          budgetRange: createdBooking.budgetRange,
-        });
-
-        const snapshot = await readDb();
-        const [clientDelivery, staffDelivery] = await Promise.all([
-          dispatchEmailNotification(
-            {
-              idempotencyKey: `booking-confirm:${createdBooking.id}`,
-              category: 'consultation_confirmation',
-              recipient: createdBooking.clientEmail,
-              bookingReference: createdBooking.referenceCode,
-              ...clientTpl,
-            },
-            snapshot.notificationDeliveries,
-            { fetchImpl: options.notificationFetch },
-          ),
-          dispatchEmailNotification(
-            {
-              idempotencyKey: `booking-staff-alert:${createdBooking.id}`,
-              category: 'staff_new_booking_alert',
-              recipient: staffRecipient,
-              bookingReference: createdBooking.referenceCode,
-              ...staffTpl,
-            },
-            snapshot.notificationDeliveries,
-            { fetchImpl: options.notificationFetch },
-          ),
-        ]);
-
-        await withTransaction((db) => {
-          if (!clientDelivery.deduplicated) {
-            db.notificationDeliveries.unshift(clientDelivery.record);
-          }
-          if (!staffDelivery.deduplicated) {
-            db.notificationDeliveries.unshift(staffDelivery.record);
-          }
-          if (db.notificationDeliveries.length > 500) {
-            db.notificationDeliveries = db.notificationDeliveries.slice(0, 500);
-          }
-        });
+        try {
+          await outboxWorker.processOnce();
+        } catch (workerErr) {
+          logStructured('warn', 'booking_outbox_immediate_drain_deferred', {
+            referenceCode: outcome.booking.referenceCode,
+            error: workerErr instanceof Error ? workerErr.message : 'Worker deferred',
+          });
+        }
       }
 
       res.status(outcome.deduplicated ? 200 : 201).json({
@@ -797,11 +1056,12 @@ export function createApp(options: CreateAppOptions = {}) {
         deduplicated: outcome.deduplicated,
       });
     } catch (err) {
+      observability.recordBookingOutcome(false);
       const msg = err instanceof Error ? err.message : 'Unable to save booking inquiry.';
       if (msg.startsWith('DUPLICATE:') || msg.startsWith('CAPACITY:') || msg.startsWith('BLACKOUT:')) {
         return res.status(409).json({ error: msg.split(':').slice(1).join(':') });
       }
-      return res.status(500).json({ error: msg });
+      return res.status(500).json({ error: 'Unable to save booking inquiry.' });
     }
   });
 
@@ -855,6 +1115,32 @@ export function createApp(options: CreateAppOptions = {}) {
         booking.status = targetStatus;
         booking.architecturalStage = LEGACY_TO_ARCH_STATUS[targetStatus];
         booking.updatedAt = new Date().toISOString();
+
+        if (targetStatus === 'Cancelled') {
+          for (const milestone of booking.payments) {
+            if (milestone.status === 'Pending' || milestone.status === 'Overdue') {
+              milestone.status = 'Cancelled';
+            }
+          }
+        }
+
+        if (prev !== targetStatus) {
+          const tpl = buildStatusUpdateTemplate({
+            clientName: booking.clientName,
+            referenceCode: booking.referenceCode,
+            eventTitle: booking.eventTitle,
+            previousStatus: prev,
+            newStatus: targetStatus,
+          });
+          enqueueOutboxNotification(db, {
+            idempotencyKey: `booking-status:${booking.id}:${targetStatus}`,
+            category: 'booking_status_update',
+            recipient: booking.clientEmail,
+            bookingReference: booking.referenceCode,
+            ...tpl,
+          });
+        }
+
         appendAudit(
           db,
           ctx.session,
@@ -867,28 +1153,12 @@ export function createApp(options: CreateAppOptions = {}) {
       });
 
       if (updated.previousStatus !== updated.booking.status) {
-        const tpl = buildStatusUpdateTemplate({
-          clientName: updated.booking.clientName,
-          referenceCode: updated.booking.referenceCode,
-          eventTitle: updated.booking.eventTitle,
-          previousStatus: updated.previousStatus,
-          newStatus: updated.booking.status,
-        });
-        const snapshot = await readDb();
-        const delivery = await dispatchEmailNotification(
-          {
-            idempotencyKey: `booking-status:${updated.booking.id}:${updated.booking.status}`,
-            category: 'booking_status_update',
-            recipient: updated.booking.clientEmail,
-            bookingReference: updated.booking.referenceCode,
-            ...tpl,
-          },
-          snapshot.notificationDeliveries,
-          { fetchImpl: options.notificationFetch },
-        );
-        if (!delivery.deduplicated) {
-          await withTransaction((db) => {
-            db.notificationDeliveries.unshift(delivery.record);
+        try {
+          await outboxWorker.processOnce();
+        } catch (workerErr) {
+          logStructured('warn', 'status_outbox_immediate_drain_deferred', {
+            referenceCode: updated.booking.referenceCode,
+            error: workerErr instanceof Error ? workerErr.message : 'Worker deferred',
           });
         }
       }
@@ -900,11 +1170,74 @@ export function createApp(options: CreateAppOptions = {}) {
       if (msg.startsWith('INVALID_STATE:') || msg.startsWith('GUARD:')) {
         return res.status(422).json({ error: msg.split(':').slice(1).join(':') });
       }
-      return res.status(500).json({ error: msg });
+      return res.status(500).json({ error: 'Status update failed.' });
     }
   });
 
-  // Create itemized quotation version (Planner/Staff/Admin only; discounts approved by Admin)
+  // Assign lead planner, staff & vendors to a booking (Block 13.8)
+  app.patch('/api/bookings/:id/assignments', async (req: Request, res: Response) => {
+    const { ctx } = await getAuth(req);
+    if (
+      !requireRoles(
+        ctx,
+        ['event_planner', 'staff', 'admin'],
+        res,
+        'Only authorized planners, staff, or directors may update event assignments.',
+      )
+    ) {
+      return;
+    }
+    if (ctx.session.role === 'admin' && !ctx.mfaVerified) {
+      return res.status(403).json({ error: 'MFA verification required.', code: 'MFA_REQUIRED', mfaRequired: true });
+    }
+    const parsed = z
+      .object({
+        assignedLeadPlanner: z.string().trim().min(2).max(120).optional(),
+        assignedVendorIds: z.array(z.string().trim().min(1)).max(20).optional(),
+      })
+      .safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Invalid assignment payload.' });
+    }
+
+    const updated = await withTransaction((db) => {
+      const booking = db.bookings.find((b) => b.id === req.params.id);
+      if (!booking) return null;
+      if (parsed.data.assignedLeadPlanner) {
+        booking.assignedLeadPlanner = parsed.data.assignedLeadPlanner;
+      }
+      if (parsed.data.assignedVendorIds) {
+        const validVendorIds = parsed.data.assignedVendorIds.filter((vid) =>
+          db.vendors.some((v) => v.id === vid),
+        );
+        booking.assignedVendorIds = Array.from(new Set(validVendorIds));
+        for (const vendor of db.vendors) {
+          const shouldHave = booking.assignedVendorIds.includes(vendor.id);
+          const alreadyHas = vendor.assignedBookingIds.includes(booking.id);
+          if (shouldHave && !alreadyHas) {
+            vendor.assignedBookingIds.push(booking.id);
+          } else if (!shouldHave && alreadyHas) {
+            vendor.assignedBookingIds = vendor.assignedBookingIds.filter((bid) => bid !== booking.id);
+          }
+        }
+      }
+      booking.updatedAt = new Date().toISOString();
+      appendAudit(
+        db,
+        ctx.session,
+        'BOOKING_ASSIGNMENTS_UPDATED',
+        'Booking',
+        booking.referenceCode,
+        `Lead: ${booking.assignedLeadPlanner}; Vendors: ${booking.assignedVendorIds.join(', ') || 'none'}`,
+      );
+      return booking;
+    });
+
+    if (!updated) return res.status(404).json({ error: 'Booking not found.' });
+    res.json({ booking: updated });
+  });
+
+  // Create itemized quotation version (Planner/Staff/Admin only; cent-exact math; discounts approved by MFA Admin)
   app.post('/api/bookings/:id/quotes', async (req: Request, res: Response) => {
     const { ctx } = await getAuth(req);
     if (
@@ -921,16 +1254,16 @@ export function createApp(options: CreateAppOptions = {}) {
       items: z
         .array(
           z.object({
-            description: z.string().min(2),
-            division: z.string().min(2),
-            quantity: z.coerce.number().int().min(1),
-            unitPrice: z.coerce.number().min(0),
+            description: z.string().trim().min(2).max(300),
+            division: z.string().trim().min(2).max(150),
+            quantity: z.coerce.number().int().min(1).max(10000),
+            unitPrice: z.coerce.number().finite().min(0).max(1_000_000),
           }),
         )
         .min(1),
-      discountAmount: z.coerce.number().min(0).default(0),
-      discountReason: z.string().optional(),
-      notes: z.string().default(''),
+      discountAmount: z.coerce.number().finite().min(0).default(0),
+      discountReason: z.string().trim().max(300).optional(),
+      notes: z.string().trim().max(1500).default(''),
     });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) {
@@ -941,37 +1274,58 @@ export function createApp(options: CreateAppOptions = {}) {
       const updated = await withTransaction(async (db) => {
         const booking = db.bookings.find((b) => b.id === req.params.id);
         if (!booking) throw new Error('NOT_FOUND:Booking not found.');
+        if (booking.status === 'Cancelled' || booking.status === 'Completed') {
+          throw new Error(`INVALID_STATE:Cannot issue quotations for a ${booking.status} booking.`);
+        }
 
-        const subtotal = parsed.data.items.reduce((sum, i) => sum + i.quantity * i.unitPrice, 0);
-        const discountApproved = parsed.data.discountAmount === 0 || ctx.session.role === 'admin';
-        const total = Math.max(0, subtotal - (discountApproved ? parsed.data.discountAmount : 0));
+        // Integer-cent precision financial arithmetic (Block 13.9)
+        const subtotalCents = parsed.data.items.reduce(
+          (sum, i) => sum + i.quantity * Math.round(i.unitPrice * 100),
+          0,
+        );
+        const discountCents = Math.round(parsed.data.discountAmount * 100);
+        if (discountCents > subtotalCents) {
+          throw new Error('INVALID_DISCOUNT:Discount amount cannot exceed quotation subtotal.');
+        }
+
+        const discountApproved =
+          discountCents === 0 || (ctx.session.role === 'admin' && ctx.mfaVerified);
+        const totalCents = Math.max(0, subtotalCents - (discountApproved ? discountCents : 0));
+        const total = Number((totalCents / 100).toFixed(2));
+        const normalizedDiscount = Number((discountCents / 100).toFixed(2));
         const nextVersion = booking.quotations.length + 1;
 
         booking.quotations.push({
           version: nextVersion,
           createdAt: new Date().toISOString(),
-          items: parsed.data.items.map((item, idx) => ({ ...item, id: `qi-${Date.now()}-${idx}` })),
-          discountAmount: parsed.data.discountAmount,
+          items: parsed.data.items.map((item, idx) => ({
+            ...item,
+            unitPrice: Number((Math.round(item.unitPrice * 100) / 100).toFixed(2)),
+            id: `qi-${Date.now()}-${idx}`,
+          })),
+          discountAmount: normalizedDiscount,
           discountReason: parsed.data.discountReason,
           discountApproved,
-          discountApprovedBy: discountApproved && parsed.data.discountAmount > 0 ? ctx.session.name : undefined,
+          discountApprovedBy: discountApproved && discountCents > 0 ? ctx.session.name : undefined,
           totalAmount: total,
           notes: parsed.data.notes,
         });
 
-        if (booking.payments.length === 0) {
+        if (booking.payments.length === 0 && totalCents > 0) {
+          const depositCents = Math.round(totalCents * 0.5);
+          const balanceCents = totalCents - depositCents;
           booking.payments.push(
             {
               id: `pay-${Date.now()}-1`,
               label: '50% Retainer Deposit',
-              amount: Math.round(total * 0.5),
+              amount: Number((depositCents / 100).toFixed(2)),
               dueDate: booking.eventDate,
               status: 'Pending',
             },
             {
               id: `pay-${Date.now()}-2`,
               label: '50% Final Production Balance',
-              amount: total - Math.round(total * 0.5),
+              amount: Number((balanceCents / 100).toFixed(2)),
               dueDate: booking.eventDate,
               status: 'Pending',
             },
@@ -983,13 +1337,16 @@ export function createApp(options: CreateAppOptions = {}) {
           booking.architecturalStage = LEGACY_TO_ARCH_STATUS['Quote Sent'];
         }
         booking.updatedAt = new Date().toISOString();
-        appendAudit(db, ctx.session, 'QUOTATION_ISSUED', 'Booking', booking.referenceCode, `Issued Quote v${nextVersion} ($${total})`);
+        appendAudit(db, ctx.session, 'QUOTATION_ISSUED', 'Booking', booking.referenceCode, `Issued Quote v${nextVersion} ($${total.toFixed(2)})`);
         return booking;
       });
       res.json({ booking: updated });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unable to issue quote.';
-      return res.status(404).json({ error: msg });
+      if (msg.startsWith('NOT_FOUND:')) return res.status(404).json({ error: msg.slice(10) });
+      if (msg.startsWith('INVALID_DISCOUNT:')) return res.status(400).json({ error: msg.slice(17) });
+      if (msg.startsWith('INVALID_STATE:')) return res.status(422).json({ error: msg.slice(14) });
+      return res.status(500).json({ error: 'Unable to issue quote.' });
     }
   });
 
@@ -1011,6 +1368,9 @@ export function createApp(options: CreateAppOptions = {}) {
         if (!booking) throw new Error('NOT_FOUND:Booking not found.');
         if (!isAuthorizedForBooking(booking, ctx.session, db.vendors)) {
           throw new Error('FORBIDDEN:Record-level access denied.');
+        }
+        if (booking.status === 'Cancelled') {
+          throw new Error('INVALID_STATE:Cannot sign a contract for a cancelled booking.');
         }
 
         booking.contract.documentHash = sha256Hex(`${booking.referenceCode}|${booking.contract.termsSummary}`);
@@ -1044,6 +1404,8 @@ export function createApp(options: CreateAppOptions = {}) {
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Signing failed.';
       if (msg.startsWith('FORBIDDEN:')) return res.status(403).json({ error: msg.slice(10) });
+      if (msg.startsWith('NOT_FOUND:')) return res.status(404).json({ error: msg.slice(10) });
+      if (msg.startsWith('INVALID_STATE:')) return res.status(422).json({ error: msg.slice(14) });
       return res.status(400).json({ error: msg });
     }
   });
@@ -1078,11 +1440,17 @@ export function createApp(options: CreateAppOptions = {}) {
         if (!isAuthorizedForBooking(booking, ctx.session, db.vendors)) {
           throw new Error('FORBIDDEN:Access denied.');
         }
+        if (booking.status === 'Cancelled') {
+          throw new Error('INVALID_STATE:Cannot settle payments on a cancelled booking.');
+        }
 
         const milestone = booking.payments.find((p) => p.id === req.params.paymentId);
         if (!milestone) throw new Error('NOT_FOUND:Payment milestone not found.');
         if (milestone.status === 'Paid') {
           return booking; // Idempotent guard
+        }
+        if (milestone.status === 'Refunded' || milestone.status === 'Cancelled') {
+          throw new Error(`INVALID_STATE:Cannot mark a ${milestone.status} milestone as Paid.`);
         }
         milestone.status = 'Paid';
         milestone.paidAt = new Date().toISOString();
@@ -1111,7 +1479,60 @@ export function createApp(options: CreateAppOptions = {}) {
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Payment error.';
       if (msg.startsWith('FORBIDDEN:')) return res.status(403).json({ error: msg.slice(10) });
+      if (msg.startsWith('NOT_FOUND:')) return res.status(404).json({ error: msg.slice(10) });
+      if (msg.startsWith('INVALID_STATE:')) return res.status(422).json({ error: msg.slice(14) });
       return res.status(400).json({ error: msg });
+    }
+  });
+
+  // Record payment refund state (MFA-verified Executive Admin only; manual staging ledger — live Stripe disabled)
+  app.post('/api/bookings/:id/payments/:paymentId/refund', async (req: Request, res: Response) => {
+    const { ctx } = await getAuth(req);
+    if (!requireAdminMfa(ctx, res)) return;
+
+    const parsed = z.object({ reason: z.string().trim().min(3).max(300) }).safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'A clear refund reason (minimum 3 characters) is required.' });
+    }
+
+    try {
+      const updated = await withTransaction((db) => {
+        const booking = db.bookings.find((b) => b.id === req.params.id);
+        if (!booking) throw new Error('NOT_FOUND:Booking not found.');
+        const milestone = booking.payments.find((p) => p.id === req.params.paymentId);
+        if (!milestone) throw new Error('NOT_FOUND:Payment milestone not found.');
+        if (milestone.status === 'Refunded') {
+          return booking; // Idempotent refund guard
+        }
+        if (milestone.status !== 'Paid') {
+          throw new Error('INVALID_STATE:Only Paid milestones can be marked Refunded.');
+        }
+
+        milestone.status = 'Refunded';
+        milestone.refundedAt = new Date().toISOString();
+        milestone.refundReason = parsed.data.reason;
+        booking.updatedAt = new Date().toISOString();
+
+        appendAudit(
+          db,
+          ctx.session,
+          'PAYMENT_MILESTONE_REFUNDED',
+          'Payment',
+          booking.referenceCode,
+          `Recorded manual/staging refund of $${milestone.amount} (${milestone.label}): ${parsed.data.reason}`,
+        );
+        return booking;
+      });
+      res.json({
+        booking: updated,
+        paymentProcessingMode: 'manual_staging_ledger',
+        liveProcessorVerified: false,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Refund recording error.';
+      if (msg.startsWith('NOT_FOUND:')) return res.status(404).json({ error: msg.slice(10) });
+      if (msg.startsWith('INVALID_STATE:')) return res.status(422).json({ error: msg.slice(14) });
+      return res.status(500).json({ error: 'Unable to record refund.' });
     }
   });
 
@@ -1599,12 +2020,93 @@ export function createApp(options: CreateAppOptions = {}) {
     }
   });
 
+  // Admin-controlled account suspension / reactivation (Block 13.4)
+  app.patch('/api/admin/users/:id/status', async (req: Request, res: Response) => {
+    const { ctx } = await getAuth(req);
+    if (!requireAdminMfa(ctx, res)) return;
+    const parsed = z
+      .object({
+        accountStatus: z.enum(['active', 'suspended', 'deactivated']),
+        reason: z.string().trim().min(3).max(300).optional(),
+      })
+      .safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Valid accountStatus (active, suspended, deactivated) is required.' });
+    }
+    if (req.params.id === ctx.session.id && parsed.data.accountStatus !== 'active') {
+      return res.status(400).json({ error: 'Executive administrators cannot suspend or deactivate their own active session.' });
+    }
+
+    const updatedUser = await withTransaction((db) => {
+      const target = db.users.find((u) => u.id === req.params.id);
+      if (!target) return null;
+      const prevStatus = target.accountStatus ?? 'active';
+      target.accountStatus = parsed.data.accountStatus;
+      appendAudit(
+        db,
+        ctx.session,
+        'USER_ACCOUNT_STATUS_CHANGED',
+        'User',
+        target.id,
+        `${prevStatus} -> ${target.accountStatus}${parsed.data.reason ? ` (${parsed.data.reason})` : ''}`,
+      );
+      appendSecurityEvent(db, {
+        eventType: 'ACCOUNT_STATUS_CHANGED',
+        userId: target.id,
+        outcome: 'allowed',
+        details: `Account status updated from ${prevStatus} to ${target.accountStatus} by ${ctx.session.id}`,
+      });
+      return sanitizeUserForClient(target);
+    });
+
+    if (!updatedUser) return res.status(404).json({ error: 'User not found.' });
+    res.json({ user: updatedUser });
+  });
+
   app.get('/api/admin/notifications', async (req: Request, res: Response) => {
     const { db, ctx } = await getAuth(req);
     if (!requireAdminMfa(ctx, res)) return;
     res.json({
       provider: getEmailProviderStatus(),
       deliveries: db.notificationDeliveries,
+      outbox: db.notificationOutbox,
+    });
+  });
+
+  app.get('/api/admin/outbox', async (req: Request, res: Response) => {
+    const { db, ctx } = await getAuth(req);
+    if (!requireAdminMfa(ctx, res)) return;
+    const queueDepth = db.notificationOutbox.filter(
+      (j) => j.status === 'Pending' || j.status === 'Retrying' || j.status === 'Claimed',
+    ).length;
+    const deadLetterCount = db.notificationOutbox.filter((j) => j.status === 'DeadLetter').length;
+    res.json({
+      queueDepth,
+      deadLetterCount,
+      jobs: db.notificationOutbox,
+    });
+  });
+
+  app.post('/api/admin/outbox/process', async (req: Request, res: Response) => {
+    const { ctx } = await getAuth(req);
+    if (!requireAdminMfa(ctx, res)) return;
+    const summary = await outboxWorker.processOnce();
+    res.json({ summary });
+  });
+
+  app.get('/api/admin/metrics', async (req: Request, res: Response) => {
+    const { db, ctx } = await getAuth(req);
+    if (!requireAdminMfa(ctx, res)) return;
+    const queueDepth = db.notificationOutbox.filter(
+      (j) => j.status === 'Pending' || j.status === 'Retrying' || j.status === 'Claimed',
+    ).length;
+    const deadLetterCount = db.notificationOutbox.filter((j) => j.status === 'DeadLetter').length;
+    res.json({
+      metrics: observability.getSnapshot(),
+      outbox: {
+        queueDepth,
+        deadLetterCount,
+      },
     });
   });
 

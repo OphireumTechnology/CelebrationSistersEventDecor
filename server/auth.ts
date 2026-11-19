@@ -9,6 +9,7 @@ import {
 import { verifyTotpCode } from './totp.ts';
 
 export const SESSION_COOKIE_NAME = 'cs_session';
+export const CSRF_COOKIE_NAME = 'cs_csrf';
 
 const EPHEMERAL_FALLBACK_SECRET = crypto.randomBytes(32).toString('hex');
 
@@ -20,6 +21,7 @@ function getSessionSecret(): string {
 }
 
 export interface SignedSessionPayload {
+  jti?: string;
   userId: string;
   role: UserRole;
   mfaVerified: boolean;
@@ -29,6 +31,8 @@ export interface SignedSessionPayload {
 
 export interface AuthenticatedContext {
   session: UserSession;
+  sessionJti?: string;
+  sessionExpiresAt?: number;
   mfaVerified: boolean;
   emailVerified: boolean;
   accountStatus: AccountStatus;
@@ -36,14 +40,65 @@ export interface AuthenticatedContext {
   authMethod: 'cookie' | 'bearer' | 'supabase_jwt' | 'guest';
   spoofAttemptDetected: boolean;
   emailPrivilegeBindBlocked?: boolean;
+  sessionRevoked?: boolean;
 }
 
 export function sha256Hex(value: string): string {
   return crypto.createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
+export function generateSessionId(): string {
+  return `sid_${crypto.randomBytes(16).toString('hex')}`;
+}
+
+/**
+ * Derives a session-bound cryptographic CSRF synchronizer token from the session JTI
+ * using HMAC-SHA256 keyed by the server session secret.
+ */
+export function deriveCsrfToken(sessionJti: string): string {
+  return crypto
+    .createHmac('sha256', getSessionSecret())
+    .update(`csrf:${sessionJti}`)
+    .digest('base64url');
+}
+
+export function verifyCsrfToken(sessionJti: string | undefined, providedToken: string | undefined): boolean {
+  if (!sessionJti || !providedToken) return false;
+  const trimmed = providedToken.trim();
+  if (!trimmed || trimmed.length > 256) return false;
+  const expected = deriveCsrfToken(sessionJti);
+  const a = Buffer.from(trimmed, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+/**
+ * Generates single-use MFA recovery codes (returned once at enrollment) and their SHA-256 hashes.
+ */
+export function generateMfaRecoveryCodes(count = 8): { plainCodes: string[]; hashes: string[] } {
+  const plainCodes: string[] = [];
+  const hashes: string[] = [];
+  for (let i = 0; i < count; i += 1) {
+    const partA = crypto.randomBytes(3).toString('hex').toUpperCase();
+    const partB = crypto.randomBytes(3).toString('hex').toUpperCase();
+    const code = `${partA}-${partB}`;
+    plainCodes.push(code);
+    hashes.push(sha256Hex(normalizeRecoveryCode(code)));
+  }
+  return { plainCodes, hashes };
+}
+
+export function normalizeRecoveryCode(code: string): string {
+  return code.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
 export function signSessionToken(payload: SignedSessionPayload): string {
-  const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+  const normalized: SignedSessionPayload = {
+    ...payload,
+    jti: payload.jti || generateSessionId(),
+  };
+  const encoded = Buffer.from(JSON.stringify(normalized), 'utf8').toString('base64url');
   const sig = crypto
     .createHmac('sha256', getSessionSecret())
     .update(encoded)
@@ -99,30 +154,68 @@ export function parseCookies(req: Request): Record<string, string> {
   return result;
 }
 
-export function setSessionCookie(res: Response, token: string): void {
+export function isRequestSecure(req?: Request): boolean {
+  if (process.env.NODE_ENV === 'production') return true;
+  if (!req) return false;
+  if (req.secure) return true;
+  // Honor X-Forwarded-Proto only when Express trust proxy is enabled (req.protocol reflects it)
+  return req.protocol === 'https';
+}
+
+export function setSessionCookie(
+  res: Response,
+  token: string,
+  options?: { req?: Request; csrfToken?: string },
+): void {
   const isProd = process.env.NODE_ENV === 'production';
-  const sameSite = isProd && process.env.CROSS_ORIGIN_COOKIES === 'true' ? 'SameSite=None' : 'SameSite=Lax';
-  const flags = [
+  const secure = isProd || isRequestSecure(options?.req);
+  const crossOrigin = isProd && process.env.CROSS_ORIGIN_COOKIES === 'true';
+  // SameSite=None strictly requires Secure; downgrade safely to Lax when non-HTTPS local dev
+  const sameSite = crossOrigin && secure ? 'SameSite=None' : 'SameSite=Lax';
+  const maxAge = 60 * 60 * 8;
+
+  const sessionFlags = [
     `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
     'Path=/',
     'HttpOnly',
     sameSite,
-    `Max-Age=${60 * 60 * 8}`,
+    `Max-Age=${maxAge}`,
   ];
-  if (isProd) {
-    flags.push('Secure');
+  if (secure) {
+    sessionFlags.push('Secure');
   }
-  res.setHeader('Set-Cookie', flags.join('; '));
+
+  const cookiesToSet = [sessionFlags.join('; ')];
+
+  if (options?.csrfToken) {
+    const csrfFlags = [
+      `${CSRF_COOKIE_NAME}=${encodeURIComponent(options.csrfToken)}`,
+      'Path=/',
+      sameSite,
+      `Max-Age=${maxAge}`,
+    ];
+    if (secure) {
+      csrfFlags.push('Secure');
+    }
+    cookiesToSet.push(csrfFlags.join('; '));
+  }
+
+  res.setHeader('Set-Cookie', cookiesToSet.length === 1 ? cookiesToSet[0] : cookiesToSet);
 }
 
-export function clearSessionCookie(res: Response): void {
+export function clearSessionCookie(res: Response, options?: { req?: Request }): void {
   const isProd = process.env.NODE_ENV === 'production';
-  const sameSite = isProd && process.env.CROSS_ORIGIN_COOKIES === 'true' ? 'SameSite=None' : 'SameSite=Lax';
-  const flags = [`${SESSION_COOKIE_NAME}=`, 'Path=/', 'HttpOnly', sameSite, 'Max-Age=0'];
-  if (isProd) {
-    flags.push('Secure');
+  const secure = isProd || isRequestSecure(options?.req);
+  const crossOrigin = isProd && process.env.CROSS_ORIGIN_COOKIES === 'true';
+  const sameSite = crossOrigin && secure ? 'SameSite=None' : 'SameSite=Lax';
+
+  const sessionFlags = [`${SESSION_COOKIE_NAME}=`, 'Path=/', 'HttpOnly', sameSite, 'Max-Age=0'];
+  const csrfFlags = [`${CSRF_COOKIE_NAME}=`, 'Path=/', sameSite, 'Max-Age=0'];
+  if (secure) {
+    sessionFlags.push('Secure');
+    csrfFlags.push('Secure');
   }
-  res.setHeader('Set-Cookie', flags.join('; '));
+  res.setHeader('Set-Cookie', [sessionFlags.join('; '), csrfFlags.join('; ')]);
 }
 
 export const GUEST_USER: UserSession = {
@@ -134,7 +227,7 @@ export const GUEST_USER: UserSession = {
   accountStatus: 'active',
 };
 
-function guestContext(spoofAttemptDetected: boolean): AuthenticatedContext {
+function guestContext(spoofAttemptDetected: boolean, sessionRevoked = false): AuthenticatedContext {
   return {
     session: GUEST_USER,
     mfaVerified: false,
@@ -143,15 +236,18 @@ function guestContext(spoofAttemptDetected: boolean): AuthenticatedContext {
     aal: 'aal1',
     authMethod: 'guest',
     spoofAttemptDetected,
+    sessionRevoked,
   };
 }
 
 /**
  * Synchronous session resolver for HMAC-signed session cookies / tokens.
+ * Rejects expired, tampered, or server-revoked (post-logout) session JTIs.
  */
 export function resolveAuthenticatedContext(
   req: Request,
   registeredUsers: UserSession[],
+  revokedSessionIds?: Record<string, number>,
 ): AuthenticatedContext {
   const rawSpoofHeader = req.header('x-user-id') || req.header('x-user-role');
   const authHeader = req.header('authorization');
@@ -177,6 +273,11 @@ export function resolveAuthenticatedContext(
     return guestContext(true);
   }
 
+  // Enforce server-side session invalidation (post-logout replay protection)
+  if (verified.jti && revokedSessionIds && revokedSessionIds[verified.jti]) {
+    return guestContext(true, true);
+  }
+
   const matchedUser = registeredUsers.find((u) => u.id === verified.userId);
   if (!matchedUser) {
     return guestContext(false);
@@ -187,6 +288,8 @@ export function resolveAuthenticatedContext(
 
   return {
     session: matchedUser,
+    sessionJti: verified.jti,
+    sessionExpiresAt: verified.expiresAt,
     mfaVerified: verified.mfaVerified,
     emailVerified,
     accountStatus,
@@ -206,6 +309,7 @@ export async function resolveAuthenticatedContextAsync(
   req: Request,
   registeredUsers: UserSession[],
   providerVerifyOptions?: VerifyProviderTokenOptions,
+  revokedSessionIds?: Record<string, number>,
 ): Promise<AuthenticatedContext> {
   const rawSpoofHeader = req.header('x-user-id') || req.header('x-user-role');
   const authHeader = req.header('authorization');
@@ -222,9 +326,13 @@ export async function resolveAuthenticatedContextAsync(
       if (!claims) {
         return guestContext(true);
       }
+      if (claims.sessionId && revokedSessionIds && revokedSessionIds[`sb:${claims.sessionId}`]) {
+        return guestContext(true, true);
+      }
       const resolved = resolveTrustedUserFromClaims(claims, registeredUsers);
       return {
         session: resolved.user,
+        sessionJti: claims.sessionId ? `sb:${claims.sessionId}` : undefined,
         mfaVerified: resolved.mfaVerified,
         emailVerified: resolved.emailVerified,
         accountStatus: resolved.accountStatus,
@@ -236,14 +344,14 @@ export async function resolveAuthenticatedContextAsync(
     }
 
     // 2-part server HMAC staging token
-    return resolveAuthenticatedContext(req, registeredUsers);
+    return resolveAuthenticatedContext(req, registeredUsers, revokedSessionIds);
   }
 
   if (rawSpoofHeader && !parseCookies(req)[SESSION_COOKIE_NAME]) {
     return guestContext(true);
   }
 
-  return resolveAuthenticatedContext(req, registeredUsers);
+  return resolveAuthenticatedContext(req, registeredUsers, revokedSessionIds);
 }
 
 /**

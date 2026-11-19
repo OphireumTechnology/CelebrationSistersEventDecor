@@ -10,9 +10,28 @@ export interface ApiEnvConfig {
 }
 
 let activeAccessToken: string | null = null;
+let activeCsrfToken: string | null = null;
 
 export function setApiAccessToken(token: string | null): void {
   activeAccessToken = token && token.trim().length > 0 ? token.trim() : null;
+}
+
+export function setApiCsrfToken(token: string | null): void {
+  activeCsrfToken = token && token.trim().length > 0 ? token.trim() : null;
+}
+
+export function readCookieValue(name: string): string | null {
+  if (typeof document === 'undefined' || !document.cookie) return null;
+  const parts = document.cookie.split(';');
+  for (const rawPart of parts) {
+    const idx = rawPart.indexOf('=');
+    if (idx <= 0) continue;
+    const key = rawPart.slice(0, idx).trim();
+    if (key === name) {
+      return decodeURIComponent(rawPart.slice(idx + 1).trim());
+    }
+  }
+  return null;
 }
 
 export function sanitizeApiBaseUrl(rawUrl: string | undefined): string {
@@ -101,6 +120,13 @@ export function apiFetch(
   }
   if (activeAccessToken && !headers.has('Authorization')) {
     headers.set('Authorization', `Bearer ${activeAccessToken}`);
+  }
+  const method = (init?.method || 'GET').toUpperCase();
+  if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS' && !headers.has('X-CSRF-Token')) {
+    const csrfToken = activeCsrfToken || readCookieValue('cs_csrf');
+    if (csrfToken) {
+      headers.set('X-CSRF-Token', csrfToken);
+    }
   }
 
   return fetch(`${resolved.configuredApiBase}${path}`, {

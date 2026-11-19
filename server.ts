@@ -8,6 +8,8 @@ import { getAllowedOrigins } from './server/authz.ts';
 import { getGeminiConfigStatus } from './server/gemini.ts';
 import { getIdentityProviderStatus } from './server/identityProvider.ts';
 import { getEmailProviderStatus } from './server/notifications.ts';
+import { logStructured } from './server/observability.ts';
+import { NotificationOutboxWorker } from './server/outbox.ts';
 import {
   assertPersistenceReady,
   checkPersistenceHealth,
@@ -52,23 +54,20 @@ function logSafeStartupDiagnostics(distPath: string): void {
   const email = getEmailProviderStatus();
   const ai = getGeminiConfigStatus();
 
-  console.log(
-    JSON.stringify({
-      event: 'server_startup_diagnostics',
-      service: 'Celebration Sisters Event Decor Platform',
-      nodeEnv: process.env.NODE_ENV || 'development',
-      port: PORT,
-      persistenceAdapter: persistence.adapter,
-      persistenceConfigReady: persistence.ready,
-      identityProvider: identity.provider,
-      supabaseReady: identity.readyForProductionAuth,
-      emailProvider: email.provider,
-      emailLiveEnabled: email.liveDeliveryEnabled,
-      aiConfigured: ai.configured,
-      allowedOriginsCount: getAllowedOrigins().length,
-      staticFrontendPresent: fs.existsSync(path.join(distPath, 'index.html')),
-    }),
-  );
+  logStructured('info', 'server_startup_diagnostics', {
+    service: 'Celebration Sisters Event Decor Platform',
+    nodeEnv: process.env.NODE_ENV || 'development',
+    port: PORT,
+    persistenceAdapter: persistence.adapter,
+    persistenceConfigReady: persistence.ready,
+    identityProvider: identity.provider,
+    supabaseReady: identity.readyForProductionAuth,
+    emailProvider: email.provider,
+    emailLiveEnabled: email.liveDeliveryEnabled,
+    aiConfigured: ai.configured,
+    allowedOriginsCount: getAllowedOrigins().length,
+    staticFrontendPresent: fs.existsSync(path.join(distPath, 'index.html')),
+  });
 }
 
 async function startServer() {
@@ -76,16 +75,14 @@ async function startServer() {
 
   const persistenceCheck = await checkPersistenceHealth();
   if (process.env.NODE_ENV === 'production' && !persistenceCheck.ready) {
-    console.error(
-      JSON.stringify({
-        event: 'startup_database_readiness_warning',
-        adapter: persistenceCheck.adapter,
-        reason: persistenceCheck.reason,
-      }),
-    );
+    logStructured('error', 'startup_database_readiness_warning', {
+      adapter: persistenceCheck.adapter,
+      reason: persistenceCheck.reason,
+    });
   }
 
-  const app = createApp({ enableRateLimit: true });
+  const outboxWorker = new NotificationOutboxWorker();
+  const app = createApp({ enableRateLimit: true, outboxWorker });
   const distPath = resolveDistDirectory();
 
   if (process.env.NODE_ENV !== 'production') {
@@ -115,14 +112,24 @@ async function startServer() {
     console.log(`Celebration Sisters Event Decor server listening on http://0.0.0.0:${PORT}`);
   });
 
+  // Production HTTP timeout hardening for Railway edge proxy reliability (Block 13.12)
+  server.requestTimeout = Number(process.env.HTTP_REQUEST_TIMEOUT_MS) || 30_000;
+  server.headersTimeout = Number(process.env.HTTP_HEADERS_TIMEOUT_MS) || 35_000;
+  server.keepAliveTimeout = Number(process.env.HTTP_KEEP_ALIVE_TIMEOUT_MS) || 65_000;
+
+  if (process.env.DISABLE_OUTBOX_POLLING !== 'true') {
+    outboxWorker.startPolling(Number(process.env.OUTBOX_POLL_INTERVAL_MS) || 15_000);
+  }
+
   let shuttingDown = false;
   const shutdown = (signal: NodeJS.Signals) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    console.log(JSON.stringify({ event: 'server_shutdown_initiated', signal }));
+    logStructured('info', 'server_shutdown_initiated', { signal });
+    outboxWorker.stop();
 
     const forceTimer = setTimeout(() => {
-      console.error(JSON.stringify({ event: 'server_shutdown_forced', signal }));
+      logStructured('error', 'server_shutdown_forced', { signal });
       process.exit(1);
     }, 10_000);
     forceTimer.unref();
@@ -131,7 +138,7 @@ async function startServer() {
       try {
         await closePgPool();
         clearTimeout(forceTimer);
-        console.log(JSON.stringify({ event: 'server_shutdown_complete', signal }));
+        logStructured('info', 'server_shutdown_complete', { signal });
         process.exit(0);
       } catch {
         clearTimeout(forceTimer);
@@ -150,12 +157,9 @@ const isDirectEntry =
 
 if (isDirectEntry) {
   startServer().catch((err) => {
-    console.error(
-      JSON.stringify({
-        event: 'server_startup_failed',
-        error: err instanceof Error ? err.message : 'Unknown startup error',
-      }),
-    );
+    logStructured('error', 'server_startup_failed', {
+      error: err instanceof Error ? err.message : 'Unknown startup error',
+    });
     process.exit(1);
   });
 }

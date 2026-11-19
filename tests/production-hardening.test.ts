@@ -120,16 +120,27 @@ test('RFC 6238 TOTP MFA enrollment & verification work end-to-end and static pas
       body: JSON.stringify({ userId: 'user-admin-director' }),
     });
     assert.equal(switchRes.status, 200);
+    const switchBody = (await switchRes.json()) as { csrfToken?: string };
+    assert.ok(switchBody.csrfToken);
     const cookie1 = (switchRes.headers.get('set-cookie') || '').split(';')[0];
 
     const enrollRes = await fetch(`${baseUrl}/api/auth/mfa/totp/enroll`, {
       method: 'POST',
-      headers: { Cookie: cookie1, 'X-Requested-With': 'XMLHttpRequest' },
+      headers: {
+        Cookie: cookie1,
+        'X-CSRF-Token': switchBody.csrfToken,
+        'X-Requested-With': 'XMLHttpRequest',
+      },
     });
     assert.equal(enrollRes.status, 200);
-    const enrollBody = (await enrollRes.json()) as { secret: string; otpauthUri: string };
+    const enrollBody = (await enrollRes.json()) as {
+      secret: string;
+      otpauthUri: string;
+      recoveryCodes?: string[];
+    };
     assert.ok(enrollBody.secret.length >= 16);
     assert.ok(enrollBody.otpauthUri.startsWith('otpauth://totp/'));
+    assert.equal(enrollBody.recoveryCodes?.length, 8);
 
     // Invalid TOTP code fails with 403
     const badMfa = await fetch(`${baseUrl}/api/auth/mfa/verify`, {
@@ -137,6 +148,7 @@ test('RFC 6238 TOTP MFA enrollment & verification work end-to-end and static pas
       headers: {
         'Content-Type': 'application/json',
         Cookie: cookie1,
+        'X-CSRF-Token': switchBody.csrfToken,
         'X-Requested-With': 'XMLHttpRequest',
       },
       body: JSON.stringify({ code: '111111' }),
@@ -152,11 +164,14 @@ test('RFC 6238 TOTP MFA enrollment & verification work end-to-end and static pas
       headers: {
         'Content-Type': 'application/json',
         Cookie: cookie1,
+        'X-CSRF-Token': switchBody.csrfToken,
         'X-Requested-With': 'XMLHttpRequest',
       },
       body: JSON.stringify({ code: validTotp }),
     });
     assert.equal(goodMfa.status, 200);
+    const goodMfaBody = (await goodMfa.json()) as { csrfToken?: string };
+    assert.ok(goodMfaBody.csrfToken);
     const cookie2 = (goodMfa.headers.get('set-cookie') || '').split(';')[0];
 
     const sessionRes = await fetch(`${baseUrl}/api/auth/session`, {
@@ -176,6 +191,7 @@ test('RFC 6238 TOTP MFA enrollment & verification work end-to-end and static pas
       headers: {
         'Content-Type': 'application/json',
         Cookie: cookie2,
+        'X-CSRF-Token': goodMfaBody.csrfToken,
         'X-Requested-With': 'XMLHttpRequest',
       },
       body: JSON.stringify({ supabaseUserId: 'sb-uuid-maya-verified' }),
@@ -187,6 +203,7 @@ test('RFC 6238 TOTP MFA enrollment & verification work end-to-end and static pas
       headers: {
         'Content-Type': 'application/json',
         Cookie: cookie2,
+        'X-CSRF-Token': goodMfaBody.csrfToken,
         'X-Requested-With': 'XMLHttpRequest',
       },
       body: JSON.stringify({ supabaseUserId: 'sb-uuid-maya-verified' }),
@@ -495,6 +512,8 @@ test('PostgreSQL repository executes live SELECT 1 health check, atomic BEGIN/FO
     invitations: [],
     authSecurityEvents: [],
     notificationDeliveries: [],
+    notificationOutbox: [],
+    revokedSessionIds: [],
     bookingIdempotencyKeys: {},
   });
 

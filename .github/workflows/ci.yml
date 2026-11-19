@@ -18,6 +18,7 @@ jobs:
   verify:
     name: Typecheck, Lint, Test, Migrations, Audit & Runtime Smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -35,6 +36,10 @@ jobs:
             echo "ERROR: .env file must not be committed to repository." >&2
             exit 1
           fi
+          if [ -f bun.lock ]; then
+            echo "ERROR: Obsolete bun.lock must not be committed alongside package-lock.json." >&2
+            exit 1
+          fi
           if ls data/backups/*.json >/dev/null 2>&1; then
             echo "ERROR: Customer database backup files must not be committed." >&2
             exit 1
@@ -47,14 +52,24 @@ jobs:
       - name: Dependency security audit (blocking high/critical threshold)
         run: npm audit --audit-level=high
 
-      - name: Validate SQL migrations 001-005 ordering & RLS coverage
+      - name: Validate SQL migrations 001-006 ordering & RLS coverage
         run: npx tsx scripts/verify-migrations.ts
+
+      - name: Verify snapshot-to-normalized reconciliation dry-run
+        run: npx tsx scripts/reconcile-snapshot-to-normalized.ts
 
       - name: TypeScript typecheck and Oxlint
         run: npm run lint
 
       - name: Automated unit, integration & security regression tests
         run: npm test
+
+      - name: Verify GitHub Pages subpath build
+        run: |
+          GITHUB_PAGES=true npm run build:client
+          test -f dist/index.html
+          test -f dist/assets/celebration-sisters-logo.png
+          grep -q '/CelebrationSistersEventDecor/assets/' dist/index.html
 
       - name: Build frontend and compiled Express backend
         run: npm run build
@@ -76,7 +91,7 @@ jobs:
             exit 1
           fi
 
-          # 2. Verify compiled bundle boots cleanly, responds on /health and /api/auth/config, and handles SIGTERM
+          # 2. Verify compiled bundle boots cleanly, responds on /health, /ready, and /api/auth/config, and handles SIGTERM
           PORT=3199 PERSISTENCE_ADAPTER=json-local CS_DB_PATH=/tmp/ci-smoke-db.json node dist-server/server.mjs &
           SERVER_PID=$!
           for i in $(seq 1 20); do
@@ -86,6 +101,7 @@ jobs:
             sleep 0.25
           done
           curl -fsS http://127.0.0.1:3199/health | grep -q '"status":"alive"'
+          curl -fsS http://127.0.0.1:3199/ready | grep -q '"status":"ready"'
           curl -fsS http://127.0.0.1:3199/api/auth/config | grep -q '"mfaPolicy"'
           kill -TERM "$SERVER_PID"
           wait "$SERVER_PID"
@@ -94,6 +110,7 @@ jobs:
   docker-build:
     name: Docker Production Image Build Check
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: verify
     steps:
       - uses: actions/checkout@v4

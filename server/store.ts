@@ -13,6 +13,7 @@ import type {
   DesignConceptRecord,
   InventoryItem,
   NotificationDeliveryRecord,
+  OutboxNotificationJob,
   StaffChecklistRecord,
   StaffVendorInvitation,
   UserRole,
@@ -44,6 +45,8 @@ export interface DatabaseSchema {
   invitations: StaffVendorInvitation[];
   authSecurityEvents: AuthSecurityEvent[];
   notificationDeliveries: NotificationDeliveryRecord[];
+  notificationOutbox: OutboxNotificationJob[];
+  revokedSessionIds: Record<string, number>;
   bookingIdempotencyKeys: Record<string, string>;
 }
 
@@ -462,6 +465,8 @@ function buildInitialSeed(): DatabaseSchema {
     invitations: [],
     authSecurityEvents: [],
     notificationDeliveries: [],
+    notificationOutbox: [],
+    revokedSessionIds: {},
     bookingIdempotencyKeys: {},
   };
 }
@@ -472,6 +477,8 @@ function normalizeSchema(parsed: DatabaseSchema): DatabaseSchema {
   parsed.invitations = parsed.invitations || [];
   parsed.authSecurityEvents = parsed.authSecurityEvents || [];
   parsed.notificationDeliveries = parsed.notificationDeliveries || [];
+  parsed.notificationOutbox = parsed.notificationOutbox || [];
+  parsed.revokedSessionIds = parsed.revokedSessionIds || {};
   parsed.bookingIdempotencyKeys = parsed.bookingIdempotencyKeys || {};
   for (const b of parsed.bookings || []) {
     if (!b.architecturalStage) {
@@ -534,8 +541,10 @@ export async function withTransaction<T>(fn: (db: DatabaseSchema) => Promise<T> 
   }
 }
 
-export function sanitizeUserForClient(user: UserSession): Omit<UserSession, 'totpSecret'> {
-  const { totpSecret: _omitted, ...safeUser } = user;
+export function sanitizeUserForClient(
+  user: UserSession,
+): Omit<UserSession, 'totpSecret' | 'mfaRecoveryCodeHashes'> {
+  const { totpSecret: _omittedSecret, mfaRecoveryCodeHashes: _omittedRecovery, ...safeUser } = user;
   return safeUser;
 }
 

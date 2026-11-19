@@ -3,7 +3,12 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { apiFetch, resolveApiEnvironment, sanitizeApiBaseUrl } from '../src/lib/apiClient.ts';
+import {
+  apiFetch,
+  resolveApiEnvironment,
+  sanitizeApiBaseUrl,
+  setApiCsrfToken,
+} from '../src/lib/apiClient.ts';
 import { createApp } from '../server/app.ts';
 
 test('sanitizeApiBaseUrl enforces HTTPS origins or localhost HTTP and strips trailing slashes', () => {
@@ -34,6 +39,30 @@ test('apiFetch returns graceful 503 BACKEND_NOT_CONFIGURED on static GitHub Page
 
 test('apiFetch rejects non-/api/ paths', () => {
   assert.throws(() => apiFetch('https://evil.example.com/steal'), /must begin with \/api\//);
+});
+
+test('apiFetch automatically forwards X-CSRF-Token on mutating methods and omits it on GET', async () => {
+  const originalFetch = globalThis.fetch;
+  const captured: Array<{ method: string; csrf: string | null }> = [];
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    const headers = new Headers(init?.headers);
+    captured.push({
+      method: (init?.method || 'GET').toUpperCase(),
+      csrf: headers.get('X-CSRF-Token'),
+    });
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    setApiCsrfToken('csrf-token-sample-123');
+    await apiFetch('/api/health', { method: 'GET' }, { baseUrl: '/', apiBaseUrl: 'https://api.celebrationsisters.com' });
+    await apiFetch('/api/bookings', { method: 'POST', body: '{}' }, { baseUrl: '/', apiBaseUrl: 'https://api.celebrationsisters.com' });
+    assert.equal(captured[0]?.csrf, null);
+    assert.equal(captured[1]?.csrf, 'csrf-token-sample-123');
+  } finally {
+    setApiCsrfToken(null);
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('GET /api/health reports readiness, AI configuration status, and non-production fallback safely', async () => {

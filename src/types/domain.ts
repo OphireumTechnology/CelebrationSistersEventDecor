@@ -48,6 +48,8 @@ export interface UserSession {
   mfaEnrolled?: boolean;
   /** Server-side TOTP secret (never returned to browser clients). */
   totpSecret?: string;
+  /** Server-side SHA-256 hashes of single-use MFA recovery codes (never returned to browser clients). */
+  mfaRecoveryCodeHashes?: string[];
 }
 
 export interface NotificationDeliveryRecord {
@@ -72,6 +74,42 @@ export interface NotificationDeliveryRecord {
     | 'Skipped (Unauthorized)';
   providerMessageId?: string;
   attempts: number;
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type OutboxJobStatus =
+  | 'Pending'
+  | 'Claimed'
+  | 'Retrying'
+  | 'ProviderAccepted'
+  | 'Delivered'
+  | 'DeadLetter'
+  | 'Skipped (Unconfigured)'
+  | 'Skipped (Unauthorized)';
+
+export interface OutboxNotificationJob {
+  id: string;
+  idempotencyKey: string;
+  category:
+    | 'consultation_confirmation'
+    | 'staff_new_booking_alert'
+    | 'booking_status_update'
+    | 'admin_security_alert';
+  channel: 'Email' | 'SMS' | 'Internal Task';
+  recipient: string;
+  bookingReference?: string;
+  subject: string;
+  htmlBody: string;
+  textBody: string;
+  status: OutboxJobStatus;
+  attempts: number;
+  maxAttempts: number;
+  nextAttemptAt: string;
+  claimedBy?: string;
+  claimedAt?: string;
+  providerMessageId?: string;
   lastError?: string;
   createdAt: string;
   updatedAt: string;
@@ -107,7 +145,13 @@ export interface AuthSecurityEvent {
     | 'UNVERIFIED_EMAIL_BLOCKED'
     | 'MFA_VERIFIED'
     | 'MFA_FAILED'
+    | 'MFA_ENROLLED'
+    | 'MFA_REVOKED'
+    | 'MFA_RECOVERY_USED'
     | 'ACCOUNT_LINKED'
+    | 'ACCOUNT_STATUS_CHANGED'
+    | 'SESSION_REVOKED'
+    | 'RATE_LIMIT_FAIL_CLOSED'
     | 'INVITATION_ISSUED'
     | 'INVITATION_ACCEPTED'
     | 'INVITATION_REVOKED'
@@ -174,8 +218,10 @@ export interface PaymentMilestone {
   label: string;
   amount: number;
   dueDate: string;
-  status: 'Pending' | 'Paid' | 'Overdue';
+  status: 'Pending' | 'Paid' | 'Overdue' | 'Refunded' | 'Cancelled';
   paidAt?: string;
+  refundedAt?: string;
+  refundReason?: string;
   reference?: string;
 }
 

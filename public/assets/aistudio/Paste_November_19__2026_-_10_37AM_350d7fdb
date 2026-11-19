@@ -1,0 +1,1031 @@
+# MASTER BULK DEVELOPMENT INSTRUCTION — PHASE 13
+## CELEBRATION SISTERS EVENT DECOR
+### Enterprise-Wide Source Code Audit, Security Repairs, Database Modernization, Reliable Notifications, CI/CD Hardening & Production Release Certification
+
+**Execution Mode:** Autonomous Bulk Development — Sequential Repairs, Parallel Independent Analysis, Mandatory Regression Testing, Controlled GitHub Synchronization
+
+**Project:** Celebration Sisters Event Decor
+
+**Repository:** https://github.com/OphireumTechnology/CelebrationSistersEventDecor
+
+**Authoritative Source:** GitHub `main`, with verified changes from open development pull requests reconciled before implementation.
+
+**Proposed Branch:** `development/phase-13-enterprise-hardening`
+
+**Frontend:** React, Vite, TypeScript, GitHub Pages
+
+**Backend:** Node.js, Express, TypeScript, Railway
+
+**Database:** Supabase PostgreSQL
+
+**Authentication:** Supabase Auth
+
+**Email Provider:** Resend
+
+**AI Provider:** Gemini
+
+**Payment Architecture:** Stripe proposal only; live payments remain disabled until separately authorized.
+
+**Target Classification:** RELEASE_CANDIDATE, subject to independent evidence.
+
+---
+
+# SECTION 1 — MASTER EXECUTION MANDATE
+
+Act as an integrated enterprise software development team consisting of:
+
+- Principal Software Architect
+- Senior Full-Stack Engineer
+- PostgreSQL Database Architect
+- Application Security Engineer
+- DevOps and CI/CD Engineer
+- AI Integration Engineer
+- Quality Assurance Automation Engineer
+- Site Reliability Engineer
+- Release Manager
+
+Your responsibility is to inspect, diagnose, repair, test, and document the entire Celebration Sisters Event Decor application.
+
+Do not simply produce a theoretical development plan.
+
+Perform actual source-code analysis and implement verified repairs in the development workspace.
+
+Do not rebuild the application from scratch.
+
+Preserve all existing customer-facing functionality, business processes, and visual branding.
+
+## Non-negotiable engineering rules
+
+1. GitHub is the authoritative source of truth.
+2. Fetch the latest repository state before making changes.
+3. Inspect all open pull requests.
+4. Preserve all completed Phase 11 and Phase 12 improvements.
+5. Reconcile existing repairs before writing duplicate implementations.
+6. Do not replace functioning code without technical justification.
+7. Do not disable security checks to obtain passing builds.
+8. Do not introduce mock persistence into production.
+9. Do not expose credentials, personal data, or payment information.
+10. Never bypass authentication or authorization.
+11. Never fabricate test results.
+12. Never claim live integration success based only on local mocks.
+13. Commit verified changes to a dedicated development branch when authenticated GitHub access is available.
+14. Do not merge into `main` without explicit approval.
+15. Do not modify production infrastructure, DNS, secrets, or databases without approval.
+16. Do not enable live payments or unrestricted production email sending.
+17. Every confirmed defect must have a regression test.
+18. Continue independent repair work when external infrastructure is unavailable.
+19. Maintain a detailed defect register throughout execution.
+20. Report exactly what is verified, blocked, tentative, or unresolved.
+
+---
+
+# BLOCK 13.1 — COMPLETE GITHUB RECONCILIATION AND SOURCE AUDIT
+
+## Objective
+
+Establish the exact current state of the authoritative repository.
+
+### Required actions
+
+Inspect:
+
+- `main` branch and latest commit.
+- All open pull requests.
+- GitHub Actions history.
+- Package dependencies and lockfile.
+- Frontend application architecture.
+- Backend Express architecture.
+- PostgreSQL repositories.
+- Supabase migrations and RLS policies.
+- Authentication and authorization.
+- API endpoints.
+- Booking and consultation workflows.
+- Financial and payment-state controls.
+- Email notification workflows.
+- Gemini AI integrations.
+- Dockerfile.
+- Railway configuration.
+- GitHub Pages workflow.
+- Security and regression tests.
+
+Specifically reconcile PRs #2, #3, #4, #5, #6, and #7, if still open.
+
+Check whether PR #7 already contains the repairs introduced in PR #6.
+
+Check whether the Phase 12 dependency and security improvements supersede PRs #2–#5.
+
+Do not assume any pull request remains open or has been merged without checking GitHub.
+
+### Deliverables
+
+Create:
+
+- `docs/audit/PHASE_13_SOURCE_AUDIT.md`
+- `docs/audit/PHASE_13_DEFECT_REGISTER.md`
+- `docs/audit/PHASE_13_PR_RECONCILIATION.md`
+
+For every defect record:
+
+- Unique defect ID.
+- Severity.
+- Affected file and function.
+- Reproduction procedure.
+- Root cause.
+- Proposed correction.
+- Regression test.
+- Repair commit.
+- Verification result.
+
+### Acceptance criteria
+
+A complete repository inventory and evidence-backed defect register are available before major architectural changes begin.
+
+---
+
+# BLOCK 13.2 — SECURITY HARDENING: RATE LIMITING
+
+## Confirmed concern
+
+The PostgreSQL rate limiter currently falls back to process-local memory when database operations fail.
+
+This may weaken enforcement across multiple Railway instances.
+
+## Required repairs
+
+1. Inspect `server/rateLimit.ts`.
+2. Preserve the existing forwarded-IP spoofing repair.
+3. Confirm that Express proxy trust is explicitly configured for the deployment environment.
+4. Never trust arbitrary caller-controlled forwarding headers.
+5. Implement a configurable fail-closed policy for security-sensitive endpoints.
+6. Ensure authentication, MFA verification, password recovery, and privileged operations remain protected during PostgreSQL outages.
+7. Return a controlled HTTP 503 when a critical distributed limiter is unavailable.
+8. Preserve noncritical service availability where safe.
+9. Add database timeouts.
+10. Add structured rate-limit error logging.
+11. Prevent internal database errors from reaching clients.
+12. Add multi-instance rate-limit tests.
+13. Add database outage tests.
+14. Add forwarded-header spoofing regression tests.
+15. Verify that retries cannot bypass limits.
+
+### Acceptance criteria
+
+- No spoofed-IP rate-limit bypass.
+- No silent fallback on protected authentication endpoints.
+- Safe responses during limiter outages.
+- Cross-instance limits verified against real staging PostgreSQL.
+
+---
+
+# BLOCK 13.3 — CSRF AND SESSION SECURITY REPAIR
+
+## Objective
+
+Strengthen state-changing API requests and cross-origin session protection.
+
+### Required actions
+
+Inspect `server/authz.ts`, session middleware, authentication routes, and cookie configuration.
+
+Repair any confirmed weaknesses involving:
+
+- Missing Origin headers.
+- Missing Referer headers.
+- Unverified custom request headers.
+- Cross-origin cookie requests.
+- SameSite cookie configuration.
+- Secure cookie requirements.
+- Session fixation.
+- Session expiration.
+- Logout invalidation.
+- CSRF token validation.
+- Trusted origin configuration.
+- CORS preflight handling.
+- Reverse-proxy HTTPS detection.
+
+### Security requirements
+
+Do not treat the mere presence of an arbitrary custom header as sufficient proof of CSRF protection.
+
+Implement a robust origin-validation and/or synchronizer-token mechanism appropriate to the actual session architecture.
+
+Preserve secure bearer-token authentication behavior.
+
+### Required tests
+
+- Same-origin authorized request.
+- Approved cross-origin request.
+- Unapproved cross-origin request.
+- Missing Origin and Referer.
+- Forged custom header.
+- Invalid CSRF token.
+- Expired session.
+- Cross-site form submission.
+- Cross-site credentialed fetch.
+- Logout followed by attempted session reuse.
+
+### Acceptance criteria
+
+All state-changing cookie-authenticated endpoints enforce verified CSRF protection.
+
+---
+
+# BLOCK 13.4 — AUTHENTICATION, MFA AND ROLE ISOLATION
+
+## Objective
+
+Harden Supabase Auth integration and privileged administrative access.
+
+### Required actions
+
+1. Inspect all authentication routes.
+2. Verify JWT signature and expiration.
+3. Verify issuer and audience.
+4. Preserve immutable Supabase user ID binding.
+5. Prevent email-based identity impersonation.
+6. Verify administrative TOTP MFA.
+7. Require step-up authentication for replacing an existing MFA factor.
+8. Require reauthentication or an approved recovery procedure for sensitive factor changes.
+9. Implement secure MFA recovery and revocation.
+10. Verify account suspension.
+11. Verify authorization on every privileged endpoint.
+12. Verify customer data isolation.
+13. Verify vendor restrictions.
+14. Verify event-planner access scope.
+15. Verify staff permissions.
+16. Prevent unauthorized financial status changes.
+17. Ensure MFA secrets are never returned outside authorized enrollment flows.
+18. Add audit records for privileged authentication changes.
+
+### Acceptance criteria
+
+Zero confirmed authentication bypasses, unauthorized role escalation, or cross-customer data exposure in the tested scope.
+
+---
+
+# BLOCK 13.5 — POSTGRESQL DATABASE ARCHITECTURE MODERNIZATION
+
+## Confirmed architectural gap
+
+The existing PostgreSQL repository uses a central `app_state_snapshots` JSONB record for durable application state.
+
+Although transactional, this design limits granular database enforcement and can become a concurrency and scalability bottleneck.
+
+## Objective
+
+Introduce a safe, incremental transition toward normalized PostgreSQL persistence.
+
+### Required actions
+
+1. Inspect `server/repositories/postgresRepository.ts`.
+2. Inspect all existing SQL migrations.
+3. Identify entities currently persisted inside the JSONB snapshot.
+4. Map each entity to existing or proposed normalized PostgreSQL tables.
+5. Review all relationships and constraints.
+6. Define transaction boundaries.
+7. Define concurrency and locking requirements.
+8. Preserve existing records.
+9. Develop a reversible migration strategy.
+10. Introduce repository interfaces for normalized persistence.
+11. Implement transaction-safe CRUD operations.
+12. Implement customer and tenant isolation.
+13. Enforce foreign keys and unique constraints.
+14. Add indexes for frequent queries.
+15. Validate booking idempotency.
+16. Validate financial record integrity.
+17. Test database connection pooling.
+18. Test database reconnection.
+19. Test transaction rollback.
+20. Test concurrent booking updates.
+
+### Migration safety rules
+
+- Never delete existing snapshot data during the initial transition.
+- Do not assume normalized tables are populated.
+- Do not run destructive migrations automatically.
+- Use staging databases first.
+- Define explicit data reconciliation procedures.
+- Keep rollback capability.
+- Avoid uncontrolled dual writes.
+- Verify all reads and writes before switching the authoritative persistence implementation.
+- Preserve audit history.
+
+### Deliverables
+
+- Normalized repository architecture.
+- Additive migration proposal.
+- Data migration and reconciliation scripts.
+- Backward compatibility tests.
+- Rollback procedure.
+- Persistence performance benchmarks.
+
+### Acceptance criteria
+
+The new repository architecture passes data integrity, isolation, concurrency, and recovery tests without loss of existing data.
+
+---
+
+# BLOCK 13.6 — SUPABASE RLS SECURITY CERTIFICATION
+
+## Objective
+
+Validate the real database authorization model.
+
+### Required actions
+
+Inspect migrations 001–005 and any newly proposed migration.
+
+Verify:
+
+- Customers can only access authorized records.
+- Staff access follows assigned permissions.
+- Event planners have appropriate operational scope.
+- Vendors cannot access unrelated bookings.
+- Vendors cannot access unauthorized financial records.
+- Administrators require approved privileged access.
+- Quotes and quote items respect ownership.
+- Invoices and payments respect ownership.
+- Contracts respect ownership.
+- AI concepts remain customer-isolated.
+- Booking idempotency records remain protected.
+- Database views cannot bypass RLS unintentionally.
+
+### Additional requirements
+
+Verify whether the application connects through a privileged PostgreSQL role that bypasses RLS.
+
+If so, do not assume database policies alone protect Express API operations.
+
+Implement and test explicit application authorization and secure database access boundaries.
+
+### Acceptance criteria
+
+All RLS and application-level authorization tests pass against an approved staging Supabase database.
+
+---
+
+# BLOCK 13.7 — RELIABLE EMAIL DELIVERY AND TRANSACTIONAL OUTBOX
+
+## Confirmed architectural concern
+
+Email dispatch and notification records require stronger guarantees for persistence, retries, and crash recovery.
+
+## Objective
+
+Implement a reliable Supabase-to-Resend notification delivery pipeline.
+
+### Required actions
+
+1. Inspect `server/notifications.ts`.
+2. Inspect consultation and booking notification routes.
+3. Inspect existing notification records.
+4. Design a transactional outbox table.
+5. Introduce an additive SQL migration.
+6. Persist notification intent in the same database transaction as the business event.
+7. Implement a separate notification worker.
+8. Implement safe job claiming.
+9. Implement retry scheduling.
+10. Implement exponential backoff with jitter.
+11. Implement idempotency keys.
+12. Handle duplicate webhook or worker execution.
+13. Track provider acceptance.
+14. Track delivery confirmation when supported.
+15. Track permanent failures.
+16. Introduce dead-letter handling.
+17. Prevent duplicate client confirmations.
+18. Prevent duplicate staff notifications.
+19. Preserve email approval gates.
+20. Add structured audit logs.
+
+### Required tests
+
+- Successful notification.
+- Duplicate event.
+- Provider timeout.
+- HTTP 429.
+- HTTP 500.
+- Network interruption.
+- Worker restart.
+- Database restart.
+- Concurrent workers.
+- Failed delivery.
+- Retry recovery.
+- Unconfigured provider.
+- Live delivery disabled.
+
+### Acceptance criteria
+
+Notification intent survives application crashes, retries are controlled, and duplicate sending is minimized through durable idempotency.
+
+Do not claim exactly-once external email delivery unless supported by a demonstrably correct end-to-end protocol.
+
+---
+
+# BLOCK 13.8 — BOOKING, CONSULTATION AND EVENT WORKFLOW REPAIRS
+
+## Objective
+
+Verify the entire event-management lifecycle.
+
+### Required workflow
+
+Public visitor → Consultation request → Customer record → Booking review → Availability validation → Quotation → Contract → Payment status → Event planning → Vendor assignment → Event completion → Audit record.
+
+### Required actions
+
+- Verify all consultation forms.
+- Verify date and time validation.
+- Verify guest-count validation.
+- Verify duplicate submission prevention.
+- Verify booking reference uniqueness.
+- Verify booking status transitions.
+- Verify concurrent booking conflicts.
+- Verify customer ownership.
+- Verify staff assignment.
+- Verify event-planner assignment.
+- Verify vendor assignment.
+- Verify quotation totals.
+- Verify contract status.
+- Verify payment status integrity.
+- Verify notification creation.
+- Verify cancellation handling.
+- Verify audit logging.
+- Verify safe recovery from partial failures.
+
+### Acceptance criteria
+
+Every implemented critical booking and event-management workflow passes automated integration and staging browser tests.
+
+Do not mark missing functionality as completed.
+
+---
+
+# BLOCK 13.9 — FINANCIAL INTEGRITY AND STRIPE PREPARATION
+
+## Objective
+
+Protect the existing financial architecture while preparing for future approved payment integration.
+
+### Required actions
+
+1. Review invoices and quotations.
+2. Verify financial calculations.
+3. Verify currency precision.
+4. Prevent client-controlled paid status.
+5. Prevent unauthorized payment updates.
+6. Verify refund and cancellation states.
+7. Validate payment audit records.
+8. Review the existing Stripe architecture proposal.
+9. Prepare secure webhook verification design.
+10. Prepare idempotent payment reconciliation design.
+11. Document additive database migration requirements.
+12. Build isolated sandbox tests where possible.
+
+### Mandatory restrictions
+
+Do not activate live Stripe Checkout.
+
+Do not process real customer payments.
+
+Do not create production payment credentials.
+
+Do not change production financial records.
+
+Actual Stripe integration requires separate explicit approval.
+
+### Acceptance criteria
+
+Financial state remains secure and the payment architecture is ready for a separately approved implementation phase.
+
+---
+
+# BLOCK 13.10 — GEMINI AI CONCIERGE AND CONCEPT STUDIO HARDENING
+
+## Objective
+
+Verify the safety, reliability, and data isolation of existing AI functionality.
+
+### Required actions
+
+- Validate Gemini API configuration.
+- Validate input schemas.
+- Validate output schemas.
+- Prevent prompt injection from triggering privileged actions.
+- Prevent cross-customer concept access.
+- Prevent unauthorized concept modification.
+- Enforce ownership checks.
+- Handle AI timeouts.
+- Handle provider outages.
+- Handle malformed model output.
+- Implement request limits.
+- Implement cost and token safeguards.
+- Prevent leakage of credentials or private customer records.
+- Verify audit logging.
+- Verify human approval for contractual or financial actions.
+
+### Acceptance criteria
+
+AI workflows pass security, ownership, provider-failure, and authorized staging integration tests.
+
+---
+
+# BLOCK 13.11 — FRONTEND UX, RESPONSIVENESS AND ACCESSIBILITY
+
+## Objective
+
+Preserve and improve the luxury Celebration Sisters customer experience.
+
+### Official branding
+
+- Royal Purple: `#4B2087`
+- Champagne Gold: `#B99045`
+- Ivory and White
+- Playfair Display
+- Montserrat
+
+### Required actions
+
+Inspect and repair:
+
+- Homepage.
+- Navigation.
+- Mobile menus.
+- Service divisions.
+- Event portfolio.
+- Consultation forms.
+- Booking interfaces.
+- Customer portal.
+- Vendor portal.
+- Staff portal.
+- Administrator portal.
+- AI Concierge interface.
+- AI Concept Studio.
+- Loading indicators.
+- Error states.
+- Form validation.
+- Responsive layouts.
+- Keyboard navigation.
+- Screen-reader labels.
+- Color contrast.
+- Focus visibility.
+- Image optimization.
+- Layout shifts.
+- Browser console errors.
+
+### Design requirements
+
+Maintain a modern, elegant, high-end, visually consistent experience.
+
+Use restrained animations, clear typography, accessible contrast, and responsive layouts.
+
+Do not introduce unrelated branding colors or redesign approved business content unnecessarily.
+
+### Acceptance criteria
+
+All release-critical screens function across supported desktop and mobile browsers, with no confirmed critical accessibility or usability defects.
+
+---
+
+# BLOCK 13.12 — RAILWAY BACKEND RELIABILITY
+
+## Objective
+
+Verify production-compatible backend behavior.
+
+### Required actions
+
+Inspect:
+
+- Dockerfile.
+- `railway.json`.
+- Express server entry point.
+- Environment variable validation.
+- PostgreSQL connection pooling.
+- Health and readiness checks.
+- HTTPS configuration.
+- Graceful shutdown.
+- Startup failures.
+- Request timeouts.
+- Structured logging.
+- Secret redaction.
+- Error handling.
+- Deployment rollback.
+
+### Required tests
+
+- Clean startup.
+- Missing database credentials.
+- Invalid session secret.
+- Database outage.
+- Database recovery.
+- Invalid Supabase configuration.
+- Provider timeout.
+- SIGTERM shutdown.
+- Container restart.
+- Concurrent requests.
+- Health endpoint.
+- Readiness endpoint.
+
+### Acceptance criteria
+
+The compiled Express backend operates correctly in an approved Railway staging environment.
+
+Do not use Vite Preview as the production API server.
+
+---
+
+# BLOCK 13.13 — GITHUB ACTIONS AND CI/CD HARDENING
+
+## Objective
+
+Make the repository reproducible, secure, and independently verifiable.
+
+### Required actions
+
+- Verify `package-lock.json`.
+- Use deterministic `npm ci`.
+- Validate Node.js compatibility.
+- Run TypeScript.
+- Run lint.
+- Run all automated tests.
+- Verify migrations.
+- Run dependency security audit.
+- Verify GitHub Pages bundle.
+- Build the compiled Express server.
+- Build the Docker image.
+- Run backend startup smoke tests.
+- Run security regression tests.
+- Verify secret scanning.
+- Verify no unauthorized artifacts are committed.
+- Verify dependency caching.
+- Verify CI permissions follow least privilege.
+- Verify deployment workflow approval gates.
+
+### Acceptance criteria
+
+All required checks pass on the exact proposed release commit.
+
+No security tests may be disabled or bypassed to achieve a green workflow.
+
+---
+
+# BLOCK 13.14 — END-TO-END AUTOMATED BROWSER TESTING
+
+## Objective
+
+Verify real user journeys.
+
+### Browser coverage
+
+- Chromium
+- Firefox
+- WebKit, where supported
+- Desktop
+- Tablet
+- Mobile
+
+### Required journeys
+
+**Public visitor**
+- Homepage.
+- Service browsing.
+- Portfolio viewing.
+- Consultation submission.
+
+**Customer**
+- Registration.
+- Authentication.
+- Booking tracking.
+- Concept review.
+- Contract and invoice access.
+
+**Staff**
+- Authorized login.
+- Assigned events.
+- Booking management.
+- Operational updates.
+
+**Vendor**
+- Assigned bookings.
+- Restricted information access.
+- Deliverable updates.
+
+**Event planner**
+- Assigned planning workflows.
+- Milestone updates.
+- Authorized event access.
+
+**Administrator**
+- Login.
+- MFA.
+- Customer management.
+- Booking oversight.
+- Audit logs.
+- Role-restricted operations.
+
+### Acceptance criteria
+
+All implemented release-critical journeys pass in a representative staging environment.
+
+---
+
+# BLOCK 13.15 — PERFORMANCE, MONITORING AND DISASTER RECOVERY
+
+## Objective
+
+Improve long-term operational reliability.
+
+### Required actions
+
+1. Add structured request logging.
+2. Add correlation IDs.
+3. Track API error rates.
+4. Track database query latency.
+5. Track booking failure rates.
+6. Track notification queue depth.
+7. Track notification delivery failures.
+8. Track AI provider failures.
+9. Track worker health.
+10. Define alert thresholds.
+11. Verify backup procedures.
+12. Test restoration using staging data.
+13. Document recovery objectives.
+14. Document rollback procedures.
+15. Document incident response procedures.
+
+### Acceptance criteria
+
+The application has documented monitoring, backup, recovery, and operational-response procedures supported by available verification evidence.
+
+---
+
+# BLOCK 13.16 — COMPLETE SECURITY CERTIFICATION
+
+Execute comprehensive security regression testing.
+
+### Coverage
+
+- Authentication bypass.
+- MFA bypass.
+- Privilege escalation.
+- Cross-customer data access.
+- SQL injection.
+- XSS.
+- CSRF.
+- Session fixation.
+- JWT manipulation.
+- Rate-limit bypass.
+- Database connection failures.
+- RLS policy bypass.
+- Vendor financial access.
+- Booking race conditions.
+- Payment-state manipulation.
+- Email duplication.
+- AI prompt injection.
+- Secret exposure.
+- Dependency vulnerabilities.
+- Unauthorized administrator actions.
+
+### Acceptance criteria
+
+Zero unresolved critical or high-severity release-blocking security defects.
+
+Every confirmed vulnerability must have a corresponding regression test.
+
+---
+
+# BLOCK 13.17 — FINAL GITHUB SYNCHRONIZATION
+
+## Objective
+
+Synchronize the verified Phase 13 development safely.
+
+### Required actions
+
+1. Confirm latest GitHub baseline.
+2. Rebase or reconcile the Phase 13 branch.
+3. Resolve merge conflicts.
+4. Run the full test suite.
+5. Commit verified changes.
+6. Push the development branch.
+7. Create a pull request against `main`.
+8. Document all changed files.
+9. Document all database migrations.
+10. Document all new environment variables.
+11. Include test evidence.
+12. Include security evidence.
+13. Include rollback procedures.
+14. Identify remaining production blockers.
+15. Request approval before merging.
+
+If authenticated GitHub push is unavailable, generate a transferable patch and synchronization guide.
+
+Do not claim synchronization occurred unless the remote commit is independently confirmed.
+
+---
+
+# BLOCK 13.18 — RELEASE READINESS CERTIFICATION
+
+## Objective
+
+Determine whether the application is ready for release.
+
+### Required acceptance matrix
+
+| System | Required evidence |
+|---|---|
+| GitHub | Verified commit and pull request |
+| CI/CD | All required jobs passing |
+| Docker | Production image builds successfully |
+| Supabase | Migrations and persistence verified |
+| Authentication | Role isolation and MFA verified |
+| Railway | Express backend running in staging |
+| Frontend | GitHub Pages integration verified |
+| Booking | End-to-end lifecycle passing |
+| Email | Durable outbox and Resend staging tests |
+| AI | Authorized provider and isolation tests |
+| Security | No unresolved release-blocking findings |
+| Browser E2E | Critical user journeys passing |
+| Recovery | Backup and rollback verified |
+
+### Classification rules
+
+Select exactly one:
+
+- DEVELOPMENT_IN_PROGRESS
+- STAGED_DEVELOPMENT_READY
+- RELEASE_CANDIDATE
+- PRODUCTION_READY
+
+Do not promote to RELEASE_CANDIDATE unless the required staging acceptance evidence exists.
+
+Do not promote to PRODUCTION_READY unless production deployment, security, recovery, and operational controls are verified and authorized.
+
+---
+
+# AUTONOMOUS BULK REPAIR PROTOCOL
+
+For every confirmed defect, execute the following cycle:
+
+**STEP 1 — INSPECT**
+
+Identify the actual source file, function, dependency, and runtime behavior.
+
+**STEP 2 — REPRODUCE**
+
+Create a failing test or other reproducible verification.
+
+**STEP 3 — ANALYZE**
+
+Identify the root cause and potential downstream effects.
+
+**STEP 4 — REPAIR**
+
+Implement the smallest secure correction.
+
+**STEP 5 — VERIFY**
+
+Run the focused test and confirm the defect is resolved.
+
+**STEP 6 — REGRESSION**
+
+Run all relevant existing tests.
+
+**STEP 7 — INTEGRATE**
+
+Verify compatibility with other application components.
+
+**STEP 8 — COMMIT**
+
+Commit the verified repair to the development branch.
+
+**STEP 9 — REPORT**
+
+Record the exact changes, evidence, and remaining risks.
+
+Continue this cycle until all independently repairable defects are resolved.
+
+Do not loop indefinitely on missing credentials, unavailable infrastructure, or external approvals.
+
+---
+
+# FINAL REQUIRED DELIVERABLES
+
+Create the following documents:
+
+1. `docs/audit/PHASE_13_SOURCE_AUDIT.md`
+2. `docs/audit/PHASE_13_DEFECT_REGISTER.md`
+3. `docs/audit/PHASE_13_PR_RECONCILIATION.md`
+4. `docs/architecture/PHASE_13_POSTGRESQL_MODERNIZATION.md`
+5. `docs/security/PHASE_13_SECURITY_CERTIFICATION.md`
+6. `docs/operations/PHASE_13_EMAIL_OUTBOX.md`
+7. `docs/operations/PHASE_13_DEPLOYMENT_READINESS.md`
+8. `docs/release/PHASE_13_ACCEPTANCE_REPORT.md`
+9. `docs/release/PHASE_13_SYNC_AND_PR.md`
+
+If remote synchronization is unavailable, also generate:
+
+`docs/release/phase-13-enterprise-hardening.patch`
+
+Ensure the patch applies cleanly to the documented GitHub baseline.
+
+---
+
+# FINAL ACCEPTANCE REPORT FORMAT
+
+Generate a detailed Phase 13 report containing:
+
+**A. Repository Baseline**
+- Main commit.
+- Development branch.
+- Pull requests reviewed.
+- Source-code changes.
+
+**B. Defect Register**
+- Total defects identified.
+- Critical defects.
+- High-severity defects.
+- Medium-severity defects.
+- Fixed defects.
+- Remaining defects.
+
+**C. Development Matrix**
+- All 18 development blocks.
+- Completed work.
+- Verification evidence.
+- Outstanding work.
+
+**D. Security Results**
+- Authentication.
+- Authorization.
+- MFA.
+- CSRF.
+- Rate limiting.
+- RLS.
+- Dependency security.
+
+**E. Database Results**
+- Schema and migrations.
+- Normalized persistence.
+- Data integrity.
+- Concurrency.
+- Rollback.
+
+**F. Infrastructure Results**
+- GitHub.
+- Railway.
+- Supabase.
+- Resend.
+- Gemini.
+
+**G. Testing Results**
+- Total tests.
+- Passed tests.
+- Failed tests.
+- Skipped tests.
+- TypeScript errors.
+- Lint errors.
+- Build errors.
+- Browser E2E results.
+
+**H. Completion Percentage**
+
+Calculate:
+
+Verified acceptance criteria ÷ Total applicable acceptance criteria × 100.
+
+Report local verification separately from live staging verification.
+
+**I. Release Classification**
+
+Provide the highest evidence-supported classification and explain every remaining blocker.
+
+---
+
+# FINAL MASTER EXECUTION COMMAND
+
+BEGIN PHASE 13 BULK DEVELOPMENT.
+
+Perform a complete source-code audit of Celebration Sisters Event Decor using the latest GitHub repository state.
+
+Reconcile the existing development branches and open pull requests.
+
+Repair confirmed security weaknesses, database persistence limitations, notification reliability gaps, booking and financial integrity defects, authentication issues, frontend problems, backend failures, and CI/CD inconsistencies.
+
+Preserve the approved Celebration Sisters branding and all existing business functionality.
+
+Implement each repair with a regression test.
+
+Verify all available changes locally and through GitHub Actions when accessible.
+
+Prepare database migrations for staging approval.
+
+Commit and push verified changes to the dedicated Phase 13 development branch when authenticated access is available.
+
+Do not merge into `main`, modify production infrastructure, enable live payments, or activate unrestricted production email sending without explicit approval.
+
+Continue all independently executable development work until no additional verified repair can safely proceed.
+
+Deliver the complete Phase 13 acceptance report with evidence, completion percentage, unresolved blockers, and release classification.
+
+**END OF MASTER DEVELOPMENT DIRECTIVE.**

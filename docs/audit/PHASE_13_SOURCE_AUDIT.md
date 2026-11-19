@@ -1,0 +1,35 @@
+# Phase 13 — Enterprise Source Code Audit
+
+**Project:** Celebration Sisters Event Decor (Columbia, SC, USA)  
+**Authoritative Baseline:** GitHub `main` @ `37b5a6c5c41c4c83bbeda18d74ddadc4b2745199`  
+**Audit Date (UTC):** 2026-11-19  
+**Audit Method:** Direct file-by-file source inspection against authoritative GitHub clone (`/tmp/gh-audit`) and active workspace.
+
+---
+
+## 1. Repository & Runtime Inventory
+
+| Subsystem | Files Inspected | Baseline State at `37b5a6c` | Key Findings |
+|---|---|---|---|
+| **Build & Dependencies** | `package.json`, `package-lock.json`, `vite.config.ts`, `tsconfig.json` | React 19, Vite 8 (Rolldown), Express 4, TypeScript 7, Tailwind CSS v4, `pg`, `jose`, `@supabase/supabase-js`, `@google/genai`, `zod` | Deterministic `package-lock.json` present (`0` high/critical vulns); sandbox occasionally re-creates stale `bun.lock` — must be deleted and blocked in CI. |
+| **Container & Railway** | `Dockerfile`, `railway.json`, `server.ts` | Multi-stage Dockerfile (`node:22-alpine`), `railway.json` with `/health` check, compiled `dist-server/server.mjs` | **Defect D-13-01**: Alpine musl fails Rolldown `linux-x64-gnu` binding; `bookworm-slim` lacks `wget`. `server.ts` lacked explicit HTTP server timeouts (`requestTimeout`, `headersTimeout`, `keepAliveTimeout`) and background outbox worker lifecycle. |
+| **CI/CD Workflows** | `.github/workflows/ci.yml`, `.github/workflows/deploy-pages.yml` | Node 22, `npm ci`, static secret scan, `npm audit`, migration check, lint, tests, build, smoke test, `docker-build` | **Defect D-13-02**: Documentation literal live-key prefix tripped CI `grep`. Missing `bun.lock` rejection and `timeout-minutes` bounds; migration check needed expansion for migration `006`. |
+| **Rate Limiting** | `server/rateLimit.ts`, `server/app.ts` | `PostgresRateLimitStore` + `InMemoryRateLimitStore` | **Defect D-13-03**: Raw `X-Forwarded-For` header trusted (spoofable, fixed in PR #7); Express `trust proxy` not configured; `PostgresRateLimitStore` silently fell back to in-memory even on auth/MFA endpoints with no DB query timeout or structured error logging. |
+| **CSRF & Session Security** | `server/authz.ts`, `server/auth.ts`, `server/app.ts`, `src/lib/apiClient.ts` | HMAC-SHA256 `cs_session` cookie + CORS allowlist + Origin/Referer middleware | **Defect D-13-04**: `isCsrfOriginValid()` accepted ANY non-empty `X-Requested-With` or arbitrary `X-CSRF-Token` when `Origin`/`Referer` were omitted; no cryptographic synchronizer CSRF token; `POST /api/auth/logout` cleared cookies without server-side `jti` revocation (allowing captured session replay until 8h expiry). |
+| **Auth, MFA & RBAC** | `server/identityProvider.ts`, `server/auth.ts`, `server/totp.ts`, `server/app.ts` | Supabase RS256/HS256 JWT verification, immutable `supabaseUserId` binding, RFC 6238 TOTP MFA | **Defect D-13-05**: `POST /api/auth/mfa/totp/enroll` allowed overwriting an already-enrolled admin TOTP secret without step-up MFA or recovery code; no single-use recovery codes or MFA revocation flow; no admin user suspension endpoint; JWTs missing `exp` not explicitly rejected. |
+| **PostgreSQL Persistence** | `server/repositories/postgresRepository.ts`, `server/store.ts`, `db/migrations/001..005` | Single-row `app_state_snapshots` JSONB store with `SELECT ... FOR UPDATE` | **Defect D-13-08**: Monolithic JSONB snapshot lacks granular normalized repository layer, reconciliation tooling, and performance benchmarks. |
+| **Supabase RLS** | `db/migrations/001..005`, `scripts/verify-migrations.ts` | 20 tables with RLS enabled + `event_planner` added in `005` + `security_invoker` on `v_vendor_booking_briefs` | **Defect D-13-09**: `app_current_role()` returned `'guest'` for direct Supabase Auth JWT connections unless `SET LOCAL app.current_role` was manually set (did not resolve trusted role from `user_roles`/`roles`); 7 relational tables (`leads`, `consultations`, `vendors`, `staff_assignments`, `event_tasks`, `inventory_reservations`, `notifications`) lacked RLS policies. |
+| **Email & Notifications** | `server/notifications.ts`, `server/app.ts` | Resend HTTPS adapter with HTML escaping, `Idempotency-Key`, honest `ProviderAccepted`/`Skipped` statuses | **Defect D-13-07**: Notifications dispatched inline in HTTP handlers outside the booking DB transaction — a crash between DB commit and Resend call loses notification intent; no transactional outbox, worker leasing, jittered backoff, or dead-letter queue. |
+| **Booking & Financials** | `server/app.ts`, `server/store.ts`, `src/types/domain.ts`, `docs/PAYMENT_INTEGRATION_ARCHITECTURE.md` | State machine, double-booking guard, `Idempotency-Key`, production `501` client self-pay guard | **Defect D-13-06**: Reference generator (`CS-2026-0${65 + length}`) collides if bookings change or exceed 99; floating-point quote math; quote catch block returned `404` for all errors; contract signing permitted on `Cancelled` bookings; missing planner/vendor assignment and admin manual-ledger refund endpoints; Stripe preparation tables not yet in additive SQL migration. |
+| **Gemini AI Integration** | `server/gemini.ts`, `server/app.ts` | `gemini-4-hydrogen`, Zod schemas, timeout guard, ownership checks | **Defect D-13-10**: Missing `maxOutputTokens` budget caps, untrusted user input delimiter framing against prompt injection, and output secret-redaction safeguard. |
+| **Frontend UX & A11y** | `src/App.tsx`, `src/components/*`, `src/lib/apiClient.ts`, `src/index.css` | Royal Purple (`#4B2087`), Champagne Gold (`#B99045`), Playfair Display & Montserrat preserved | **Defect D-13-11**: `apiClient.ts` did not forward cryptographic `X-CSRF-Token`; missing skip-to-main-content landmark link; `ConsultationModal` lacked Escape-key close and ARIA live error/availability regions; `LuxuryHeader` lacked `aria-current="page"` and Escape-key close on mobile menu. |
+| **Observability & Ops** | `server/app.ts`, `server.ts` | `X-Request-Id` header set; basic startup JSON log | **Defect D-13-12**: Missing structured per-request JSON logging with secret redaction, correlation IDs, operational metrics endpoint (`GET /api/admin/metrics`), alert threshold documentation, and disaster recovery runbooks. |
+
+---
+
+## 2. External Access & Environment Constraints Audited
+
+Verified directly in the development container:
+- **GitHub read access:** Available via HTTPS (`git ls-remote`, `git clone`).
+- **GitHub write/API auth:** Unavailable (`GITHUB_TOKEN` / `GH_TOKEN` unset; no `.git`, `~/.ssh`, or `~/.git-credentials`; unauthenticated REST API rate-limited). Transferable patch (`docs/release/phase-13-enterprise-hardening.patch`) required per Block 13.17.
+- **External CLIs & Staging Secrets:** `docker`, `railway`, `supabase`, `psql`, `gh`, `playwright`, `chromium`, `firefox`, and all external staging secrets (`DATABASE_URL`, `SUPABASE_*`, `RESEND_API_KEY`, `GEMINI_API_KEY`, `RAILWAY_TOKEN`) are absent in this sandbox. All local repairs, unit/integration/security tests, and static verifications proceed autonomously; live staging gates are explicitly tracked as externally `BLOCKED`.

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Menu, X } from 'lucide-react';
 import { BrandLogo } from './BrandLogo';
 
@@ -20,6 +20,17 @@ const NAV_ITEMS: { id: AppRoute; label: string }[] = [
 
 export function LuxuryHeader({ activeRoute, onNavigate, onOpenBooking }: LuxuryHeaderProps) {
   const [mobileOpen, setMobileOpen] = useState(false);
+
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setMobileOpen(false);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [mobileOpen]);
 
   const handleNav = (route: AppRoute) => {
     onNavigate(route);
@@ -51,6 +62,7 @@ export function LuxuryHeader({ activeRoute, onNavigate, onOpenBooking }: LuxuryH
               <button
                 key={item.id}
                 type="button"
+                aria-current={isActive ? 'page' : undefined}
                 onClick={() => handleNav(item.id)}
                 className={`relative py-1 text-sm font-medium tracking-wide whitespace-nowrap shrink-0 transition-colors duration-200 ${
                   isActive
@@ -97,6 +109,7 @@ export function LuxuryHeader({ activeRoute, onNavigate, onOpenBooking }: LuxuryH
             <button
               key={item.id}
               type="button"
+              aria-current={activeRoute === item.id ? 'page' : undefined}
               onClick={() => handleNav(item.id)}
               className={`block w-full text-left py-2.5 text-sm font-medium border-b border-[var(--cs-border)]/60 ${
                 activeRoute === item.id ? 'text-[var(--cs-purple)] font-semibold' : 'text-[var(--cs-charcoal)]'

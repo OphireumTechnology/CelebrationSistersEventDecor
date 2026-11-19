@@ -12,7 +12,7 @@ import { PortfolioAndAboutView } from './components/PortfolioAndAboutView';
 import { PortalsWorkspace } from './components/PortalsWorkspace';
 import { PublicHomeView } from './components/PublicHomeView';
 import { ServiceDivisionCatalog } from './components/ServiceDivisionCatalog';
-import { apiFetch } from './lib/apiClient';
+import { apiFetch, setApiCsrfToken } from './lib/apiClient';
 import type { UserSession } from './types/domain';
 
 const DEFAULT_GUEST: UserSession = {
@@ -52,6 +52,7 @@ export default function App() {
         }
         if (sessionRes.ok) {
           const sData = await sessionRes.json();
+          setApiCsrfToken(sData.csrfToken ?? null);
           if (sData.user) {
             setCurrentUser(sData.user);
             setMfaRequired(Boolean(sData.mfaRequired));
@@ -73,6 +74,7 @@ export default function App() {
     });
     if (!res.ok) return;
     const data = await res.json();
+    setApiCsrfToken(data.csrfToken ?? null);
     setCurrentUser(data.user);
     setMfaRequired(Boolean(data.mfaRequired));
   };
@@ -88,6 +90,7 @@ export default function App() {
     if (!res.ok) {
       return { ok: false, error: data.error || 'MFA verification failed.' };
     }
+    setApiCsrfToken(data.csrfToken ?? null);
     setMfaRequired(false);
     setCurrentUser(data.user);
     return { ok: true };
@@ -95,6 +98,7 @@ export default function App() {
 
   const handleLogout = async () => {
     await apiFetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
+    setApiCsrfToken(null);
     setCurrentUser(DEFAULT_GUEST);
     setMfaRequired(false);
   };
@@ -123,13 +127,19 @@ export default function App() {
 
   return (
     <div className="min-h-screen flex flex-col bg-white text-[var(--cs-charcoal)]">
+      <a
+        href="#main-content"
+        className="sr-only focus:not-sr-only focus:fixed focus:top-2 focus:left-2 focus:z-50 focus:px-4 focus:py-2 focus:bg-[var(--cs-purple)] focus:text-white focus:rounded-md focus:text-xs focus:font-medium"
+      >
+        Skip to main content
+      </a>
       <LuxuryHeader
         activeRoute={activeRoute}
         onNavigate={handleNavigate}
         onOpenBooking={() => openBooking()}
       />
 
-      <main className="flex-1">
+      <main id="main-content" className="flex-1">
         {activeRoute === 'home' && (
           <PublicHomeView
             onNavigate={handleNavigate}

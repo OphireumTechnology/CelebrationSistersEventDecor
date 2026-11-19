@@ -105,6 +105,17 @@ export function ConsultationModal({
     idempotencyKeyRef.current = createIdempotencyKey();
   }, [open, initialServiceId, initialEventType, initialLocation, initialGuestCount, initialNotes]);
 
+  useEffect(() => {
+    if (!open) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [open, onClose]);
+
   if (!open) return null;
 
   const invalidateAvailability = () => {
@@ -272,7 +283,10 @@ export function ConsultationModal({
         {mode === 'track' ? (
           <form onSubmit={handleTrackSubmit} className="p-6 sm:p-8 space-y-5">
             {trackingError && (
-              <div className="p-3.5 text-xs font-medium text-red-800 bg-red-50 border border-red-200 rounded-lg">
+              <div
+                role="alert"
+                className="p-3.5 text-xs font-medium text-red-800 bg-red-50 border border-red-200 rounded-lg"
+              >
                 {trackingError}
               </div>
             )}
@@ -362,7 +376,10 @@ export function ConsultationModal({
         ) : (
           <form onSubmit={handleSubmit} className="p-6 sm:p-8 space-y-6">
             {error && (
-              <div className="p-3.5 text-xs font-medium text-red-800 bg-red-50 border border-red-200 rounded-lg flex flex-wrap items-center justify-between gap-2">
+              <div
+                role="alert"
+                className="p-3.5 text-xs font-medium text-red-800 bg-red-50 border border-red-200 rounded-lg flex flex-wrap items-center justify-between gap-2"
+              >
                 <span>{error}</span>
                 <button
                   type="button"
@@ -485,6 +502,7 @@ export function ConsultationModal({
 
             {availabilityMsg && (
               <div
+                aria-live="polite"
                 className={`p-3 rounded-md text-xs border ${
                   isAvailable
                     ? 'bg-emerald-50 border-emerald-200 text-emerald-900'

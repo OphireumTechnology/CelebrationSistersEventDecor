@@ -14,11 +14,14 @@ const EXPECTED_SEQUENCE = [
   '003_auth_identity.sql',
   '004_production_hardening.sql',
   '005_rls_event_planner_and_invoices.sql',
+  '006_normalized_and_outbox.sql',
 ];
 
 const REQUIRED_RLS_TABLES = [
   'users',
   'clients',
+  'leads',
+  'consultations',
   'bookings',
   'quotations',
   'quote_items',
@@ -27,8 +30,13 @@ const REQUIRED_RLS_TABLES = [
   'payments',
   'messages',
   'design_concepts',
+  'vendors',
   'vendor_assignments',
+  'staff_assignments',
+  'event_tasks',
+  'inventory_reservations',
   'ai_sessions',
+  'notifications',
   'audit_logs',
   'staff_vendor_invitations',
   'auth_security_events',
@@ -37,6 +45,11 @@ const REQUIRED_RLS_TABLES = [
   'notification_deliveries',
   'user_mfa_factors',
   'rate_limit_buckets',
+  'notification_outbox',
+  'revoked_sessions',
+  'user_mfa_recovery_codes',
+  'payment_intents_prep',
+  'payment_webhook_events',
 ];
 
 export async function validateMigrationsDirectory(
@@ -87,9 +100,12 @@ export async function validateMigrationsDirectory(
     }
   }
 
-  // Verify event_planner RLS alignment & security_invoker view protection
+  // Verify event_planner RLS alignment, user_roles resolution, and security_invoker view protection
   if (!/app_current_role\(\)\s+IN\s*\('admin',\s*'staff',\s*'event_planner'\)/i.test(combinedSql)) {
     errors.push('RLS policies do not include operational role event_planner.');
+  }
+  if (!/FROM\s+user_roles\s+ur\s+JOIN\s+roles\s+r/i.test(combinedSql)) {
+    errors.push('app_current_role() must resolve authoritative roles from user_roles JOIN roles for Supabase Auth JWTs.');
   }
   if (!/ALTER\s+VIEW\s+v_vendor_booking_briefs\s+SET\s*\(\s*security_invoker\s*=\s*true\s*\)/i.test(combinedSql)) {
     errors.push('Vendor brief view v_vendor_booking_briefs is missing security_invoker = true.');

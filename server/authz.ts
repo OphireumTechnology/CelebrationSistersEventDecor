@@ -1,6 +1,6 @@
 import type { NextFunction, Request, Response } from 'express';
 import type { BookingRecord, UserRole, UserSession, VendorRecord } from '../src/types/domain.ts';
-import type { AuthenticatedContext } from './auth.ts';
+import { verifyCsrfToken, type AuthenticatedContext } from './auth.ts';
 
 const UNSAFE_HTTP_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
@@ -49,9 +49,9 @@ export function corsAllowlistMiddleware() {
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
       res.setHeader(
         'Access-Control-Allow-Headers',
-        'Content-Type, Authorization, X-Requested-With, X-Request-Id, X-CSRF-Token',
+        'Content-Type, Authorization, X-Requested-With, X-Request-Id, X-CSRF-Token, Idempotency-Key',
       );
-      res.setHeader('Access-Control-Expose-Headers', 'X-Request-Id');
+      res.setHeader('Access-Control-Expose-Headers', 'X-Request-Id, RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset, Retry-After');
     }
 
     if (req.method === 'OPTIONS') {
@@ -65,34 +65,80 @@ export function corsAllowlistMiddleware() {
   };
 }
 
-/**
- * Validates Origin/Referer on cookie-authenticated state-changing requests to prevent CSRF.
- * Bearer-token authenticated requests are inherently CSRF-immune because custom Authorization headers
- * cannot be attached by cross-site form/img submissions.
- */
-export function isCsrfOriginValid(req: Request, authMethod: AuthenticatedContext['authMethod']): boolean {
-  if (!UNSAFE_HTTP_METHODS.has(req.method.toUpperCase())) return true;
-  if (authMethod !== 'cookie') return true;
+export interface CsrfValidationResult {
+  valid: boolean;
+  code?: 'CSRF_ORIGIN_REJECTED' | 'CSRF_TOKEN_INVALID';
+  reason?: string;
+}
 
-  const originHeader = req.header('origin');
-  const refererHeader = req.header('referer');
+/**
+ * Strict CSRF defense for cookie-authenticated state-changing requests (Block 13.3):
+ * - Bearer/Supabase JWT requests are inherently CSRF-immune (browsers never auto-attach Authorization headers).
+ * - Arbitrary custom headers (e.g., X-Requested-With) are NEVER treated as sufficient proof of CSRF safety.
+ * - If X-CSRF-Token is supplied, it MUST cryptographically match the active session JTI (HMAC-SHA256).
+ * - Origin (preferred) or Referer must match same-origin Host or explicit ALLOWED_ORIGINS allowlist.
+ * - Requests missing BOTH Origin and Referer are REJECTED unless carrying a cryptographically verified
+ *   session-bound X-CSRF-Token.
+ */
+export function validateCsrfProtection(
+  req: Request,
+  ctx: Pick<AuthenticatedContext, 'authMethod' | 'sessionJti'>,
+): CsrfValidationResult {
+  if (!UNSAFE_HTTP_METHODS.has(req.method.toUpperCase())) {
+    return { valid: true };
+  }
+  if (ctx.authMethod !== 'cookie') {
+    return { valid: true };
+  }
+
+  const csrfHeader = (req.header('x-csrf-token') || '').trim();
+  let hasVerifiedCsrfToken = false;
+  if (csrfHeader) {
+    if (!verifyCsrfToken(ctx.sessionJti, csrfHeader)) {
+      return {
+        valid: false,
+        code: 'CSRF_TOKEN_INVALID',
+        reason: 'Invalid or forged X-CSRF-Token header.',
+      };
+    }
+    hasVerifiedCsrfToken = true;
+  }
+
+  const originHeader = (req.header('origin') || '').trim();
+  const refererHeader = (req.header('referer') || '').trim();
   const candidate = originHeader || refererHeader;
 
   if (!candidate) {
-    // Require an explicit non-simple custom header when browsers/clients omit Origin/Referer.
-    const requestedWith = (req.header('x-requested-with') || '').trim();
-    const csrfHeader = (req.header('x-csrf-token') || '').trim();
-    if (requestedWith || csrfHeader) {
-      return true;
+    // Missing Origin and Referer: NEVER trust unverified X-Requested-With.
+    // Permit ONLY when a cryptographically verified session-bound X-CSRF-Token is present.
+    if (hasVerifiedCsrfToken) {
+      return { valid: true };
     }
-    return false;
+    return {
+      valid: false,
+      code: 'CSRF_ORIGIN_REJECTED',
+      reason: 'Missing Origin/Referer headers without a verified cryptographic CSRF token.',
+    };
+  }
+
+  // Reject explicit "null" Origin (sandboxed iframe / data: URI cross-site form submissions)
+  if (candidate.toLowerCase() === 'null') {
+    return {
+      valid: false,
+      code: 'CSRF_ORIGIN_REJECTED',
+      reason: 'Null Origin rejected by CSRF policy.',
+    };
   }
 
   let parsedOrigin: string;
   try {
     parsedOrigin = new URL(candidate).origin;
   } catch {
-    return false;
+    return {
+      valid: false,
+      code: 'CSRF_ORIGIN_REJECTED',
+      reason: 'Malformed Origin or Referer URL.',
+    };
   }
 
   const host = req.header('host');
@@ -100,16 +146,37 @@ export function isCsrfOriginValid(req: Request, authMethod: AuthenticatedContext
     const expectedHttp = `http://${host}`;
     const expectedHttps = `https://${host}`;
     if (parsedOrigin === expectedHttp || parsedOrigin === expectedHttps) {
-      return true;
+      return { valid: true };
     }
   }
 
-  return isOriginAllowed(parsedOrigin);
+  if (isOriginAllowed(parsedOrigin)) {
+    return { valid: true };
+  }
+
+  return {
+    valid: false,
+    code: 'CSRF_ORIGIN_REJECTED',
+    reason: 'Origin is not in the trusted CORS/CSRF allowlist.',
+  };
+}
+
+export function isCsrfOriginValid(
+  req: Request,
+  authMethod: AuthenticatedContext['authMethod'],
+  sessionJti?: string,
+): boolean {
+  return validateCsrfProtection(req, { authMethod, sessionJti }).valid;
 }
 
 export function requireActiveAccount(ctx: AuthenticatedContext, res: Response, requireVerified = false): boolean {
   if (ctx.session.role === 'guest') {
-    res.status(401).json({ error: 'Authentication required.', code: 'AUTH_REQUIRED' });
+    res.status(401).json({
+      error: ctx.sessionRevoked
+        ? 'Your session has been signed out or revoked. Please sign in again.'
+        : 'Authentication required.',
+      code: ctx.sessionRevoked ? 'SESSION_REVOKED' : 'AUTH_REQUIRED',
+    });
     return false;
   }
 

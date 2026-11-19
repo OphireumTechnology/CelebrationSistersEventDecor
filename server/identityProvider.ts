@@ -131,7 +131,7 @@ export async function verifyProviderAccessToken(
       payload = verified.payload;
     }
 
-    if (!payload.sub || typeof payload.sub !== 'string') {
+    if (!payload.sub || typeof payload.sub !== 'string' || typeof payload.exp !== 'number') {
       return null;
     }
 

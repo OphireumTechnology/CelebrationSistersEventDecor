@@ -1,0 +1,489 @@
+import crypto from 'node:crypto';
+import type { NotificationDeliveryRecord, OutboxNotificationJob } from '../src/types/domain.ts';
+import type { FetchLike, SendNotificationInput } from './notifications.ts';
+import { logStructured, observability } from './observability.ts';
+import type { DatabaseSchema } from './store.ts';
+import { appendAudit, withTransaction } from './store.ts';
+
+export interface OutboxEnqueueResult {
+  job: OutboxNotificationJob;
+  deduplicated: boolean;
+}
+
+export interface OutboxWorkerOptions {
+  workerId?: string;
+  fetchImpl?: FetchLike;
+  apiKey?: string;
+  fromAddress?: string;
+  liveDeliveryEnabled?: boolean;
+  providerTimeoutMs?: number;
+  baseBackoffMs?: number;
+  maxBackoffMs?: number;
+  claimLeaseMs?: number;
+  batchSize?: number;
+  jitterFn?: () => number;
+  nowFn?: () => number;
+}
+
+export interface OutboxProcessSummary {
+  workerId: string;
+  claimed: number;
+  accepted: number;
+  retried: number;
+  deadLettered: number;
+  skipped: number;
+}
+
+/**
+ * Exponential backoff with bounded jitter (0.75x - 1.25x) to prevent thundering herds
+ * across multiple Railway workers retrying after Resend 429 or transient 5xx outages.
+ */
+export function computeBackoffDelayMs(
+  attempt: number,
+  baseMs = 5_000,
+  maxMs = 300_000,
+  jitterFn: () => number = Math.random,
+): number {
+  const safeAttempt = Math.max(1, attempt);
+  const raw = Math.min(maxMs, baseMs * 2 ** (safeAttempt - 1));
+  const jitterFactor = 0.75 + Math.max(0, Math.min(1, jitterFn())) * 0.5;
+  return Math.max(1, Math.round(raw * jitterFactor));
+}
+
+function mapOutboxStatusToDeliveryStatus(
+  status: OutboxNotificationJob['status'],
+): NotificationDeliveryRecord['status'] {
+  switch (status) {
+    case 'ProviderAccepted':
+      return 'ProviderAccepted';
+    case 'Delivered':
+      return 'Delivered';
+    case 'DeadLetter':
+      return 'Failed';
+    case 'Skipped (Unconfigured)':
+      return 'Skipped (Unconfigured)';
+    case 'Skipped (Unauthorized)':
+      return 'Skipped (Unauthorized)';
+    default:
+      return 'Queued';
+  }
+}
+
+function syncDeliveryLedgerFromJob(db: DatabaseSchema, job: OutboxNotificationJob): void {
+  const mappedStatus = mapOutboxStatusToDeliveryStatus(job.status);
+  const existing = db.notificationDeliveries.find((d) => d.idempotencyKey === job.idempotencyKey);
+  const provider: 'resend' | 'unconfigured' =
+    job.status === 'Skipped (Unconfigured)' ? 'unconfigured' : 'resend';
+
+  if (existing) {
+    existing.status = mappedStatus;
+    existing.attempts = job.attempts;
+    existing.providerMessageId = job.providerMessageId ?? existing.providerMessageId;
+    existing.lastError = job.lastError;
+    existing.updatedAt = job.updatedAt;
+    existing.provider = provider;
+  } else {
+    db.notificationDeliveries.unshift({
+      id: `ntf-${job.id}`,
+      idempotencyKey: job.idempotencyKey,
+      category: job.category,
+      channel: job.channel,
+      provider,
+      recipient: job.recipient,
+      bookingReference: job.bookingReference,
+      subject: job.subject,
+      status: mappedStatus,
+      providerMessageId: job.providerMessageId,
+      attempts: job.attempts,
+      lastError: job.lastError,
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt,
+    });
+    if (db.notificationDeliveries.length > 500) {
+      db.notificationDeliveries = db.notificationDeliveries.slice(0, 500);
+    }
+  }
+}
+
+/**
+ * Enqueues a durable notification job INSIDE the caller's database transaction
+ * so notification intent commits atomically alongside booking creation or workflow changes.
+ * Strictly deduplicates by idempotencyKey to prevent duplicate client/staff emails.
+ */
+export function enqueueOutboxNotification(
+  db: DatabaseSchema,
+  input: SendNotificationInput,
+  options?: { maxAttempts?: number; nowMs?: number },
+): OutboxEnqueueResult {
+  const existing = db.notificationOutbox.find((j) => j.idempotencyKey === input.idempotencyKey);
+  if (existing) {
+    return { job: existing, deduplicated: true };
+  }
+
+  const nowIso = new Date(options?.nowMs ?? Date.now()).toISOString();
+  const job: OutboxNotificationJob = {
+    id: `obx-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,
+    idempotencyKey: input.idempotencyKey,
+    category: input.category,
+    channel: 'Email',
+    recipient: input.recipient,
+    bookingReference: input.bookingReference,
+    subject: input.subject,
+    htmlBody: input.htmlBody,
+    textBody: input.textBody,
+    status: 'Pending',
+    attempts: 0,
+    maxAttempts: Math.max(1, Math.min(options?.maxAttempts ?? 5, 10)),
+    nextAttemptAt: nowIso,
+    createdAt: nowIso,
+    updatedAt: nowIso,
+  };
+
+  db.notificationOutbox.unshift(job);
+  if (db.notificationOutbox.length > 1000) {
+    db.notificationOutbox = db.notificationOutbox.slice(0, 1000);
+  }
+  syncDeliveryLedgerFromJob(db, job);
+  observability.recordNotificationEnqueued(1);
+  return { job, deduplicated: false };
+}
+
+/**
+ * Records downstream provider delivery confirmation (e.g., from a verified Resend webhook)
+ * idempotently without ever fabricating delivery on HTTP 2xx submission alone.
+ */
+export async function recordProviderDeliveryConfirmation(
+  providerMessageId: string,
+  eventStatus: 'Delivered' | 'Bounced',
+  details?: string,
+): Promise<{ updated: boolean; job?: OutboxNotificationJob }> {
+  return withTransaction((db) => {
+    const job = db.notificationOutbox.find((j) => j.providerMessageId === providerMessageId);
+    if (!job) return { updated: false };
+
+    if (job.status === 'Delivered' && eventStatus === 'Delivered') {
+      return { updated: false, job };
+    }
+
+    job.status = eventStatus === 'Delivered' ? 'Delivered' : 'DeadLetter';
+    job.lastError = eventStatus === 'Bounced' ? details || 'Recipient bounced at email provider.' : undefined;
+    job.updatedAt = new Date().toISOString();
+    syncDeliveryLedgerFromJob(db, job);
+    observability.recordNotificationOutcome(eventStatus === 'Delivered' ? 'delivered' : 'dead_letter');
+    return { updated: true, job };
+  });
+}
+
+async function fetchWithTimeout(
+  fetchImpl: FetchLike,
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetchImpl(url, { ...init, signal: controller.signal });
+  } catch (err) {
+    if (controller.signal.aborted) {
+      throw new Error(`PROVIDER_TIMEOUT: Email provider exceeded ${timeoutMs}ms timeout.`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Transactional Outbox Notification Worker (Block 13.7).
+ * - Claims due Pending/Retrying jobs (and reclaims stale Claimed jobs after worker crash lease expiry)
+ *   inside an atomic transaction so concurrent workers never double-claim the same job.
+ * - Dispatches to Resend HTTPS API with durable Idempotency-Key.
+ * - Schedules exponential backoff + jitter on 429, 5xx, timeouts, and network errors.
+ * - Routes permanent 4xx or max-attempt exhaustions to DeadLetter.
+ * - Respects EMAIL_LIVE_DELIVERY_ENABLED approval gate and unconfigured-provider honesty.
+ */
+export class NotificationOutboxWorker {
+  readonly workerId: string;
+  private timer: ReturnType<typeof setInterval> | null = null;
+  private readonly options: OutboxWorkerOptions;
+
+  constructor(options: OutboxWorkerOptions = {}) {
+    this.workerId = options.workerId || `outbox-worker-${crypto.randomBytes(4).toString('hex')}`;
+    this.options = options;
+  }
+
+  private now(): number {
+    return this.options.nowFn ? this.options.nowFn() : Date.now();
+  }
+
+  async claimBatch(): Promise<OutboxNotificationJob[]> {
+    const nowMs = this.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const leaseMs = this.options.claimLeaseMs ?? 60_000;
+    const staleThresholdIso = new Date(nowMs - leaseMs).toISOString();
+    const batchSize = this.options.batchSize ?? 10;
+
+    return withTransaction((db) => {
+      const claimed: OutboxNotificationJob[] = [];
+      for (const job of db.notificationOutbox) {
+        if (claimed.length >= batchSize) break;
+        const isDue =
+          (job.status === 'Pending' || job.status === 'Retrying') &&
+          job.nextAttemptAt <= nowIso;
+        const isStaleClaim =
+          job.status === 'Claimed' &&
+          Boolean(job.claimedAt) &&
+          (job.claimedAt as string) <= staleThresholdIso;
+
+        if (isDue || isStaleClaim) {
+          job.status = 'Claimed';
+          job.claimedBy = this.workerId;
+          job.claimedAt = nowIso;
+          job.updatedAt = nowIso;
+          claimed.push({ ...job });
+        }
+      }
+      return claimed;
+    });
+  }
+
+  async processOnce(): Promise<OutboxProcessSummary> {
+    observability.recordWorkerHeartbeat();
+    const summary: OutboxProcessSummary = {
+      workerId: this.workerId,
+      claimed: 0,
+      accepted: 0,
+      retried: 0,
+      deadLettered: 0,
+      skipped: 0,
+    };
+
+    const claimedJobs = await this.claimBatch();
+    summary.claimed = claimedJobs.length;
+    if (claimedJobs.length === 0) {
+      return summary;
+    }
+
+    const apiKey = (this.options.apiKey ?? process.env.RESEND_API_KEY ?? '').trim();
+    const fromAddress = (this.options.fromAddress ?? process.env.EMAIL_FROM ?? '').trim();
+    const liveEnabled =
+      this.options.liveDeliveryEnabled ?? process.env.EMAIL_LIVE_DELIVERY_ENABLED === 'true';
+    const fetchImpl = this.options.fetchImpl ?? fetch;
+    const providerTimeoutMs = this.options.providerTimeoutMs ?? 10_000;
+    const baseBackoffMs = this.options.baseBackoffMs ?? 5_000;
+    const maxBackoffMs = this.options.maxBackoffMs ?? 300_000;
+
+    for (const job of claimedJobs) {
+      const attemptNum = job.attempts + 1;
+      const nowMs = this.now();
+      const nowIso = new Date(nowMs).toISOString();
+
+      // Approval & configuration gates
+      if (!apiKey || !fromAddress) {
+        await this.finalizeJob(job.id, {
+          status: 'Skipped (Unconfigured)',
+          attempts: attemptNum,
+          lastError: 'RESEND_API_KEY or EMAIL_FROM not configured.',
+          updatedAt: nowIso,
+        });
+        summary.skipped += 1;
+        continue;
+      }
+
+      if (!liveEnabled) {
+        await this.finalizeJob(job.id, {
+          status: 'Skipped (Unauthorized)',
+          attempts: attemptNum,
+          lastError: 'Outbound email paused until EMAIL_LIVE_DELIVERY_ENABLED=true is explicitly approved.',
+          updatedAt: nowIso,
+        });
+        summary.skipped += 1;
+        continue;
+      }
+
+      try {
+        const response = await fetchWithTimeout(
+          fetchImpl,
+          'https://api.resend.com/emails',
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${apiKey}`,
+              'Content-Type': 'application/json',
+              'Idempotency-Key': job.idempotencyKey,
+            },
+            body: JSON.stringify({
+              from: fromAddress,
+              to: [job.recipient],
+              subject: job.subject,
+              html: job.htmlBody,
+              text: job.textBody,
+            }),
+          },
+          providerTimeoutMs,
+        );
+
+        if (response.ok) {
+          const body = (await response.json().catch(() => ({}))) as { id?: string };
+          const providerMessageId = typeof body.id === 'string' ? body.id : undefined;
+          await this.finalizeJob(job.id, {
+            status: 'ProviderAccepted',
+            attempts: attemptNum,
+            providerMessageId,
+            lastError: undefined,
+            updatedAt: new Date(this.now()).toISOString(),
+          });
+          observability.recordNotificationOutcome('accepted');
+          logStructured('info', 'outbox_notification_provider_accepted', {
+            workerId: this.workerId,
+            jobId: job.id,
+            category: job.category,
+            bookingReference: job.bookingReference,
+            attempts: attemptNum,
+            providerMessageId,
+          });
+          summary.accepted += 1;
+          continue;
+        }
+
+        const errText = await response.text().catch(() => '');
+        const lastError = `Resend HTTP ${response.status}${errText ? `: ${errText.slice(0, 160)}` : ''}`;
+        const retryable = response.status === 429 || response.status >= 500;
+        if (retryable && attemptNum < job.maxAttempts) {
+          const delayMs = computeBackoffDelayMs(attemptNum, baseBackoffMs, maxBackoffMs, this.options.jitterFn);
+          await this.finalizeJob(job.id, {
+            status: 'Retrying',
+            attempts: attemptNum,
+            nextAttemptAt: new Date(this.now() + delayMs).toISOString(),
+            lastError,
+            updatedAt: new Date(this.now()).toISOString(),
+          });
+          observability.recordNotificationOutcome('failed');
+          logStructured('warn', 'outbox_notification_retry_scheduled', {
+            workerId: this.workerId,
+            jobId: job.id,
+            statusCode: response.status,
+            attempts: attemptNum,
+            delayMs,
+          });
+          summary.retried += 1;
+        } else {
+          await this.finalizeJob(job.id, {
+            status: 'DeadLetter',
+            attempts: attemptNum,
+            lastError,
+            updatedAt: new Date(this.now()).toISOString(),
+          });
+          observability.recordNotificationOutcome('dead_letter');
+          logStructured('error', 'outbox_notification_dead_letter', {
+            workerId: this.workerId,
+            jobId: job.id,
+            statusCode: response.status,
+            attempts: attemptNum,
+            retryable,
+          });
+          summary.deadLettered += 1;
+        }
+      } catch (err) {
+        const lastError = err instanceof Error ? err.message : 'Network error contacting email provider.';
+        if (attemptNum < job.maxAttempts) {
+          const delayMs = computeBackoffDelayMs(attemptNum, baseBackoffMs, maxBackoffMs, this.options.jitterFn);
+          await this.finalizeJob(job.id, {
+            status: 'Retrying',
+            attempts: attemptNum,
+            nextAttemptAt: new Date(this.now() + delayMs).toISOString(),
+            lastError,
+            updatedAt: new Date(this.now()).toISOString(),
+          });
+          observability.recordNotificationOutcome('failed');
+          logStructured('warn', 'outbox_notification_network_retry', {
+            workerId: this.workerId,
+            jobId: job.id,
+            attempts: attemptNum,
+            delayMs,
+          });
+          summary.retried += 1;
+        } else {
+          await this.finalizeJob(job.id, {
+            status: 'DeadLetter',
+            attempts: attemptNum,
+            lastError,
+            updatedAt: new Date(this.now()).toISOString(),
+          });
+          observability.recordNotificationOutcome('dead_letter');
+          logStructured('error', 'outbox_notification_dead_letter', {
+            workerId: this.workerId,
+            jobId: job.id,
+            attempts: attemptNum,
+          });
+          summary.deadLettered += 1;
+        }
+      }
+    }
+
+    return summary;
+  }
+
+  private async finalizeJob(
+    jobId: string,
+    patch: {
+      status: OutboxNotificationJob['status'];
+      attempts: number;
+      nextAttemptAt?: string;
+      providerMessageId?: string;
+      lastError?: string;
+      updatedAt: string;
+    },
+  ): Promise<void> {
+    await withTransaction((db) => {
+      const target = db.notificationOutbox.find((j) => j.id === jobId);
+      if (!target) return;
+      target.status = patch.status;
+      target.attempts = patch.attempts;
+      if (patch.nextAttemptAt) target.nextAttemptAt = patch.nextAttemptAt;
+      if (patch.providerMessageId !== undefined) target.providerMessageId = patch.providerMessageId;
+      target.lastError = patch.lastError;
+      target.claimedBy = undefined;
+      target.claimedAt = undefined;
+      target.updatedAt = patch.updatedAt;
+      syncDeliveryLedgerFromJob(db, target);
+
+      if (patch.status === 'DeadLetter') {
+        appendAudit(
+          db,
+          {
+            id: 'system-outbox-worker',
+            name: 'Notification Outbox Worker',
+            email: 'system@celebrationsisters.example.com',
+            role: 'admin',
+          },
+          'NOTIFICATION_DEAD_LETTERED',
+          'OutboxNotification',
+          target.id,
+          `${target.category} (${target.bookingReference || 'general'}) moved to DeadLetter after ${patch.attempts} attempt(s)`,
+        );
+      }
+    });
+  }
+
+  startPolling(intervalMs = 15_000): void {
+    if (this.timer) return;
+    this.timer = setInterval(() => {
+      this.processOnce().catch((err) => {
+        logStructured('error', 'outbox_worker_poll_error', {
+          workerId: this.workerId,
+          error: err instanceof Error ? err.message : 'Unknown worker error',
+        });
+      });
+    }, intervalMs);
+    this.timer.unref();
+  }
+
+  stop(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+  }
+}

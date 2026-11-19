@@ -40,7 +40,7 @@ function futureIso(daysAhead: number): string {
   return new Date(Date.now() + daysAhead * 86_400_000).toISOString().slice(0, 10);
 }
 
-test('Block 11.2: SQL migrations 001-005 pass ordering, non-destructive DDL, full RLS coverage & security_invoker audit', async () => {
+test('Block 11.2 / 13.6: SQL migrations 001-006 pass ordering, non-destructive DDL, full RLS coverage & security_invoker audit', async () => {
   const result = await validateMigrationsDirectory();
   assert.equal(result.passed, true, `Migration audit errors: ${result.errors.join('; ')}`);
   assert.deepEqual(result.files, [
@@ -49,8 +49,9 @@ test('Block 11.2: SQL migrations 001-005 pass ordering, non-destructive DDL, ful
     '003_auth_identity.sql',
     '004_production_hardening.sql',
     '005_rls_event_planner_and_invoices.sql',
+    '006_normalized_and_outbox.sql',
   ]);
-  assert.ok(result.rlsTablesChecked >= 20);
+  assert.ok(result.rlsTablesChecked >= 32);
 });
 
 test('Block 11.7: Complete customer-to-administrator lifecycle with payment honesty, audit logs & restart persistence', async () => {
