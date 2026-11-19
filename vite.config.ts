@@ -9,9 +9,11 @@ const configDir = path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig(() => {
   return {
-    // GitHub Pages hosts this project below a repository subpath.
-    // Keep root-relative paths in local development and backend deployments.
-    base: process.env.GITHUB_PAGES === 'true' ? '/CelebrationSistersEventDecor/' : '/',
+    // GitHub Pages with a custom apex domain serves assets from /.
+    // Retain repository-subpath support only for Pages without a custom domain.
+    base: process.env.GITHUB_PAGES === 'true' && process.env.GITHUB_PAGES_CUSTOM_DOMAIN !== 'true'
+      ? '/CelebrationSistersEventDecor/'
+      : '/',
     plugins: [
       react(),
       tailwindcss(),
