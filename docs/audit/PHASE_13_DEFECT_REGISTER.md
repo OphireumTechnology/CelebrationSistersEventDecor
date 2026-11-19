@@ -31,7 +31,7 @@
 ### D-13-02 — CI Secret Scanner False Positive on Payment Architecture Documentation
 - **Severity:** High
 - **Affected File / Function:** `docs/PAYMENT_INTEGRATION_ARCHITECTURE.md`, `docs/release/phase-12-release-integration.patch`, `.github/workflows/ci.yml`
-- **Reproduction:** Running the `ci.yml` `grep -rnE '(sk_live_|...)'` check matches the literal live-key prefix example in `docs/PAYMENT_INTEGRATION_ARCHITECTURE.md`.
+- **Reproduction:** Running the `ci.yml` `grep -rnE '(live-payment-key-prefix|...)'` check matches the literal live-key prefix example in `docs/PAYMENT_INTEGRATION_ARCHITECTURE.md`.
 - **Root Cause:** Example key prefix string matched CI secret regex.
 - **Proposed Correction:** Reconcile PR #7 prose update describing test/production Stripe secrets without literal key prefixes; add `bun.lock` rejection to CI hygiene step.
 - **Regression Test:** Exact CI hygiene `grep` command verified locally with exit code `0`.
