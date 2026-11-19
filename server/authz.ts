@@ -77,9 +77,15 @@ export function isCsrfOriginValid(req: Request, authMethod: AuthenticatedContext
   const originHeader = req.header('origin');
   const refererHeader = req.header('referer');
   const candidate = originHeader || refererHeader;
+
   if (!candidate) {
-    // Allow explicit X-Requested-With in headless tests or require same-origin; reject only mismatched untrusted cross-site origins
-    return true;
+    // Require an explicit non-simple custom header when browsers/clients omit Origin/Referer.
+    const requestedWith = (req.header('x-requested-with') || '').trim();
+    const csrfHeader = (req.header('x-csrf-token') || '').trim();
+    if (requestedWith || csrfHeader) {
+      return true;
+    }
+    return false;
   }
 
   let parsedOrigin: string;

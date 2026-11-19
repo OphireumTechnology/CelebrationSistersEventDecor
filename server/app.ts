@@ -14,7 +14,7 @@ import {
   setSessionCookie,
   sha256Hex,
   signSessionToken,
-  verifyAdminMfaCode,
+  verifyAdminMfaChallenge,
   type AuthenticatedContext,
 } from './auth.ts';
 import {
@@ -28,7 +28,25 @@ import {
 } from './authz.ts';
 import { generateConceptProposal, getGeminiConfigStatus, runConciergeTurn } from './gemini.ts';
 import { getIdentityProviderStatus, type VerifyProviderTokenOptions } from './identityProvider.ts';
-import { getPersistenceStatus } from './repositories/postgresRepository.ts';
+import {
+  buildConsultationConfirmationTemplate,
+  buildStaffAlertTemplate,
+  buildStatusUpdateTemplate,
+  dispatchEmailNotification,
+  getEmailProviderStatus,
+  type FetchLike,
+} from './notifications.ts';
+import {
+  createRateLimiter,
+  InMemoryRateLimitStore,
+  PostgresRateLimitStore,
+  type RateLimitStore,
+} from './rateLimit.ts';
+import {
+  checkPersistenceHealth,
+  getPersistenceAdapterMode,
+  getPgPool,
+} from './repositories/postgresRepository.ts';
 import {
   appendAudit,
   appendSecurityEvent,
@@ -36,18 +54,30 @@ import {
   isAuthorizedForBooking,
   readDb,
   sanitizeBookingForRole,
+  sanitizeUserForClient,
   withTransaction,
 } from './store.ts';
+import { buildTotpProvisioningUri, generateTotpSecret } from './totp.ts';
 
 export interface CreateAppOptions {
   enableRateLimit?: boolean;
   providerVerifyOptions?: VerifyProviderTokenOptions;
+  rateLimitStore?: RateLimitStore;
+  notificationFetch?: FetchLike;
+}
+
+function isValidIsoCalendarDate(dateStr: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return false;
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
 }
 
 export function createApp(options: CreateAppOptions = {}) {
   const enableRateLimit = options.enableRateLimit ?? true;
   const app = express();
 
+  app.disable('x-powered-by');
   app.use(express.json({ limit: '1mb' }));
 
   // Security headers (OWASP ASVS aligned) & request correlation IDs
@@ -60,30 +90,21 @@ export function createApp(options: CreateAppOptions = {}) {
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
     res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
     res.setHeader('Cache-Control', 'no-store');
+    if (process.env.NODE_ENV === 'production') {
+      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
     next();
   });
 
   // Explicit credentialed CORS allowlist (GitHub Pages -> Railway)
   app.use(corsAllowlistMiddleware());
 
-  const rateBucket = new Map<string, { count: number; resetAt: number }>();
-  function rateLimit(maxRequests: number, windowMs: number) {
-    return (req: Request, res: Response, next: NextFunction) => {
-      if (!enableRateLimit) return next();
-      const key = `${req.ip || 'local'}:${req.path}`;
-      const now = Date.now();
-      const entry = rateBucket.get(key);
-      if (!entry || entry.resetAt <= now) {
-        rateBucket.set(key, { count: 1, resetAt: now + windowMs });
-        return next();
-      }
-      if (entry.count >= maxRequests) {
-        return res.status(429).json({ error: 'Too many requests. Please wait a moment before trying again.' });
-      }
-      entry.count += 1;
-      return next();
-    };
-  }
+  const resolvedRateStore: RateLimitStore =
+    options.rateLimitStore ??
+    (getPersistenceAdapterMode() === 'postgres' && process.env.DATABASE_URL
+      ? new PostgresRateLimitStore(getPgPool())
+      : new InMemoryRateLimitStore());
+  const rateLimit = createRateLimiter(resolvedRateStore, enableRateLimit);
 
   async function getAuth(req: Request) {
     const db = await readDb();
@@ -109,26 +130,37 @@ export function createApp(options: CreateAppOptions = {}) {
 
   // Cookie-authenticated state-changing request CSRF Origin/Referer protection
   app.use('/api', async (req: Request, res: Response, next: NextFunction) => {
-    if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method.toUpperCase())) {
-      return next();
-    }
-    const { ctx } = await getAuth(req);
-    if (!isCsrfOriginValid(req, ctx.authMethod)) {
-      await withTransaction((wdb) => {
-        appendSecurityEvent(wdb, {
-          eventType: 'CSRF_REJECTED',
-          userId: ctx.session.id !== 'guest-public' ? ctx.session.id : undefined,
-          outcome: 'denied',
-          details: `Rejected cookie-authenticated ${req.method} ${req.path} from untrusted origin/referer`,
+    try {
+      if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method.toUpperCase())) {
+        return next();
+      }
+      // Only requests carrying a session cookie (and not Bearer auth) can be vulnerable to cookie CSRF.
+      const hasBearer = Boolean((req.header('authorization') || '').trim().toLowerCase().startsWith('bearer '));
+      const rawCookie = req.header('cookie') || '';
+      if (hasBearer || !rawCookie.includes('cs_session=')) {
+        return next();
+      }
+
+      const { ctx } = await getAuth(req);
+      if (!isCsrfOriginValid(req, ctx.authMethod)) {
+        await withTransaction((wdb) => {
+          appendSecurityEvent(wdb, {
+            eventType: 'CSRF_REJECTED',
+            userId: ctx.session.id !== 'guest-public' ? ctx.session.id : undefined,
+            outcome: 'denied',
+            details: `Rejected cookie-authenticated ${req.method} ${req.path} from untrusted origin/referer`,
+          });
+          appendAudit(wdb, ctx.session, 'CSRF_ORIGIN_REJECTED', 'API', req.path, 'Cross-site cookie mutation rejected');
         });
-        appendAudit(wdb, ctx.session, 'CSRF_ORIGIN_REJECTED', 'API', req.path, 'Cross-site cookie mutation rejected');
-      });
-      return res.status(403).json({
-        error: 'Cross-site state-changing request rejected by CSRF origin policy.',
-        code: 'CSRF_ORIGIN_REJECTED',
-      });
+        return res.status(403).json({
+          error: 'Cross-site state-changing request rejected by CSRF origin policy.',
+          code: 'CSRF_ORIGIN_REJECTED',
+        });
+      }
+      return next();
+    } catch (err) {
+      return next(err);
     }
-    return next();
   });
 
   function requireAdminMfa(ctx: AuthenticatedContext, res: Response): boolean {
@@ -146,29 +178,33 @@ export function createApp(options: CreateAppOptions = {}) {
     });
   });
 
-  app.get('/ready', (_req: Request, res: Response) => {
-    const persistence = getPersistenceStatus();
+  app.get('/ready', async (_req: Request, res: Response) => {
+    const persistence = await checkPersistenceHealth();
     const ai = getGeminiConfigStatus();
     const auth = getIdentityProviderStatus();
+    const email = getEmailProviderStatus();
     res.status(persistence.ready ? 200 : 503).json({
       ok: persistence.ready,
       persistence,
       auth,
+      email,
       ai: { model: ai.model, configured: ai.configured },
       requestId: res.getHeader('X-Request-Id'),
       timestamp: new Date().toISOString(),
     });
   });
 
-  app.get('/api/health', (_req: Request, res: Response) => {
-    const persistence = getPersistenceStatus();
+  app.get('/api/health', async (_req: Request, res: Response) => {
+    const persistence = await checkPersistenceHealth();
     const ai = getGeminiConfigStatus();
     const auth = getIdentityProviderStatus();
+    const email = getEmailProviderStatus();
     res.status(persistence.ready ? 200 : 503).json({
       ok: persistence.ready,
       service: 'Celebration Sisters Event Decor Platform',
       persistence,
       auth,
+      email,
       ai: { model: ai.model, configured: ai.configured, timeoutMs: ai.timeoutMs },
       requestId: res.getHeader('X-Request-Id'),
       timestamp: new Date().toISOString(),
@@ -190,7 +226,7 @@ export function createApp(options: CreateAppOptions = {}) {
       return res.status(404).json({ error: 'Demo personas are unavailable in production.' });
     }
     const db = await readDb();
-    res.json({ personas: db.users });
+    res.json({ personas: db.users.map(sanitizeUserForClient) });
   });
 
   app.get('/api/auth/session', async (req: Request, res: Response) => {
@@ -203,8 +239,16 @@ export function createApp(options: CreateAppOptions = {}) {
         'Rejected invalid token or spoofed identity headers',
       );
     }
+    if (ctx.emailPrivilegeBindBlocked) {
+      await logSecurityIncident(
+        ctx,
+        'EMAIL_PRIVILEGE_BIND_BLOCKED',
+        '/api/auth/session',
+        'Blocked email-only privilege inheritance; immutable supabaseUserId binding required',
+      );
+    }
     res.json({
-      user: ctx.session,
+      user: sanitizeUserForClient(ctx.session),
       mfaVerified: ctx.mfaVerified,
       mfaRequired: ctx.session.role === 'admin' && !ctx.mfaVerified,
       emailVerified: ctx.emailVerified,
@@ -244,18 +288,49 @@ export function createApp(options: CreateAppOptions = {}) {
 
     setSessionCookie(res, token);
     res.json({
-      user,
+      user: sanitizeUserForClient(user),
       token,
       mfaRequired: user.role === 'admin',
       mfaVerified: user.role !== 'admin',
     });
   });
 
+  // Enroll RFC 6238 TOTP factor for authenticated administrator
+  app.post('/api/auth/mfa/totp/enroll', rateLimit(5, 60_000), async (req: Request, res: Response) => {
+    const { ctx } = await getAuth(req);
+    if (!requireActiveAccount(ctx, res)) return;
+    if (ctx.session.role !== 'admin') {
+      return res.status(403).json({ error: 'Executive director clearance required to enroll admin TOTP MFA.' });
+    }
+
+    const secret = generateTotpSecret();
+    const otpauthUri = buildTotpProvisioningUri(ctx.session.email, secret);
+
+    await withTransaction((db) => {
+      const target = db.users.find((u) => u.id === ctx.session.id);
+      if (target) {
+        target.totpSecret = secret;
+        target.mfaEnrolled = true;
+      }
+      appendAudit(db, ctx.session, 'MFA_TOTP_ENROLLED', 'AuthSession', ctx.session.id, 'Enrolled RFC 6238 TOTP authenticator factor');
+    });
+
+    res.json({
+      enrolled: true,
+      algorithm: 'SHA1',
+      digits: 6,
+      periodSeconds: 30,
+      secret,
+      otpauthUri,
+    });
+  });
+
   app.post('/api/auth/mfa/verify', rateLimit(10, 60_000), async (req: Request, res: Response) => {
     const { ctx } = await getAuth(req);
     if (!requireActiveAccount(ctx, res)) return;
-    const parsed = z.object({ code: z.string().min(4) }).safeParse(req.body);
-    if (!parsed.success || !verifyAdminMfaCode(parsed.data.code)) {
+    const parsed = z.object({ code: z.string().min(6).max(12) }).safeParse(req.body);
+    const challenge = parsed.success ? verifyAdminMfaChallenge(ctx.session, parsed.data.code) : { verified: false, method: 'none' as const };
+    if (!parsed.success || !challenge.verified) {
       await withTransaction((db) => {
         appendAudit(db, ctx.session, 'MFA_VERIFICATION_FAILED', 'AuthSession', ctx.session.id, 'Invalid MFA code entered');
         appendSecurityEvent(db, {
@@ -265,7 +340,7 @@ export function createApp(options: CreateAppOptions = {}) {
           details: 'Invalid director MFA verification code entered',
         });
       });
-      return res.status(403).json({ error: 'Invalid director MFA verification code.' });
+      return res.status(403).json({ error: 'Invalid director MFA verification code.', code: 'MFA_INVALID' });
     }
 
     const token = signSessionToken({
@@ -277,16 +352,29 @@ export function createApp(options: CreateAppOptions = {}) {
     });
     setSessionCookie(res, token);
     await withTransaction((db) => {
-      appendAudit(db, ctx.session, 'MFA_VERIFIED', 'AuthSession', ctx.session.id, 'Privileged MFA verified');
+      appendAudit(
+        db,
+        ctx.session,
+        'MFA_VERIFIED',
+        'AuthSession',
+        ctx.session.id,
+        `Privileged MFA verified (${challenge.method})`,
+      );
       appendSecurityEvent(db, {
         eventType: 'MFA_VERIFIED',
         userId: ctx.session.id,
         outcome: 'allowed',
-        details: 'Privileged MFA verified',
+        details: `Privileged MFA verified via ${challenge.method}`,
       });
     });
 
-    res.json({ user: ctx.session, token, mfaVerified: true, mfaRequired: false });
+    res.json({
+      user: sanitizeUserForClient(ctx.session),
+      token,
+      mfaVerified: true,
+      mfaRequired: false,
+      method: challenge.method,
+    });
   });
 
   app.post('/api/auth/logout', async (req: Request, res: Response) => {
@@ -426,6 +514,37 @@ export function createApp(options: CreateAppOptions = {}) {
     res.json({ bookings: visible });
   });
 
+  // Public consultation status lookup (strictly requires matching referenceCode + clientEmail; omits sensitive financials/notes)
+  app.get('/api/bookings/track', rateLimit(15, 60_000), async (req: Request, res: Response) => {
+    const referenceCode = String(req.query.referenceCode || '').trim().toUpperCase();
+    const email = String(req.query.email || '').trim().toLowerCase();
+    if (!referenceCode || !email) {
+      return res.status(400).json({ error: 'Both referenceCode and email are required to track a consultation.' });
+    }
+
+    const db = await readDb();
+    const matched = db.bookings.find(
+      (b) => b.referenceCode.toUpperCase() === referenceCode && b.clientEmail.toLowerCase() === email,
+    );
+    if (!matched) {
+      return res.status(404).json({ error: 'No matching consultation found for that reference code and email.' });
+    }
+
+    return res.json({
+      tracking: {
+        referenceCode: matched.referenceCode,
+        eventTitle: matched.eventTitle,
+        eventDate: matched.eventDate,
+        venueName: matched.venueName,
+        location: matched.location,
+        status: matched.status,
+        architecturalStage: matched.architecturalStage,
+        assignedLeadPlanner: matched.assignedLeadPlanner,
+        updatedAt: matched.updatedAt,
+      },
+    });
+  });
+
   const createBookingSchema = z.object({
     clientName: z.string().trim().min(2, 'Full name is required'),
     clientEmail: z.string().trim().email('Valid email address is required'),
@@ -434,7 +553,11 @@ export function createApp(options: CreateAppOptions = {}) {
     eventType: z.string().trim().min(2),
     serviceDivisionIds: z.array(z.string()).min(1, 'Select at least one service division'),
     packageTier: z.string().trim().default('Custom Consultation Package'),
-    eventDate: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/, 'Use YYYY-MM-DD date format'),
+    eventDate: z
+      .string()
+      .trim()
+      .regex(/^\d{4}-\d{2}-\d{2}$/, 'Use YYYY-MM-DD date format')
+      .refine((v) => isValidIsoCalendarDate(v), 'Event date must be a valid calendar date'),
     location: z.string().trim().min(2),
     venueName: z.string().trim().min(2),
     guestCount: z.coerce.number().int().min(10).max(2000),
@@ -449,10 +572,27 @@ export function createApp(options: CreateAppOptions = {}) {
       return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid booking input.' });
     }
     const input = parsed.data;
+    const todayIso = new Date().toISOString().slice(0, 10);
+    if (input.eventDate < todayIso) {
+      return res.status(400).json({ error: 'Event date cannot be in the past. Please choose an upcoming date.' });
+    }
+
+    const rawIdemKey = (req.header('idempotency-key') || '').trim();
+    const idempotencyKey =
+      rawIdemKey && /^[a-zA-Z0-9_:-]{8,128}$/.test(rawIdemKey) ? rawIdemKey : undefined;
+
     const { ctx } = await getAuth(req);
 
     try {
-      const created = await withTransaction(async (db) => {
+      const outcome = await withTransaction(async (db) => {
+        if (idempotencyKey && db.bookingIdempotencyKeys[idempotencyKey]) {
+          const existingId = db.bookingIdempotencyKeys[idempotencyKey];
+          const existingBooking = db.bookings.find((b) => b.id === existingId);
+          if (existingBooking) {
+            return { booking: existingBooking, deduplicated: true };
+          }
+        }
+
         const blackout = db.blackoutDates.find((b) => b.date === input.eventDate);
         if (blackout) {
           throw new Error(`BLACKOUT:Selected date (${input.eventDate}) is blocked: ${blackout.reason}.`);
@@ -548,6 +688,9 @@ export function createApp(options: CreateAppOptions = {}) {
         };
 
         db.bookings.unshift(newBooking);
+        if (idempotencyKey) {
+          db.bookingIdempotencyKeys[idempotencyKey] = newBooking.id;
+        }
         appendAudit(
           db,
           ctx.session,
@@ -556,10 +699,73 @@ export function createApp(options: CreateAppOptions = {}) {
           refCode,
           `Created ${initialStatus} (${newBooking.architecturalStage}) for ${input.eventTitle} (${input.eventDate})`,
         );
-        return newBooking;
+        return { booking: newBooking, deduplicated: false };
       });
 
-      res.status(201).json({ booking: created });
+      if (!outcome.deduplicated) {
+        const createdBooking = outcome.booking;
+        const clientTpl = buildConsultationConfirmationTemplate({
+          clientName: createdBooking.clientName,
+          referenceCode: createdBooking.referenceCode,
+          eventTitle: createdBooking.eventTitle,
+          eventDate: createdBooking.eventDate,
+          venueName: createdBooking.venueName,
+          location: createdBooking.location,
+        });
+        const staffRecipient =
+          (process.env.STAFF_NOTIFICATION_EMAIL || '').trim() || 'directors@celebrationsisters.example.com';
+        const staffTpl = buildStaffAlertTemplate({
+          referenceCode: createdBooking.referenceCode,
+          clientName: createdBooking.clientName,
+          eventTitle: createdBooking.eventTitle,
+          eventDate: createdBooking.eventDate,
+          venueName: createdBooking.venueName,
+          budgetRange: createdBooking.budgetRange,
+        });
+
+        const snapshot = await readDb();
+        const [clientDelivery, staffDelivery] = await Promise.all([
+          dispatchEmailNotification(
+            {
+              idempotencyKey: `booking-confirm:${createdBooking.id}`,
+              category: 'consultation_confirmation',
+              recipient: createdBooking.clientEmail,
+              bookingReference: createdBooking.referenceCode,
+              ...clientTpl,
+            },
+            snapshot.notificationDeliveries,
+            { fetchImpl: options.notificationFetch },
+          ),
+          dispatchEmailNotification(
+            {
+              idempotencyKey: `booking-staff-alert:${createdBooking.id}`,
+              category: 'staff_new_booking_alert',
+              recipient: staffRecipient,
+              bookingReference: createdBooking.referenceCode,
+              ...staffTpl,
+            },
+            snapshot.notificationDeliveries,
+            { fetchImpl: options.notificationFetch },
+          ),
+        ]);
+
+        await withTransaction((db) => {
+          if (!clientDelivery.deduplicated) {
+            db.notificationDeliveries.unshift(clientDelivery.record);
+          }
+          if (!staffDelivery.deduplicated) {
+            db.notificationDeliveries.unshift(staffDelivery.record);
+          }
+          if (db.notificationDeliveries.length > 500) {
+            db.notificationDeliveries = db.notificationDeliveries.slice(0, 500);
+          }
+        });
+      }
+
+      res.status(outcome.deduplicated ? 200 : 201).json({
+        booking: outcome.booking,
+        deduplicated: outcome.deduplicated,
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unable to save booking inquiry.';
       if (msg.startsWith('DUPLICATE:') || msg.startsWith('CAPACITY:') || msg.startsWith('BLACKOUT:')) {
@@ -627,9 +833,37 @@ export function createApp(options: CreateAppOptions = {}) {
           booking.referenceCode,
           `${prev} -> ${targetStatus} (${booking.architecturalStage})`,
         );
-        return booking;
+        return { booking, previousStatus: prev };
       });
-      res.json({ booking: updated });
+
+      if (updated.previousStatus !== updated.booking.status) {
+        const tpl = buildStatusUpdateTemplate({
+          clientName: updated.booking.clientName,
+          referenceCode: updated.booking.referenceCode,
+          eventTitle: updated.booking.eventTitle,
+          previousStatus: updated.previousStatus,
+          newStatus: updated.booking.status,
+        });
+        const snapshot = await readDb();
+        const delivery = await dispatchEmailNotification(
+          {
+            idempotencyKey: `booking-status:${updated.booking.id}:${updated.booking.status}`,
+            category: 'booking_status_update',
+            recipient: updated.booking.clientEmail,
+            bookingReference: updated.booking.referenceCode,
+            ...tpl,
+          },
+          snapshot.notificationDeliveries,
+          { fetchImpl: options.notificationFetch },
+        );
+        if (!delivery.deduplicated) {
+          await withTransaction((db) => {
+            db.notificationDeliveries.unshift(delivery.record);
+          });
+        }
+      }
+
+      res.json({ booking: updated.booking });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Status update failed.';
       if (msg.startsWith('NOT_FOUND:')) return res.status(404).json({ error: msg.slice(10) });
@@ -1212,9 +1446,65 @@ export function createApp(options: CreateAppOptions = {}) {
       automationLogs: db.automationLogs,
       auditLogs: db.auditLogs,
       authSecurityEvents: db.authSecurityEvents,
+      notificationDeliveries: db.notificationDeliveries,
       blackoutDates: db.blackoutDates,
       availabilityHolds: db.availabilityHolds,
-      users: db.users,
+      users: db.users.map(sanitizeUserForClient),
+    });
+  });
+
+  // Explicit admin-controlled immutable Supabase UID identity binding
+  app.post('/api/admin/users/:id/link-identity', async (req: Request, res: Response) => {
+    const { ctx } = await getAuth(req);
+    if (!requireAdminMfa(ctx, res)) return;
+    const parsed = z.object({ supabaseUserId: z.string().trim().min(6).max(128) }).safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Valid immutable supabaseUserId is required.' });
+    }
+
+    try {
+      const updatedUser = await withTransaction((db) => {
+        const conflict = db.users.find(
+          (u) => u.supabaseUserId === parsed.data.supabaseUserId && u.id !== req.params.id,
+        );
+        if (conflict) {
+          throw new Error('CONFLICT:This Supabase identity is already linked to another user.');
+        }
+        const target = db.users.find((u) => u.id === req.params.id);
+        if (!target) return null;
+        target.supabaseUserId = parsed.data.supabaseUserId;
+        appendAudit(
+          db,
+          ctx.session,
+          'IDENTITY_LINKED',
+          'User',
+          target.id,
+          `Bound immutable supabaseUserId for role ${target.role}`,
+        );
+        appendSecurityEvent(db, {
+          eventType: 'ACCOUNT_LINKED',
+          userId: target.id,
+          outcome: 'allowed',
+          details: `Executive director bound immutable Supabase UID to ${target.id} (${target.role})`,
+        });
+        return sanitizeUserForClient(target);
+      });
+
+      if (!updatedUser) return res.status(404).json({ error: 'User not found.' });
+      return res.json({ user: updatedUser });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unable to link identity.';
+      if (msg.startsWith('CONFLICT:')) return res.status(409).json({ error: msg.slice(9) });
+      return res.status(500).json({ error: 'Internal server error.' });
+    }
+  });
+
+  app.get('/api/admin/notifications', async (req: Request, res: Response) => {
+    const { db, ctx } = await getAuth(req);
+    if (!requireAdminMfa(ctx, res)) return;
+    res.json({
+      provider: getEmailProviderStatus(),
+      deliveries: db.notificationDeliveries,
     });
   });
 
@@ -1295,6 +1585,21 @@ export function createApp(options: CreateAppOptions = {}) {
     });
     if (!result) return res.status(404).json({ error: 'Workflow not found.' });
     res.json(result);
+  });
+
+  // Global safe error handler — prevents leaking stack traces, secrets, or raw SQL errors
+  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    if (res.headersSent) return;
+    const isSyntax = err instanceof SyntaxError && 'status' in err;
+    if (isSyntax) {
+      res.status(400).json({ error: 'Malformed JSON request payload.', code: 'BAD_JSON' });
+      return;
+    }
+    res.status(500).json({
+      error: 'An unexpected server error occurred. Please try again later.',
+      code: 'INTERNAL_SERVER_ERROR',
+      requestId: res.getHeader('X-Request-Id'),
+    });
   });
 
   return app;

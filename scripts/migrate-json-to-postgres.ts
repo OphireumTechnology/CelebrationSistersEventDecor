@@ -35,6 +35,7 @@ export interface MigrationReport {
 export async function runJsonToPostgresMigrationAudit(options?: {
   sourcePath?: string;
   createBackup?: boolean;
+  backupDir?: string;
   dryRun?: boolean;
 }): Promise<MigrationReport> {
   const dryRun = options?.dryRun ?? true;
@@ -78,7 +79,7 @@ export async function runJsonToPostgresMigrationAudit(options?: {
 
   let backupPath: string | null = null;
   if (options?.createBackup) {
-    const backupDir = path.resolve(process.cwd(), 'data', 'backups');
+    const backupDir = options.backupDir ?? path.resolve(process.cwd(), 'data', 'backups');
     await fs.mkdir(backupDir, { recursive: true });
     backupPath = path.resolve(backupDir, `db.backup.${Date.now()}.json`);
     await fs.writeFile(backupPath, raw, 'utf8');

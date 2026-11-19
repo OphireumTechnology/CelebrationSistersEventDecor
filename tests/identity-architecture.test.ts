@@ -153,9 +153,34 @@ test('verifies RS256 Supabase-style JWTs and prevents user_metadata privilege es
   }
 });
 
-test('enforces admin aal2 MFA claim on provider JWTs and blocks suspended accounts', async () => {
+test('enforces immutable supabaseUserId binding for privileged accounts, blocks email-only privilege escalation, enforces admin aal2 MFA, and blocks suspended accounts', async () => {
   const { baseUrl, mintJwt, cleanup } = await startIsolatedIdentityServer();
   try {
+    // 1. An unlinked JWT claiming the admin's email MUST NOT bind to the privileged admin record!
+    const unlinkedAdminEmailJwt = await mintJwt({
+      sub: 'sb-uuid-impostor-admin',
+      email: 'directors@celebrationsisters.example.com',
+      aal: 'aal2',
+    });
+    const unlinkedSessionRes = await fetch(`${baseUrl}/api/auth/session`, {
+      headers: { Authorization: `Bearer ${unlinkedAdminEmailJwt}` },
+    });
+    assert.equal(unlinkedSessionRes.status, 200);
+    const unlinkedSession = (await unlinkedSessionRes.json()) as { user: { id: string; role: string } };
+    assert.equal(unlinkedSession.user.role, 'client');
+    assert.notEqual(unlinkedSession.user.id, 'user-admin-director');
+
+    const blockedOverview = await fetch(`${baseUrl}/api/admin/overview`, {
+      headers: { Authorization: `Bearer ${unlinkedAdminEmailJwt}` },
+    });
+    assert.equal(blockedOverview.status, 403);
+
+    // 2. Explicitly bind verified immutable supabaseUserId to the admin account
+    await withTransaction((db) => {
+      const admin = db.users.find((u) => u.id === 'user-admin-director');
+      if (admin) admin.supabaseUserId = 'sb-uuid-admin';
+    });
+
     // Admin with aal1 is denied admin overview (403 MFA_REQUIRED)
     const adminAal1 = await mintJwt({
       sub: 'sb-uuid-admin',
@@ -208,6 +233,7 @@ test('enforces event_planner operational permissions while reserving executive c
     await withTransaction((db) => {
       db.users.push({
         id: 'user-planner-sienna',
+        supabaseUserId: 'sb-uuid-planner',
         name: 'Sienna Brooks',
         email: 'sienna.planner@celebrationsisters.example.com',
         role: 'event_planner',
@@ -300,6 +326,19 @@ test('enforces explicit CORS allowlist, cookie CSRF Origin policy, and safe /api
     assert.equal(csrfAttack.status, 403);
     const csrfBody = (await csrfAttack.json()) as { code: string };
     assert.equal(csrfBody.code, 'CSRF_ORIGIN_REJECTED');
+
+    // Cookie-authenticated mutation with missing Origin/Referer AND missing X-Requested-With is rejected
+    const missingOriginAttack = await fetch(`${baseUrl}/api/bookings/bkg-101/messages`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookiePair,
+      },
+      body: JSON.stringify({ text: 'Originless form CSRF attempt' }),
+    });
+    assert.equal(missingOriginAttack.status, 403);
+    const missingOriginBody = (await missingOriginAttack.json()) as { code: string };
+    assert.equal(missingOriginBody.code, 'CSRF_ORIGIN_REJECTED');
 
     // Allowed same-origin/allowlisted origin with cookie succeeds
     const validCookiePost = await fetch(`${baseUrl}/api/bookings/bkg-101/messages`, {

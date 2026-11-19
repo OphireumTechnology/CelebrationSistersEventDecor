@@ -6,6 +6,7 @@ import {
   verifyProviderAccessToken,
   type VerifyProviderTokenOptions,
 } from './identityProvider.ts';
+import { verifyTotpCode } from './totp.ts';
 
 export const SESSION_COOKIE_NAME = 'cs_session';
 
@@ -34,6 +35,7 @@ export interface AuthenticatedContext {
   aal: 'aal1' | 'aal2';
   authMethod: 'cookie' | 'bearer' | 'supabase_jwt' | 'guest';
   spoofAttemptDetected: boolean;
+  emailPrivilegeBindBlocked?: boolean;
 }
 
 export function sha256Hex(value: string): string {
@@ -78,15 +80,20 @@ export function verifySessionToken(token: string): SignedSessionPayload | null {
 
 export function parseCookies(req: Request): Record<string, string> {
   const header = req.header('cookie');
-  if (!header) return {};
-  const result: Record<string, string> = {};
+  if (!header) return Object.create(null) as Record<string, string>;
+  const result = Object.create(null) as Record<string, string>;
   for (const segment of header.split(';')) {
     const eqIdx = segment.indexOf('=');
     if (eqIdx === -1) continue;
     const key = segment.slice(0, eqIdx).trim();
     const val = segment.slice(eqIdx + 1).trim();
-    if (key) {
-      result[key] = decodeURIComponent(val);
+    if (!key || key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
+    if (!Object.prototype.hasOwnProperty.call(result, key)) {
+      try {
+        result[key] = decodeURIComponent(val);
+      } catch {
+        // Malformed percent-encoding is untrusted client input, never a server crash.
+      }
     }
   }
   return result;
@@ -224,6 +231,7 @@ export async function resolveAuthenticatedContextAsync(
         aal: claims.aal,
         authMethod: 'supabase_jwt',
         spoofAttemptDetected: false,
+        emailPrivilegeBindBlocked: resolved.emailPrivilegeBindBlocked,
       };
     }
 
@@ -238,7 +246,44 @@ export async function resolveAuthenticatedContextAsync(
   return resolveAuthenticatedContext(req, registeredUsers);
 }
 
+/**
+ * Verifies administrator MFA challenge using RFC 6238 TOTP bound to the user account.
+ * Shared static passcodes are strictly prohibited in production mode.
+ */
+export function verifyAdminMfaChallenge(user: UserSession, code: string): {
+  verified: boolean;
+  method: 'totp' | 'staging_passcode' | 'none';
+} {
+  if (user.totpSecret) {
+    return {
+      verified: verifyTotpCode(user.totpSecret, code),
+      method: 'totp',
+    };
+  }
+
+  // Production strictly prohibits static shared passcodes.
+  if (process.env.NODE_ENV === 'production') {
+    return { verified: false, method: 'none' };
+  }
+
+  // Non-production local/staging compatibility only when ADMIN_MFA_PASSCODE is explicitly configured
+  const expected = process.env.ADMIN_MFA_PASSCODE;
+  if (!expected) {
+    return { verified: false, method: 'none' };
+  }
+  const providedBuf = Buffer.from(code.trim(), 'utf8');
+  const expectedBuf = Buffer.from(expected, 'utf8');
+  if (providedBuf.length !== expectedBuf.length) {
+    return { verified: false, method: 'staging_passcode' };
+  }
+  return {
+    verified: crypto.timingSafeEqual(providedBuf, expectedBuf),
+    method: 'staging_passcode',
+  };
+}
+
 export function verifyAdminMfaCode(code: string): boolean {
+  if (process.env.NODE_ENV === 'production') return false;
   const expected = process.env.ADMIN_MFA_PASSCODE;
   if (!expected) return false;
   const providedBuf = Buffer.from(code.trim(), 'utf8');

@@ -15,6 +15,7 @@ test('migration dry-run validates referential integrity and reconciles lifecycle
     await readDb(); // Ensure clean seed exists in temp file
     const report = await runJsonToPostgresMigrationAudit({
       sourcePath: tmpDb,
+      backupDir: path.join(tmpDir, 'backups'),
       createBackup: true,
       dryRun: true,
     });

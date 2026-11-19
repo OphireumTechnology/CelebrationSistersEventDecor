@@ -1,0 +1,99 @@
+name: CI Verification & Production Hardening Checks
+
+on:
+  push:
+    branches: [main, 'repair/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Typecheck, Lint, Test, Build & Runtime Smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Static secret & committed artifact hygiene check
+        run: |
+          if [ -f .env ]; then
+            echo "ERROR: .env file must not be committed to repository." >&2
+            exit 1
+          fi
+          if ls data/backups/*.json >/dev/null 2>&1; then
+            echo "ERROR: Customer database backup files must not be committed." >&2
+            exit 1
+          fi
+          if grep -rnE '(sk_live_|re_[A-Za-z0-9]{20,}|AIzaSy[A-Za-z0-9_-]{30,}|-----BEGIN (RSA |EC )?PRIVATE KEY-----)' src server scripts docs --exclude-dir=node_modules; then
+            echo "ERROR: Potential hardcoded secret detected." >&2
+            exit 1
+          fi
+
+      - name: TypeScript typecheck and Oxlint
+        run: npm run lint
+
+      - name: Automated unit, integration & security regression tests
+        run: npm test
+
+      - name: Build frontend and compiled Express backend
+        run: npm run build
+
+      - name: Validate compiled frontend and server artifacts
+        run: |
+          test -f dist/index.html
+          test -f dist-server/server.mjs
+          if grep -q 'src="/src/main.tsx"' dist/index.html; then
+            echo "Uncompiled Vite development entrypoint detected in dist/index.html" >&2
+            exit 1
+          fi
+
+      - name: Production server fail-closed and compiled startup smoke test
+        run: |
+          # 1. Verify production mode fails closed without DATABASE_URL and SESSION_SECRET
+          if NODE_ENV=production PORT=3198 node dist-server/server.mjs; then
+            echo "ERROR: Production server started without DATABASE_URL / SESSION_SECRET" >&2
+            exit 1
+          fi
+
+          # 2. Verify compiled bundle boots cleanly, responds on /health and /api/auth/config, and handles SIGTERM
+          PORT=3199 PERSISTENCE_ADAPTER=json-local CS_DB_PATH=/tmp/ci-smoke-db.json node dist-server/server.mjs &
+          SERVER_PID=$!
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:3199/health >/dev/null; then
+              break
+            fi
+            sleep 0.25
+          done
+          curl -fsS http://127.0.0.1:3199/health | grep -q '"status":"alive"'
+          curl -fsS http://127.0.0.1:3199/api/auth/config | grep -q '"mfaPolicy"'
+          kill -TERM "$SERVER_PID"
+          wait "$SERVER_PID"
+          rm -f /tmp/ci-smoke-db.json
+
+      - name: Dependency security audit (high/critical threshold)
+        continue-on-error: true
+        run: npm audit --audit-level=high
+
+  docker-build:
+    name: Docker Production Image Build Check
+    runs-on: ubuntu-latest
+    needs: verify
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build production Docker image
+        run: docker build --tag celebration-sisters-prod:ci .

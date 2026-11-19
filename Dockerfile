@@ -1,9 +1,32 @@
-FROM node:24-alpine
+# Multi-stage production Dockerfile for Celebration Sisters Event Decor (Railway)
+# Builds both the static React frontend (dist/) and compiled Express backend (dist-server/server.mjs).
+# Never runs Vite dev or Vite preview in production.
+
+FROM node:22-alpine AS builder
 WORKDIR /app
+
 COPY package.json ./
 RUN npm install --no-audit --no-fund
+
 COPY . .
 RUN npm run build
+
+FROM node:22-alpine AS runner
+WORKDIR /app
+
 ENV NODE_ENV=production
+ENV PORT=3000
+
+COPY package.json ./
+RUN npm install --omit=dev --no-audit --no-fund
+
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/dist-server ./dist-server
+COPY --from=builder /app/db/migrations ./db/migrations
+
 EXPOSE 3000
-CMD ["sh", "-c", "./node_modules/.bin/vite preview --host 0.0.0.0 --port ${PORT:-3000}"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:${PORT:-3000}/health || exit 1
+
+CMD ["node", "dist-server/server.mjs"]

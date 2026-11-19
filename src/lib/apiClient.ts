@@ -9,6 +9,12 @@ export interface ApiEnvConfig {
   baseUrl?: string;
 }
 
+let activeAccessToken: string | null = null;
+
+export function setApiAccessToken(token: string | null): void {
+  activeAccessToken = token && token.trim().length > 0 ? token.trim() : null;
+}
+
 export function sanitizeApiBaseUrl(rawUrl: string | undefined): string {
   const trimmed = (rawUrl || '').trim().replace(/\/+$/, '');
   if (!trimmed) return '';
@@ -66,6 +72,14 @@ export function buildApiResponseNotConfigured(): Response {
   );
 }
 
+export async function readApiJson<T = Record<string, unknown>>(response: Response): Promise<T> {
+  try {
+    return (await response.json()) as T;
+  } catch {
+    return {} as T;
+  }
+}
+
 export function apiFetch(
   path: string,
   init?: RequestInit,
@@ -81,8 +95,17 @@ export function apiFetch(
     return Promise.resolve(buildApiResponseNotConfigured());
   }
 
+  const headers = new Headers(init?.headers || {});
+  if (!headers.has('X-Requested-With')) {
+    headers.set('X-Requested-With', 'XMLHttpRequest');
+  }
+  if (activeAccessToken && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${activeAccessToken}`);
+  }
+
   return fetch(`${resolved.configuredApiBase}${path}`, {
     credentials: 'include',
     ...init,
+    headers,
   });
 }

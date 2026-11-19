@@ -105,7 +105,13 @@ export function PortalsWorkspace({
         apiFetch('/api/bookings', { credentials: 'include' }),
         apiFetch('/api/concepts', { credentials: 'include' }),
       ]);
-      if (bkgRes.ok) {
+      if (bkgRes.status === 401 || bkgRes.status === 403) {
+        const errBody = await bkgRes.json().catch(() => ({}));
+        setActionMessage({
+          type: 'err',
+          text: errBody.error || 'Your session expired or lacks permission to load workspace records.',
+        });
+      } else if (bkgRes.ok) {
         const bkgJson = await bkgRes.json();
         const list: BookingRecord[] = bkgJson.bookings || [];
         setBookings(list);
@@ -118,12 +124,12 @@ export function PortalsWorkspace({
         setConcepts(cncJson.concepts || []);
       }
 
-      if (['vendor', 'staff', 'admin'].includes(currentUser.role)) {
+      if (['vendor', 'event_planner', 'staff', 'admin'].includes(currentUser.role)) {
         const vRes = await apiFetch('/api/vendors', { credentials: 'include' });
         if (vRes.ok) setVendors((await vRes.json()).vendors || []);
       }
 
-      if (['staff', 'admin'].includes(currentUser.role)) {
+      if (['event_planner', 'staff', 'admin'].includes(currentUser.role)) {
         const [chkRes, invRes] = await Promise.all([
           apiFetch('/api/staff/checklists', { credentials: 'include' }),
           apiFetch('/api/inventory', { credentials: 'include' }),
@@ -138,6 +144,11 @@ export function PortalsWorkspace({
       } else {
         setAdminData(null);
       }
+    } catch {
+      setActionMessage({
+        type: 'err',
+        text: 'Unable to reach the Celebration Sisters API backend. Check your connection and try again.',
+      });
     } finally {
       setLoading(false);
     }
@@ -889,8 +900,8 @@ export function PortalsWorkspace({
               </div>
             ))}
           </div>
-        ) : currentUser.role === 'staff' ? (
-          /* STAFF PRODUCTION PORTAL */
+        ) : currentUser.role === 'staff' || currentUser.role === 'event_planner' ? (
+          /* STAFF & EVENT PLANNER PRODUCTION PORTAL */
           <div className="space-y-6">
             {checklists.map((chk) => (
               <div key={chk.id} className="bg-white border border-[var(--cs-border)] rounded-lg p-6 space-y-5">

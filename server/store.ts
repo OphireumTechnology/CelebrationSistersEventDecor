@@ -12,6 +12,7 @@ import type {
   BookingStatus,
   DesignConceptRecord,
   InventoryItem,
+  NotificationDeliveryRecord,
   StaffChecklistRecord,
   StaffVendorInvitation,
   UserRole,
@@ -20,6 +21,12 @@ import type {
 } from '../src/types/domain.ts';
 import { VALID_BOOKING_TRANSITIONS } from '../src/types/domain.ts';
 import { LEGACY_TO_ARCH_STATUS } from '../src/types/lifecycle.ts';
+import {
+  assertPersistenceReady,
+  getPersistenceAdapterMode,
+  readDbFromPostgres,
+  runPostgresTransaction,
+} from './repositories/postgresRepository.ts';
 
 export interface DatabaseSchema {
   users: UserSession[];
@@ -36,6 +43,8 @@ export interface DatabaseSchema {
   auditLogs: AuditLogEntry[];
   invitations: StaffVendorInvitation[];
   authSecurityEvents: AuthSecurityEvent[];
+  notificationDeliveries: NotificationDeliveryRecord[];
+  bookingIdempotencyKeys: Record<string, string>;
 }
 
 function getDbPath(): string {
@@ -452,7 +461,24 @@ function buildInitialSeed(): DatabaseSchema {
     ],
     invitations: [],
     authSecurityEvents: [],
+    notificationDeliveries: [],
+    bookingIdempotencyKeys: {},
   };
+}
+
+function normalizeSchema(parsed: DatabaseSchema): DatabaseSchema {
+  parsed.availabilityHolds = parsed.availabilityHolds || [];
+  parsed.blackoutDates = parsed.blackoutDates || [];
+  parsed.invitations = parsed.invitations || [];
+  parsed.authSecurityEvents = parsed.authSecurityEvents || [];
+  parsed.notificationDeliveries = parsed.notificationDeliveries || [];
+  parsed.bookingIdempotencyKeys = parsed.bookingIdempotencyKeys || {};
+  for (const b of parsed.bookings || []) {
+    if (!b.architecturalStage) {
+      b.architecturalStage = LEGACY_TO_ARCH_STATUS[b.status] ?? 'INQUIRY';
+    }
+  }
+  return parsed;
 }
 
 let writeLock: Promise<void> = Promise.resolve();
@@ -470,23 +496,24 @@ async function ensureDbFile(): Promise<string> {
 }
 
 export async function readDb(): Promise<DatabaseSchema> {
+  assertPersistenceReady();
+  if (getPersistenceAdapterMode() === 'postgres') {
+    const raw = await readDbFromPostgres(buildInitialSeed);
+    return normalizeSchema(raw);
+  }
+
   const dbPath = await ensureDbFile();
   const raw = await fs.readFile(dbPath, 'utf8');
   const parsed = JSON.parse(raw) as DatabaseSchema;
-  // Backward-compatible backfill for Phase 1/2 records
-  parsed.availabilityHolds = parsed.availabilityHolds || [];
-  parsed.blackoutDates = parsed.blackoutDates || [];
-  parsed.invitations = parsed.invitations || [];
-  parsed.authSecurityEvents = parsed.authSecurityEvents || [];
-  for (const b of parsed.bookings || []) {
-    if (!b.architecturalStage) {
-      b.architecturalStage = LEGACY_TO_ARCH_STATUS[b.status] ?? 'INQUIRY';
-    }
-  }
-  return parsed;
+  return normalizeSchema(parsed);
 }
 
 export async function withTransaction<T>(fn: (db: DatabaseSchema) => Promise<T> | T): Promise<T> {
+  assertPersistenceReady();
+  if (getPersistenceAdapterMode() === 'postgres') {
+    return runPostgresTransaction(buildInitialSeed, normalizeSchema, fn);
+  }
+
   let release!: () => void;
   const prevLock = writeLock;
   writeLock = new Promise<void>((resolve) => {
@@ -495,7 +522,8 @@ export async function withTransaction<T>(fn: (db: DatabaseSchema) => Promise<T> 
   await prevLock;
   try {
     const dbPath = await ensureDbFile();
-    const db = await readDb();
+    const raw = await fs.readFile(dbPath, 'utf8');
+    const db = normalizeSchema(JSON.parse(raw) as DatabaseSchema);
     const result = await fn(db);
     const tmpPath = `${dbPath}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}.tmp`;
     await fs.writeFile(tmpPath, JSON.stringify(db, null, 2), 'utf8');
@@ -504,6 +532,11 @@ export async function withTransaction<T>(fn: (db: DatabaseSchema) => Promise<T> 
   } finally {
     release();
   }
+}
+
+export function sanitizeUserForClient(user: UserSession): Omit<UserSession, 'totpSecret'> {
+  const { totpSecret: _omitted, ...safeUser } = user;
+  return safeUser;
 }
 
 export function appendAudit(

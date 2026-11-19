@@ -46,6 +46,35 @@ export interface UserSession {
   emailVerified?: boolean;
   accountStatus?: AccountStatus;
   mfaEnrolled?: boolean;
+  /** Server-side TOTP secret (never returned to browser clients). */
+  totpSecret?: string;
+}
+
+export interface NotificationDeliveryRecord {
+  id: string;
+  idempotencyKey: string;
+  category:
+    | 'consultation_confirmation'
+    | 'staff_new_booking_alert'
+    | 'booking_status_update'
+    | 'admin_security_alert';
+  channel: 'Email' | 'SMS' | 'Internal Task';
+  provider: 'resend' | 'unconfigured';
+  recipient: string;
+  bookingReference?: string;
+  subject: string;
+  status:
+    | 'Queued'
+    | 'ProviderAccepted'
+    | 'Delivered'
+    | 'Failed'
+    | 'Skipped (Unconfigured)'
+    | 'Skipped (Unauthorized)';
+  providerMessageId?: string;
+  attempts: number;
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface StaffVendorInvitation {
@@ -73,10 +102,12 @@ export interface AuthSecurityEvent {
     | 'TOKEN_REJECTED'
     | 'CSRF_REJECTED'
     | 'SPOOF_ATTEMPT'
+    | 'EMAIL_PRIVILEGE_BIND_BLOCKED'
     | 'SUSPENDED_ACCOUNT_BLOCKED'
     | 'UNVERIFIED_EMAIL_BLOCKED'
     | 'MFA_VERIFIED'
     | 'MFA_FAILED'
+    | 'ACCOUNT_LINKED'
     | 'INVITATION_ISSUED'
     | 'INVITATION_ACCEPTED'
     | 'INVITATION_REVOKED'

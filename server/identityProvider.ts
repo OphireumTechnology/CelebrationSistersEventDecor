@@ -169,38 +169,77 @@ export async function verifyProviderAccessToken(
 
 /**
  * Resolves a verified provider identity strictly against trusted server records.
- * Self-registered accounts NEVER receive privileged roles from client-supplied claims.
+ * Security invariants:
+ * - Privileged accounts (admin, staff, event_planner, vendor) MUST match by immutable supabaseUserId === claims.sub.
+ * - Email address matching NEVER grants access to an existing privileged account or overwrites an existing supabaseUserId.
+ * - Unmatched accounts strictly receive the least-privileged 'client' role.
  */
 export function resolveTrustedUserFromClaims(
   claims: VerifiedProviderClaims,
   registeredUsers: UserSession[],
-): { user: UserSession; accountStatus: AccountStatus; emailVerified: boolean; mfaVerified: boolean } {
-  const matched = registeredUsers.find(
-    (u) =>
-      (u.supabaseUserId && u.supabaseUserId === claims.sub) ||
-      (claims.email && u.email.toLowerCase() === claims.email.toLowerCase()),
+): {
+  user: UserSession;
+  accountStatus: AccountStatus;
+  emailVerified: boolean;
+  mfaVerified: boolean;
+  emailPrivilegeBindBlocked: boolean;
+} {
+  // 1. Primary authoritative lookup: immutable Supabase subject UUID
+  const byImmutableSub = registeredUsers.find(
+    (u) => Boolean(u.supabaseUserId) && u.supabaseUserId === claims.sub,
   );
 
-  if (matched) {
-    const accountStatus: AccountStatus = matched.accountStatus ?? 'active';
-    const role: UserRole = matched.role;
+  if (byImmutableSub) {
+    const accountStatus: AccountStatus = byImmutableSub.accountStatus ?? 'active';
+    const role: UserRole = byImmutableSub.role;
     const isAdmin = role === 'admin';
-    const mfaVerified = isAdmin ? claims.aal === 'aal2' : claims.aal === 'aal2' || !matched.mfaEnrolled;
+    const mfaVerified = isAdmin ? claims.aal === 'aal2' : claims.aal === 'aal2' || !byImmutableSub.mfaEnrolled;
 
     return {
       user: {
-        ...matched,
-        supabaseUserId: matched.supabaseUserId || claims.sub,
+        ...byImmutableSub,
         emailVerified: claims.emailVerified,
         accountStatus,
       },
       accountStatus,
       emailVerified: claims.emailVerified,
       mfaVerified,
+      emailPrivilegeBindBlocked: false,
     };
   }
 
-  // Unmatched verified provider accounts receive strictly the least-privileged 'client' role.
+  // 2. Check if an unlinked account shares this email
+  const emailCandidate = claims.email
+    ? registeredUsers.find((u) => u.email.toLowerCase() === claims.email.toLowerCase())
+    : undefined;
+
+  let emailPrivilegeBindBlocked = false;
+  if (emailCandidate) {
+    const isPrivileged = emailCandidate.role !== 'client';
+    const alreadyLinkedElsewhere = Boolean(emailCandidate.supabaseUserId && emailCandidate.supabaseUserId !== claims.sub);
+
+    if (isPrivileged || alreadyLinkedElsewhere) {
+      // NEVER grant privileged roles or cross-link an already-bound account based on email alone.
+      emailPrivilegeBindBlocked = true;
+    } else if (claims.emailVerified) {
+      // Safe one-way migration for unlinked, verified least-privileged client record only
+      const accountStatus: AccountStatus = emailCandidate.accountStatus ?? 'active';
+      return {
+        user: {
+          ...emailCandidate,
+          supabaseUserId: claims.sub,
+          emailVerified: true,
+          accountStatus,
+        },
+        accountStatus,
+        emailVerified: true,
+        mfaVerified: claims.aal === 'aal2',
+        emailPrivilegeBindBlocked: false,
+      };
+    }
+  }
+
+  // 3. Unmatched verified provider accounts receive strictly the least-privileged 'client' role.
   const fullNameClaim =
     typeof claims.rawClaims.user_metadata === 'object' &&
     claims.rawClaims.user_metadata &&
@@ -223,5 +262,6 @@ export function resolveTrustedUserFromClaims(
     accountStatus,
     emailVerified: claims.emailVerified,
     mfaVerified: claims.aal === 'aal2',
+    emailPrivilegeBindBlocked,
   };
 }
