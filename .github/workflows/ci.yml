@@ -25,7 +25,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'npm'
+          # npm caching requires a committed npm lockfile; this repository
+          # currently has only bun.lock. Restore caching after committing
+          # a validated package-lock.json and switching installs to npm ci.
 
       - name: Install deterministic dependencies
         run: npm ci --no-audit --no-fund
