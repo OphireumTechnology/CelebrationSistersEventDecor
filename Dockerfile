@@ -2,8 +2,10 @@
 # Uses deterministic npm ci backed by committed package-lock.json.
 # Builds both the static React frontend (dist/) and compiled Express backend (dist-server/server.mjs).
 # Never runs Vite dev or Vite preview in production.
+# Debian glibc is required by the committed Rolldown linux-x64-gnu native binding;
+# Alpine musl is not supported by this lockfile.
 
-FROM node:22-alpine AS builder
+FROM node:22-bookworm-slim AS builder
 WORKDIR /app
 
 COPY package.json package-lock.json ./
@@ -12,7 +14,7 @@ RUN npm ci --no-audit --no-fund
 COPY . .
 RUN npm run build
 
-FROM node:22-alpine AS runner
+FROM node:22-bookworm-slim AS runner
 WORKDIR /app
 
 ENV NODE_ENV=production
