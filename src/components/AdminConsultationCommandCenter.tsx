@@ -109,6 +109,27 @@ function formatMethod(method: ConsultationMethod): string {
   return 'Video';
 }
 
+function getStudioTodayIso(): string {
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/New_York',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(new Date());
+    const map: Record<string, string> = {};
+    for (const p of parts) {
+      if (p.type !== 'literal') map[p.type] = p.value;
+    }
+    if (map.year && map.month && map.day) {
+      return `${map.year}-${map.month}-${map.day}`;
+    }
+  } catch {
+    // Fallback to UTC date if Intl timezone data is unavailable
+  }
+  return new Date().toISOString().slice(0, 10);
+}
+
 export function AdminConsultationCommandCenter({
   currentRole,
   onWorkspaceRefresh,
@@ -117,7 +138,7 @@ export function AdminConsultationCommandCenter({
     'calendar' | 'crm' | 'staff' | 'proposals' | 'notifications' | 'audit'
   >('calendar');
   const [calendarMode, setCalendarMode] = useState<'day' | 'week' | 'month'>('week');
-  const [anchorDate, setAnchorDate] = useState<string>(() => new Date().toISOString().slice(0, 10));
+  const [anchorDate, setAnchorDate] = useState<string>(() => getStudioTodayIso());
   const [statusFilter, setStatusFilter] = useState<string>('');
   const [plannerFilter, setPlannerFilter] = useState<string>('');
   const [searchQuery, setSearchQuery] = useState('');
@@ -157,7 +178,7 @@ export function AdminConsultationCommandCenter({
   const [adminRescheduleSlots, setAdminRescheduleSlots] = useState<
     Array<{ slotId: string; startUtc: string; plannerId: string; plannerName: string; studioDisplayLabel: string; dateLocal: string }>
   >([]);
-  const [adminSelectedSlotUtc, setAdminSelectedSlotUtc] = useState('');
+  const [adminSelectedSlotId, setAdminSelectedSlotId] = useState('');
   const [adminRescheduleReason, setAdminRescheduleReason] = useState('Rescheduled by studio coordinator');
   const [outboxStatusFilter, setOutboxStatusFilter] = useState<string>('ALL');
 
@@ -373,9 +394,9 @@ export function AdminConsultationCommandCenter({
   const openAdminReschedule = async () => {
     if (!selectedConsultation) return;
     setAdminRescheduleOpen(true);
-    setAdminSelectedSlotUtc('');
+    setAdminSelectedSlotId('');
     try {
-      const startDate = new Date().toISOString().slice(0, 10);
+      const startDate = getStudioTodayIso();
       const params = new URLSearchParams({
         startDate,
         days: '14',
@@ -408,7 +429,7 @@ export function AdminConsultationCommandCenter({
         }
       }
       setAdminRescheduleSlots(flatSlots.slice(0, 24));
-      if (flatSlots[0]) setAdminSelectedSlotUtc(flatSlots[0].startUtc);
+      if (flatSlots[0]) setAdminSelectedSlotId(flatSlots[0].slotId);
     } catch {
       setFeedback({ type: 'err', text: 'Unable to load available reschedule slots.' });
     }
@@ -416,14 +437,15 @@ export function AdminConsultationCommandCenter({
 
   const handleAdminRescheduleSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    if (!selectedConsultation || !adminSelectedSlotUtc) return;
-    const picked = adminRescheduleSlots.find((s) => s.startUtc === adminSelectedSlotUtc);
+    if (!selectedConsultation || !adminSelectedSlotId) return;
+    const picked = adminRescheduleSlots.find((s) => s.slotId === adminSelectedSlotId);
+    if (!picked) return;
     const ok = await runAction(
       `/api/consultations/${selectedConsultation.id}/reschedule`,
       'POST',
       {
-        newStartUtc: adminSelectedSlotUtc,
-        plannerId: picked?.plannerId || selectedConsultation.assignedPlannerId,
+        newStartUtc: picked.startUtc,
+        plannerId: picked.plannerId || selectedConsultation.assignedPlannerId,
         reason: adminRescheduleReason.trim() || 'Rescheduled by studio coordinator',
       },
       `Rescheduled ${selectedConsultation.referenceCode} and released previous slot.`,
@@ -739,13 +761,13 @@ export function AdminConsultationCommandCenter({
                       <p className="font-semibold text-[var(--cs-purple)]">Admin Reschedule (ET Studio Availability)</p>
                       <select
                         required
-                        value={adminSelectedSlotUtc}
-                        onChange={(e) => setAdminSelectedSlotUtc(e.target.value)}
+                        value={adminSelectedSlotId}
+                        onChange={(e) => setAdminSelectedSlotId(e.target.value)}
                         className="w-full min-h-[40px] px-2.5 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md bg-white tabular-nums"
                       >
                         {adminRescheduleSlots.length === 0 && <option value="">Loading available slots...</option>}
                         {adminRescheduleSlots.map((slot) => (
-                          <option key={slot.slotId} value={slot.startUtc}>
+                          <option key={slot.slotId} value={slot.slotId}>
                             {slot.dateLocal} · {slot.studioDisplayLabel} ({slot.plannerName})
                           </option>
                         ))}
@@ -759,7 +781,7 @@ export function AdminConsultationCommandCenter({
                       />
                       <button
                         type="submit"
-                        disabled={!adminSelectedSlotUtc}
+                        disabled={!adminSelectedSlotId}
                         className="w-full min-h-[40px] px-3 py-2 text-xs font-medium text-white bg-[var(--cs-purple)] rounded-md cursor-pointer disabled:opacity-50"
                       >
                         Confirm Admin Reschedule

@@ -14,8 +14,8 @@
 
 ## 1. Executive Summary for System Owner
 
-All application source code, database migrations (`001`–`008`), security guards, transactional email outbox, administrative MFA workflows, and automated test suites are complete and verified:
-- **Automated Regression Suite:** `102 / 102` passing (`0` failures, `0` warnings/errors in TypeScript + Oxlint).
+All application source code, database migrations (`001`–`008` with FORCE RLS write policies), security guards (Supabase login/password-reset, TOTP MFA enrollment/recovery UI, superseded `aal1` JTI revocation), transactional email outbox (RFC 2606 production placeholder guard, `email.failed` & `email.delivery_delayed` signed webhook reconciliation), operational readiness/rollback verification (`scripts/verify-deployment-and-rollback.ts`), and automated test suites are complete and verified:
+- **Automated Regression Suite:** `113 / 113` passing (`0` failures, `0` errors in TypeScript + Oxlint, `0` secret scan matches).
 - **Compiled Chromium Browser Acceptance:** `20 / 20` passing (Desktop `1440×900` & Mobile `390×844`, `0` console/page errors, `0px` overflow).
 - **Live Read-Only Website Verification:** `https://celebrationsistersdecor.com/` loads cleanly in real Chromium (`0` broken images, `0` console errors, `0px` overflow) and fetches live consultation slots from Railway.
 - **Hosted GitHub Actions (`main` `288d20ea`):** CI + `npm audit --audit-level=high` + Docker image build (`Run 44679267813`) and GitHub Pages deployment (`Run 44679267814`) are **green**.

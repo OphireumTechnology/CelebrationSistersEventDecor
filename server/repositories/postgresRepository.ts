@@ -358,7 +358,7 @@ export async function checkPersistenceHealth(): Promise<PersistenceReadinessStat
       let migrationsAppliedCount = 0;
       if (migrationsTablePresent) {
         const countRes = await pool.query<{ cnt: string | number }>(
-          'SELECT COUNT(*)::int AS cnt FROM schema_migrations',
+          `SELECT COUNT(DISTINCT COALESCE(NULLIF(substring(version FROM '^[0-9]{3}'), ''), version))::int AS cnt FROM schema_migrations`,
         );
         migrationsAppliedCount = Number(countRes.rows[0]?.cnt ?? 0);
       }

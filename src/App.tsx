@@ -12,7 +12,7 @@ import { PortfolioAndAboutView } from './components/PortfolioAndAboutView';
 import { PortalsWorkspace } from './components/PortalsWorkspace';
 import { PublicHomeView } from './components/PublicHomeView';
 import { ServiceDivisionCatalog } from './components/ServiceDivisionCatalog';
-import { apiFetch, isBackendConfigured, setApiCsrfToken } from './lib/apiClient';
+import { apiFetch, isBackendConfigured, setApiAccessToken, setApiCsrfToken } from './lib/apiClient';
 import type { UserSession } from './types/domain';
 
 const DEFAULT_GUEST: UserSession = {
@@ -22,6 +22,14 @@ const DEFAULT_GUEST: UserSession = {
   role: 'guest',
 };
 
+export interface TotpEnrollmentResult {
+  ok: boolean;
+  error?: string;
+  secret?: string;
+  otpauthUri?: string;
+  recoveryCodes?: string[];
+}
+
 export default function App() {
   const [activeRoute, setActiveRoute] = useState<AppRoute>('home');
   const [selectedServiceId, setSelectedServiceId] = useState<string | null>(null);
@@ -29,6 +37,8 @@ export default function App() {
   const [personas, setPersonas] = useState<UserSession[]>([]);
   const [currentUser, setCurrentUser] = useState<UserSession>(DEFAULT_GUEST);
   const [mfaRequired, setMfaRequired] = useState(false);
+  const [mfaEnrolled, setMfaEnrolled] = useState(false);
+  const [authProviderReady, setAuthProviderReady] = useState(false);
 
   const [bookingModalOpen, setBookingModalOpen] = useState(false);
   const [bookingPrefill, setBookingPrefill] = useState<{
@@ -55,10 +65,12 @@ export default function App() {
           if (sData.user) {
             setCurrentUser(sData.user);
             setMfaRequired(Boolean(sData.mfaRequired));
+            setMfaEnrolled(Boolean(sData.mfaEnrolled || sData.user.mfaEnrolled));
           }
         }
         if (configRes.ok) {
           const cfg = await configRes.json();
+          setAuthProviderReady(Boolean(cfg.readyForProductionAuth));
           if (cfg.demoPersonasAvailable === true) {
             const personasRes = await apiFetch('/api/auth/personas', { credentials: 'include' });
             if (personasRes.ok) {
@@ -86,6 +98,50 @@ export default function App() {
     setApiCsrfToken(data.csrfToken ?? null);
     setCurrentUser(data.user);
     setMfaRequired(Boolean(data.mfaRequired));
+    setMfaEnrolled(Boolean(data.user?.mfaEnrolled));
+  };
+
+  const handleEmailLogin = async (
+    email: string,
+    password: string,
+  ): Promise<{ ok: boolean; error?: string }> => {
+    try {
+      const res = await apiFetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ email, password }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        return { ok: false, error: data.error || 'Sign-in failed. Verify your email and password.' };
+      }
+      setApiCsrfToken(data.csrfToken ?? null);
+      setCurrentUser(data.user);
+      setMfaRequired(Boolean(data.mfaRequired));
+      setMfaEnrolled(Boolean(data.mfaEnrolled || data.user?.mfaEnrolled));
+      return { ok: true };
+    } catch {
+      return { ok: false, error: 'Unable to reach the authentication server.' };
+    }
+  };
+
+  const handlePasswordReset = async (email: string): Promise<{ ok: boolean; message?: string; error?: string }> => {
+    try {
+      const res = await apiFetch('/api/auth/password-reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ email }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        return { ok: false, error: data.error || 'Password reset request could not be completed.' };
+      }
+      return { ok: true, message: data.message || 'Recovery instructions dispatched.' };
+    } catch {
+      return { ok: false, error: 'Unable to reach the authentication server.' };
+    }
   };
 
   const handleVerifyMfa = async (code: string): Promise<{ ok: boolean; error?: string }> => {
@@ -105,11 +161,60 @@ export default function App() {
     return { ok: true };
   };
 
+  const handleEnrollTotp = async (recoveryCode?: string): Promise<TotpEnrollmentResult> => {
+    try {
+      const res = await apiFetch('/api/auth/mfa/totp/enroll', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify(recoveryCode ? { recoveryCode } : {}),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        return { ok: false, error: data.error || 'Unable to enroll TOTP authenticator.' };
+      }
+      setMfaEnrolled(true);
+      return {
+        ok: true,
+        secret: data.secret,
+        otpauthUri: data.otpauthUri,
+        recoveryCodes: Array.isArray(data.recoveryCodes) ? data.recoveryCodes : [],
+      };
+    } catch {
+      return { ok: false, error: 'Unable to reach the MFA enrollment endpoint.' };
+    }
+  };
+
+  const handleRecoverMfa = async (
+    recoveryCode: string,
+  ): Promise<{ ok: boolean; remainingRecoveryCodes?: number; error?: string }> => {
+    try {
+      const res = await apiFetch('/api/auth/mfa/recover', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ recoveryCode }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        return { ok: false, error: data.error || 'Invalid or already-used recovery code.' };
+      }
+      setApiCsrfToken(data.csrfToken ?? null);
+      setMfaRequired(false);
+      setCurrentUser(data.user);
+      return { ok: true, remainingRecoveryCodes: data.remainingRecoveryCodes };
+    } catch {
+      return { ok: false, error: 'Unable to verify recovery code.' };
+    }
+  };
+
   const handleLogout = async () => {
     await apiFetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
+    setApiAccessToken(null);
     setApiCsrfToken(null);
     setCurrentUser(DEFAULT_GUEST);
     setMfaRequired(false);
+    setMfaEnrolled(false);
   };
 
   const openBooking = (serviceId?: string) => {
@@ -180,9 +285,15 @@ export default function App() {
           <PortalsWorkspace
             currentUser={currentUser}
             mfaRequired={mfaRequired}
+            mfaEnrolled={mfaEnrolled}
+            authProviderReady={authProviderReady}
             personas={personas}
             onSwitchPersona={handleSwitchPersona}
+            onEmailLogin={handleEmailLogin}
+            onPasswordReset={handlePasswordReset}
             onVerifyMfa={handleVerifyMfa}
+            onEnrollTotp={handleEnrollTotp}
+            onRecoverMfa={handleRecoverMfa}
             onLogout={handleLogout}
           />
         )}

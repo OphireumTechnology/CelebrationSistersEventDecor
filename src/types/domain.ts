@@ -165,6 +165,7 @@ export interface AuthSecurityEvent {
     | 'INVITATION_ISSUED'
     | 'INVITATION_ACCEPTED'
     | 'INVITATION_REVOKED'
+    | 'PASSWORD_RESET_REQUESTED'
     | 'LOGOUT';
   userId?: string;
   emailHash?: string;

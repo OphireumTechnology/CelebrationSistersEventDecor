@@ -31,6 +31,7 @@ export interface CreateNormalizedBookingInput {
   notes: string;
   legacyStatus: string;
   architecturalStage: string;
+  actor?: NormalizedActorContext;
   outboxJobs?: {
     idempotencyKey: string;
     category: string;
@@ -70,6 +71,7 @@ export interface CreateNormalizedQuoteInput {
   discountReason?: string;
   discountApproved: boolean;
   discountApprovedBy?: string;
+  actor?: NormalizedActorContext;
   notes: string;
 }
 
@@ -104,6 +106,7 @@ export interface CreateNormalizedConsultationInput {
   privacyConsentVersion: string;
   accessTokenHash: string;
   plannerNotes: string;
+  actor?: NormalizedActorContext;
   outboxJobs?: {
     idempotencyKey: string;
     category: string;
@@ -182,6 +185,13 @@ export class PostgresNormalizedRepository implements NormalizedPersistenceReposi
     input: CreateNormalizedBookingInput,
   ): Promise<{ booking: NormalizedBookingRow; deduplicated: boolean }> {
     return this.runTx(async (client) => {
+      await applyTransactionActorContext(
+        client,
+        input.actor ?? {
+          userId: '00000000-0000-0000-0000-000000000000',
+          role: 'staff',
+        },
+      );
       if (input.idempotencyKey) {
         const existingKey = await client.query<{ booking_id: string }>(
           'SELECT booking_id FROM booking_idempotency_keys WHERE idempotency_key = $1',
@@ -329,6 +339,13 @@ export class PostgresNormalizedRepository implements NormalizedPersistenceReposi
     input: CreateNormalizedQuoteInput,
   ): Promise<{ quotationId: string; versionNumber: number; subtotalCents: number; totalCents: number }> {
     return this.runTx(async (client) => {
+      await applyTransactionActorContext(
+        client,
+        input.actor ?? {
+          userId: '00000000-0000-0000-0000-000000000000',
+          role: 'staff',
+        },
+      );
       const subtotalCents = input.items.reduce(
         (sum, item) => sum + Math.round(item.quantity) * Math.round(item.unitPriceCents),
         0,
@@ -424,6 +441,13 @@ export class PostgresNormalizedRepository implements NormalizedPersistenceReposi
     input: CreateNormalizedConsultationInput,
   ): Promise<{ consultation: NormalizedConsultationRow; deduplicated: boolean }> {
     return this.runTx(async (client) => {
+      await applyTransactionActorContext(
+        client,
+        input.actor ?? {
+          userId: input.assignedPlannerId || '00000000-0000-0000-0000-000000000000',
+          role: 'staff',
+        },
+      );
       if (input.idempotencyKey) {
         const existing = await client.query<NormalizedConsultationRow>(
           'SELECT * FROM consultations WHERE idempotency_key = $1',

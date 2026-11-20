@@ -36,9 +36,23 @@ import { BrandLogo } from './BrandLogo';
 interface PortalsWorkspaceProps {
   currentUser: UserSession;
   mfaRequired: boolean;
+  mfaEnrolled?: boolean;
+  authProviderReady?: boolean;
   personas: UserSession[];
   onSwitchPersona: (user: UserSession) => Promise<void>;
+  onEmailLogin?: (email: string, password: string) => Promise<{ ok: boolean; error?: string }>;
+  onPasswordReset?: (email: string) => Promise<{ ok: boolean; message?: string; error?: string }>;
   onVerifyMfa: (code: string) => Promise<{ ok: boolean; error?: string }>;
+  onEnrollTotp?: (recoveryCode?: string) => Promise<{
+    ok: boolean;
+    error?: string;
+    secret?: string;
+    otpauthUri?: string;
+    recoveryCodes?: string[];
+  }>;
+  onRecoverMfa?: (
+    recoveryCode: string,
+  ) => Promise<{ ok: boolean; remainingRecoveryCodes?: number; error?: string }>;
   onLogout: () => Promise<void>;
 }
 
@@ -61,9 +75,15 @@ interface AdminOverviewData {
 export function PortalsWorkspace({
   currentUser,
   mfaRequired,
+  mfaEnrolled = false,
+  authProviderReady = false,
   personas,
   onSwitchPersona,
+  onEmailLogin,
+  onPasswordReset,
   onVerifyMfa,
+  onEnrollTotp,
+  onRecoverMfa,
   onLogout,
 }: PortalsWorkspaceProps) {
   const [bookings, setBookings] = useState<BookingRecord[]>([]);
@@ -77,7 +97,19 @@ export function PortalsWorkspace({
   const [loading, setLoading] = useState(false);
   const [actionMessage, setActionMessage] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
 
+  const [loginMode, setLoginMode] = useState<'login' | 'reset'>('login');
+  const [loginEmail, setLoginEmail] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+
   const [mfaCode, setMfaCode] = useState('');
+  const [mfaMode, setMfaMode] = useState<'totp' | 'recovery' | 'enroll'>('totp');
+  const [recoveryCodeInput, setRecoveryCodeInput] = useState('');
+  const [totpEnrollment, setTotpEnrollment] = useState<{
+    secret: string;
+    otpauthUri: string;
+    recoveryCodes: string[];
+  } | null>(null);
   const [signatureInput, setSignatureInput] = useState(currentUser.name);
   const [portalMessage, setPortalMessage] = useState('');
   const [issueSummary, setIssueSummary] = useState('');
@@ -166,6 +198,45 @@ export function PortalsWorkspace({
 
   const activeBooking = bookings.find((b) => b.id === selectedBookingId) || bookings[0];
 
+  const handleLoginSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!onEmailLogin || authSubmitting) return;
+    setActionMessage(null);
+    setAuthSubmitting(true);
+    try {
+      const result = await onEmailLogin(loginEmail.trim(), loginPassword);
+      if (!result.ok) {
+        setActionMessage({ type: 'err', text: result.error || 'Sign-in failed.' });
+        return;
+      }
+      setLoginPassword('');
+      setActionMessage({ type: 'ok', text: 'Authenticated portal session established.' });
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const handlePasswordResetSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!onPasswordReset || authSubmitting) return;
+    setActionMessage(null);
+    setAuthSubmitting(true);
+    try {
+      const result = await onPasswordReset(loginEmail.trim());
+      if (!result.ok) {
+        setActionMessage({ type: 'err', text: result.error || 'Unable to submit password reset.' });
+        return;
+      }
+      setActionMessage({
+        type: 'ok',
+        text: result.message || 'If an account matches that email, recovery instructions have been sent.',
+      });
+      setLoginMode('login');
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
   const handleMfaSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setActionMessage(null);
@@ -175,8 +246,57 @@ export function PortalsWorkspace({
       return;
     }
     setMfaCode('');
+    setTotpEnrollment(null);
     setActionMessage({ type: 'ok', text: 'Executive MFA verification succeeded.' });
     await loadWorkspaceData();
+  };
+
+  const handleEnrollTotpClick = async () => {
+    if (!onEnrollTotp || authSubmitting) return;
+    setActionMessage(null);
+    setAuthSubmitting(true);
+    try {
+      const result = await onEnrollTotp();
+      if (!result.ok || !result.secret || !result.otpauthUri) {
+        setActionMessage({ type: 'err', text: result.error || 'Unable to generate authenticator enrollment.' });
+        return;
+      }
+      setTotpEnrollment({
+        secret: result.secret,
+        otpauthUri: result.otpauthUri,
+        recoveryCodes: result.recoveryCodes || [],
+      });
+      setMfaMode('enroll');
+      setActionMessage({
+        type: 'ok',
+        text: 'TOTP secret generated. Save your single-use recovery codes, then verify with a 6-digit authenticator code.',
+      });
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const handleRecoverMfaSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!onRecoverMfa || authSubmitting) return;
+    setActionMessage(null);
+    setAuthSubmitting(true);
+    try {
+      const result = await onRecoverMfa(recoveryCodeInput.trim());
+      if (!result.ok) {
+        setActionMessage({ type: 'err', text: result.error || 'Recovery code rejected.' });
+        return;
+      }
+      setRecoveryCodeInput('');
+      setMfaMode('totp');
+      setActionMessage({
+        type: 'ok',
+        text: `Executive MFA recovered (${result.remainingRecoveryCodes ?? 0} recovery codes remaining).`,
+      });
+      await loadWorkspaceData();
+    } finally {
+      setAuthSubmitting(false);
+    }
   };
 
   const handleSignContract = async (e: FormEvent) => {
@@ -467,45 +587,223 @@ export function PortalsWorkspace({
         )}
 
         {currentUser.role === 'guest' ? (
-          <div className="bg-white border border-[var(--cs-border)] rounded-lg p-12 text-center space-y-4">
-            <Lock className="w-10 h-10 text-[var(--cs-purple)] mx-auto" />
-            <h2 className="font-display text-2xl font-semibold text-[var(--cs-purple)]">
-              Protected Client & Operations Workspaces
-            </h2>
-            <p className="text-sm text-[var(--cs-charcoal-muted)] max-w-lg mx-auto">
-              Select an authenticated Client, Vendor, Staff Planner, or Executive Director account above to issue a signed HttpOnly session cookie and access role-isolated records.
-            </p>
+          <div className="bg-white border border-[var(--cs-border)] rounded-lg p-8 sm:p-10 max-w-lg mx-auto space-y-6">
+            <div className="text-center space-y-2.5">
+              <Lock className="w-10 h-10 text-[var(--cs-purple)] mx-auto" />
+              <h2 className="font-display text-2xl font-semibold text-[var(--cs-purple)]">
+                Protected Client & Operations Workspaces
+              </h2>
+              <p className="text-xs sm:text-sm text-[var(--cs-charcoal-muted)] leading-relaxed">
+                {personas.length > 0
+                  ? 'Sign in with your verified account below or select a staging workspace account above to issue a signed HttpOnly session cookie.'
+                  : 'Sign in with your verified Celebration Sisters account credentials to access role-isolated client, planner, vendor, and executive portals.'}
+              </p>
+            </div>
+
+            {loginMode === 'login' ? (
+              <form onSubmit={handleLoginSubmit} className="space-y-4">
+                <div>
+                  <label htmlFor="portal-login-email" className="block text-xs font-medium text-[var(--cs-charcoal)] mb-1">
+                    Email Address
+                  </label>
+                  <input
+                    id="portal-login-email"
+                    type="email"
+                    required
+                    autoComplete="email"
+                    value={loginEmail}
+                    onChange={(e) => setLoginEmail(e.target.value)}
+                    placeholder="name@celebrationsistersdecor.com"
+                    className="w-full min-h-[42px] px-3.5 py-2 text-sm border border-[var(--cs-border-strong)] rounded-md"
+                  />
+                </div>
+                <div>
+                  <label htmlFor="portal-login-password" className="block text-xs font-medium text-[var(--cs-charcoal)] mb-1">
+                    Password
+                  </label>
+                  <input
+                    id="portal-login-password"
+                    type="password"
+                    required
+                    minLength={6}
+                    autoComplete="current-password"
+                    value={loginPassword}
+                    onChange={(e) => setLoginPassword(e.target.value)}
+                    placeholder="Enter your password"
+                    className="w-full min-h-[42px] px-3.5 py-2 text-sm border border-[var(--cs-border-strong)] rounded-md"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={authSubmitting || !isBackendConfigured}
+                  className="w-full min-h-[44px] py-2.5 text-xs font-medium text-white bg-[var(--cs-purple)] hover:bg-[var(--cs-purple-hover)] rounded-md cursor-pointer disabled:opacity-50"
+                >
+                  {authSubmitting ? 'Signing In...' : 'Sign In to Portal'}
+                </button>
+                <div className="flex items-center justify-between text-xs pt-1">
+                  <span className="text-[var(--cs-charcoal-muted)]">
+                    {authProviderReady ? 'Supabase Auth active' : 'Identity provider awaiting server configuration'}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setActionMessage(null);
+                      setLoginMode('reset');
+                    }}
+                    className="text-[var(--cs-purple)] hover:underline font-medium cursor-pointer"
+                  >
+                    Forgot password?
+                  </button>
+                </div>
+              </form>
+            ) : (
+              <form onSubmit={handlePasswordResetSubmit} className="space-y-4">
+                <div>
+                  <label htmlFor="portal-reset-email" className="block text-xs font-medium text-[var(--cs-charcoal)] mb-1">
+                    Account Email Address
+                  </label>
+                  <input
+                    id="portal-reset-email"
+                    type="email"
+                    required
+                    autoComplete="email"
+                    value={loginEmail}
+                    onChange={(e) => setLoginEmail(e.target.value)}
+                    placeholder="name@celebrationsistersdecor.com"
+                    className="w-full min-h-[42px] px-3.5 py-2 text-sm border border-[var(--cs-border-strong)] rounded-md"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={authSubmitting || !isBackendConfigured}
+                  className="w-full min-h-[44px] py-2.5 text-xs font-medium text-white bg-[var(--cs-purple)] hover:bg-[var(--cs-purple-hover)] rounded-md cursor-pointer disabled:opacity-50"
+                >
+                  {authSubmitting ? 'Sending Recovery Link...' : 'Send Password Recovery Link'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActionMessage(null);
+                    setLoginMode('login');
+                  }}
+                  className="w-full py-2 text-xs font-medium text-[var(--cs-purple)] hover:underline cursor-pointer"
+                >
+                  Return to Portal Sign-In
+                </button>
+              </form>
+            )}
           </div>
         ) : currentUser.role === 'admin' && mfaRequired ? (
-          /* Executive MFA Gate */
-          <form
-            onSubmit={handleMfaSubmit}
-            className="bg-white border border-[var(--cs-border)] rounded-lg p-10 max-w-md mx-auto space-y-5 text-center"
-          >
-            <KeyRound className="w-10 h-10 text-[var(--cs-purple)] mx-auto" />
-            <div className="space-y-1.5">
+          /* Executive MFA Gate (TOTP Verification, First-Time Enrollment & Recovery Code) */
+          <div className="bg-white border border-[var(--cs-border)] rounded-lg p-8 sm:p-10 max-w-md mx-auto space-y-5">
+            <div className="text-center space-y-1.5">
+              <KeyRound className="w-10 h-10 text-[var(--cs-purple)] mx-auto" />
               <h2 className="font-display text-2xl font-semibold text-[var(--cs-purple)]">
                 Executive MFA Verification Required
               </h2>
               <p className="text-xs text-[var(--cs-charcoal-muted)] leading-relaxed">
-                Privileged administrative endpoints require multi-factor verification. Enter your executive director MFA verification code configured on the server to unlock Executive Administration.
+                Privileged administrative endpoints require multi-factor verification. Enter your 6-digit authenticator code to unlock Executive Administration.
               </p>
             </div>
-            <input
-              type="password"
-              required
-              value={mfaCode}
-              onChange={(e) => setMfaCode(e.target.value)}
-              placeholder="Enter 6-digit MFA code"
-              className="w-full px-4 py-2.5 text-sm text-center tracking-widest border border-[var(--cs-border-strong)] rounded-md tabular-nums"
-            />
-            <button
-              type="submit"
-              className="w-full py-2.5 text-xs font-medium text-white bg-[var(--cs-purple)] hover:bg-[var(--cs-purple-hover)] rounded-md cursor-pointer"
-            >
-              Verify & Unlock Executive Portal
-            </button>
-          </form>
+
+            {mfaMode === 'recovery' ? (
+              <form onSubmit={handleRecoverMfaSubmit} className="space-y-4">
+                <input
+                  type="text"
+                  required
+                  value={recoveryCodeInput}
+                  onChange={(e) => setRecoveryCodeInput(e.target.value)}
+                  placeholder="Enter single-use recovery code (e.g. A1B2C3-D4E5F6)"
+                  className="w-full px-4 py-2.5 text-sm text-center font-mono border border-[var(--cs-border-strong)] rounded-md uppercase"
+                />
+                <button
+                  type="submit"
+                  disabled={authSubmitting}
+                  className="w-full py-2.5 text-xs font-medium text-white bg-[var(--cs-purple)] hover:bg-[var(--cs-purple-hover)] rounded-md cursor-pointer disabled:opacity-50"
+                >
+                  {authSubmitting ? 'Verifying Recovery Code...' : 'Verify Recovery Code & Unlock'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMfaMode('totp')}
+                  className="w-full py-1.5 text-xs font-medium text-[var(--cs-purple)] hover:underline cursor-pointer"
+                >
+                  Back to 6-Digit Authenticator Code
+                </button>
+              </form>
+            ) : (
+              <form onSubmit={handleMfaSubmit} className="space-y-4">
+                {totpEnrollment && (
+                  <div className="p-4 bg-[var(--cs-ivory)] border border-[var(--cs-border-strong)] rounded-md space-y-2.5 text-left text-xs">
+                    <p className="font-semibold text-[var(--cs-purple)]">Authenticator Setup (RFC 6238 TOTP)</p>
+                    <div>
+                      <p className="text-[11px] text-[var(--cs-charcoal-muted)]">Manual Setup Secret:</p>
+                      <p className="font-mono text-xs bg-white px-2.5 py-1.5 mt-1 rounded border border-[var(--cs-border)] break-all select-all">
+                        {totpEnrollment.secret}
+                      </p>
+                    </div>
+                    <div>
+                      <p className="text-[11px] text-[var(--cs-charcoal-muted)]">Provisioning URI:</p>
+                      <p className="font-mono text-[10px] bg-white px-2.5 py-1.5 mt-1 rounded border border-[var(--cs-border)] break-all select-all">
+                        {totpEnrollment.otpauthUri}
+                      </p>
+                    </div>
+                    {totpEnrollment.recoveryCodes.length > 0 && (
+                      <div>
+                        <p className="text-[11px] font-semibold text-[var(--cs-charcoal)]">
+                          Single-Use Recovery Codes (Save Once):
+                        </p>
+                        <div className="grid grid-cols-2 gap-1 mt-1 font-mono text-[11px]">
+                          {totpEnrollment.recoveryCodes.map((rc) => (
+                            <span key={rc} className="bg-white px-2 py-1 rounded border border-[var(--cs-border)] text-center">
+                              {rc}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <input
+                  type="password"
+                  required
+                  value={mfaCode}
+                  onChange={(e) => setMfaCode(e.target.value)}
+                  placeholder="Enter 6-digit MFA code"
+                  className="w-full px-4 py-2.5 text-sm text-center tracking-widest border border-[var(--cs-border-strong)] rounded-md tabular-nums"
+                />
+                <button
+                  type="submit"
+                  className="w-full py-2.5 text-xs font-medium text-white bg-[var(--cs-purple)] hover:bg-[var(--cs-purple-hover)] rounded-md cursor-pointer"
+                >
+                  Verify & Unlock Executive Portal
+                </button>
+
+                <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-[var(--cs-border)] text-xs">
+                  {!mfaEnrolled && onEnrollTotp && (
+                    <button
+                      type="button"
+                      disabled={authSubmitting}
+                      onClick={handleEnrollTotpClick}
+                      className="text-[var(--cs-purple)] hover:underline font-medium cursor-pointer"
+                    >
+                      Enroll Authenticator App (TOTP)
+                    </button>
+                  )}
+                  {onRecoverMfa && (
+                    <button
+                      type="button"
+                      onClick={() => setMfaMode('recovery')}
+                      className="text-[var(--cs-charcoal-muted)] hover:text-[var(--cs-purple)] underline cursor-pointer ml-auto"
+                    >
+                      Use Recovery Code
+                    </button>
+                  )}
+                </div>
+              </form>
+            )}
+          </div>
         ) : loading && bookings.length === 0 ? (
           <div className="bg-white border border-[var(--cs-border)] rounded-lg p-10 text-center text-sm text-[var(--cs-charcoal-muted)]">
             Loading authorized workspace records...

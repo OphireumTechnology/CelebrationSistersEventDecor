@@ -22,6 +22,31 @@ export interface EmailRuntimeConfig {
  */
 export const DEFAULT_STAFF_NOTIFICATION_EMAIL = 'directors@celebrationsisters.example.com';
 
+const RESERVED_PLACEHOLDER_DOMAINS = [
+  '.example.com',
+  '.example.org',
+  '.example.net',
+  '.invalid',
+  '.test',
+];
+
+/**
+ * Returns true if an email targets an RFC 2606 reserved placeholder domain
+ * (such as example.com / .invalid / .test) that must never be sent via live production SMTP/Resend.
+ */
+export function isReservedPlaceholderEmail(email: string): boolean {
+  const normalized = (email || '').trim().toLowerCase();
+  const atIdx = normalized.lastIndexOf('@');
+  if (atIdx <= 0) return false;
+  const domain = normalized.slice(atIdx + 1);
+  return (
+    domain === 'example.com' ||
+    domain === 'example.org' ||
+    domain === 'example.net' ||
+    RESERVED_PLACEHOLDER_DOMAINS.some((suffix) => domain.endsWith(suffix))
+  );
+}
+
 export function getEmailRuntimeConfig(env: NodeJS.ProcessEnv = process.env): EmailRuntimeConfig {
   return {
     apiKey: (env.RESEND_API_KEY || '').trim(),
@@ -516,6 +541,14 @@ export async function dispatchEmailNotification(
   if (!liveEnabled) {
     baseRecord.status = 'Skipped (Unauthorized)';
     baseRecord.lastError = 'Outbound email paused until EMAIL_LIVE_DELIVERY_ENABLED=true is explicitly approved.';
+    baseRecord.updatedAt = new Date().toISOString();
+    return { record: baseRecord, deduplicated: false };
+  }
+
+  if (process.env.NODE_ENV === 'production' && isReservedPlaceholderEmail(input.recipient)) {
+    baseRecord.status = 'Skipped (Unconfigured)';
+    baseRecord.lastError =
+      'Outbound transmission blocked for RFC 2606 placeholder recipient in production. Configure a verified destination address.';
     baseRecord.updatedAt = new Date().toISOString();
     return { record: baseRecord, deduplicated: false };
   }

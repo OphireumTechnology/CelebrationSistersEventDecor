@@ -58,6 +58,25 @@ CREATE POLICY notification_outbox_worker_scoped ON notification_outbox
 DROP POLICY IF EXISTS notification_webhook_events_ops_only ON notification_webhook_events;
 CREATE POLICY notification_webhook_events_ops_only ON notification_webhook_events
   FOR ALL
+  USING (app_current_role() IN ('admin', 'staff', 'event_planner', 'notification_worker'))
+  WITH CHECK (app_current_role() IN ('admin', 'staff', 'event_planner', 'notification_worker'));
+
+-- Operational write policies under FORCE RLS for Phase 14 scheduling & CRM tables
+DROP POLICY IF EXISTS consultation_slot_holds_ops_modify ON consultation_slot_holds;
+CREATE POLICY consultation_slot_holds_ops_modify ON consultation_slot_holds
+  FOR ALL
+  USING (app_current_role() IN ('admin', 'staff', 'event_planner'))
+  WITH CHECK (app_current_role() IN ('admin', 'staff', 'event_planner'));
+
+DROP POLICY IF EXISTS crm_follow_up_tasks_ops_modify ON crm_follow_up_tasks;
+CREATE POLICY crm_follow_up_tasks_ops_modify ON crm_follow_up_tasks
+  FOR ALL
+  USING (app_current_role() IN ('admin', 'staff', 'event_planner'))
+  WITH CHECK (app_current_role() IN ('admin', 'staff', 'event_planner'));
+
+DROP POLICY IF EXISTS staff_availability_rules_ops_modify ON staff_availability_rules;
+CREATE POLICY staff_availability_rules_ops_modify ON staff_availability_rules
+  FOR ALL
   USING (app_current_role() IN ('admin', 'staff', 'event_planner'))
   WITH CHECK (app_current_role() IN ('admin', 'staff', 'event_planner'));
 

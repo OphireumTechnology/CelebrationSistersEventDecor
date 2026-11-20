@@ -36,7 +36,13 @@ import {
   validateCsrfProtection,
 } from './authz.ts';
 import { generateConceptProposal, getGeminiConfigStatus, runConciergeTurn } from './gemini.ts';
-import { getIdentityProviderStatus, type VerifyProviderTokenOptions } from './identityProvider.ts';
+import {
+  createSupabasePublicClient,
+  getIdentityProviderStatus,
+  resolveTrustedUserFromClaims,
+  verifyProviderAccessToken,
+  type VerifyProviderTokenOptions,
+} from './identityProvider.ts';
 import { classifyDatabaseError } from './lib/pgErrorClassifier.ts';
 import {
   buildConsultationCancelledTemplate,
@@ -102,9 +108,26 @@ import {
 } from './store.ts';
 import { buildTotpProvisioningUri, generateTotpSecret } from './totp.ts';
 
+export interface SupabaseAuthClientLike {
+  auth: {
+    signInWithPassword: (credentials: { email: string; password: string }) => Promise<{
+      data: { session?: { access_token?: string } | null } | null;
+      error: { message?: string } | null;
+    }>;
+    resetPasswordForEmail: (
+      email: string,
+      options?: { redirectTo?: string },
+    ) => Promise<{
+      data: unknown;
+      error: { message?: string } | null;
+    }>;
+  };
+}
+
 export interface CreateAppOptions {
   enableRateLimit?: boolean;
   providerVerifyOptions?: VerifyProviderTokenOptions;
+  supabaseAuthClient?: SupabaseAuthClientLike | null;
   rateLimitStore?: RateLimitStore;
   notificationFetch?: FetchLike;
   outboxWorker?: NotificationOutboxWorker;
@@ -568,6 +591,7 @@ export function createApp(options: CreateAppOptions = {}) {
       user: sanitizeUserForClient(ctx.session),
       mfaVerified: ctx.mfaVerified,
       mfaRequired: ctx.session.role === 'admin' && !ctx.mfaVerified,
+      mfaEnrolled: Boolean(ctx.session.mfaEnrolled),
       emailVerified: ctx.emailVerified,
       accountStatus: ctx.accountStatus,
       aal: ctx.aal,
@@ -575,6 +599,245 @@ export function createApp(options: CreateAppOptions = {}) {
       csrfToken: ctx.sessionJti ? deriveCsrfToken(ctx.sessionJti) : undefined,
     });
   });
+
+  // Production Email/Password Sign-In via Supabase Auth with cryptographic JWT verification
+  // and server-authoritative role resolution (never trusts user_metadata role claims).
+  app.post(
+    '/api/auth/login',
+    rateLimit(10, 60_000, { failClosed: true, endpointGroup: 'auth' }),
+    async (req: Request, res: Response) => {
+      const parsed = z
+        .object({
+          email: z.string().trim().email('Valid email address is required').max(180),
+          password: z.string().min(6, 'Password must be at least 6 characters').max(128),
+        })
+        .safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Valid email and password are required.' });
+      }
+
+      const normalizedEmail = parsed.data.email.toLowerCase();
+      const emailHash = sha256Hex(normalizedEmail).slice(0, 16);
+      const authClient: SupabaseAuthClientLike | null =
+        options.supabaseAuthClient !== undefined ? options.supabaseAuthClient : createSupabasePublicClient();
+
+      if (!authClient) {
+        return res.status(503).json({
+          error: 'Production identity provider (Supabase Auth) is not configured on this server.',
+          code: 'AUTH_PROVIDER_NOT_CONFIGURED',
+        });
+      }
+
+      let signInResult: {
+        data: { session?: { access_token?: string } | null } | null;
+        error: { message?: string } | null;
+      };
+      try {
+        signInResult = await authClient.auth.signInWithPassword({
+          email: normalizedEmail,
+          password: parsed.data.password,
+        });
+      } catch {
+        return res.status(502).json({
+          error: 'Identity provider authentication service is temporarily unavailable.',
+          code: 'AUTH_PROVIDER_UNAVAILABLE',
+        });
+      }
+
+      const accessToken = signInResult.data?.session?.access_token;
+      if (signInResult.error || !accessToken) {
+        await withTransaction((db) => {
+          appendSecurityEvent(db, {
+            eventType: 'LOGIN_FAILED',
+            emailHash,
+            outcome: 'denied',
+            details: 'Supabase email/password sign-in rejected credentials',
+          });
+        });
+        return res.status(401).json({
+          error: 'Invalid email address or password.',
+          code: 'INVALID_CREDENTIALS',
+        });
+      }
+
+      const claims = await verifyProviderAccessToken(accessToken, options.providerVerifyOptions);
+      if (!claims) {
+        await withTransaction((db) => {
+          appendSecurityEvent(db, {
+            eventType: 'TOKEN_REJECTED',
+            emailHash,
+            outcome: 'denied',
+            details: 'Provider access token failed cryptographic verification during /api/auth/login',
+          });
+        });
+        return res.status(401).json({
+          error: 'Unable to cryptographically verify identity provider token.',
+          code: 'TOKEN_INVALID',
+        });
+      }
+
+      const dbSnapshot = await readDb();
+      const resolved = resolveTrustedUserFromClaims(claims, dbSnapshot.users);
+
+      if (resolved.emailPrivilegeBindBlocked) {
+        await withTransaction((db) => {
+          appendSecurityEvent(db, {
+            eventType: 'EMAIL_PRIVILEGE_BIND_BLOCKED',
+            emailHash,
+            outcome: 'denied',
+            details: 'Blocked email-only privilege login; administrator-verified immutable supabaseUserId binding required',
+          });
+        });
+        return res.status(403).json({
+          error: 'Privileged accounts require administrator-verified identity binding.',
+          code: 'EMAIL_PRIVILEGE_BIND_BLOCKED',
+        });
+      }
+
+      if (resolved.accountStatus === 'suspended' || resolved.accountStatus === 'deactivated') {
+        await withTransaction((db) => {
+          appendSecurityEvent(db, {
+            eventType: 'SUSPENDED_ACCOUNT_BLOCKED',
+            userId: resolved.user.id,
+            emailHash,
+            outcome: 'denied',
+            details: `Blocked sign-in for ${resolved.accountStatus} account`,
+          });
+        });
+        return res.status(403).json({
+          error: 'This account is suspended or deactivated.',
+          code: 'ACCOUNT_SUSPENDED',
+        });
+      }
+
+      if (!resolved.emailVerified) {
+        await withTransaction((db) => {
+          appendSecurityEvent(db, {
+            eventType: 'UNVERIFIED_EMAIL_BLOCKED',
+            userId: resolved.user.id,
+            emailHash,
+            outcome: 'denied',
+            details: 'Blocked sign-in until email verification is completed',
+          });
+        });
+        return res.status(403).json({
+          error: 'Please verify your email address before signing in.',
+          code: 'EMAIL_NOT_VERIFIED',
+        });
+      }
+
+      const authoritativeUser = await withTransaction((db) => {
+        let userRecord = db.users.find(
+          (u) => u.id === resolved.user.id || (u.supabaseUserId && u.supabaseUserId === claims.sub),
+        );
+        if (!userRecord && resolved.user.role === 'client') {
+          userRecord = {
+            id: resolved.user.id,
+            supabaseUserId: claims.sub,
+            name: resolved.user.name,
+            email: resolved.user.email || normalizedEmail,
+            role: 'client',
+            emailVerified: true,
+            accountStatus: 'active',
+          };
+          db.users.push(userRecord);
+        } else if (userRecord && userRecord.role === 'client' && !userRecord.supabaseUserId) {
+          userRecord.supabaseUserId = claims.sub;
+          userRecord.emailVerified = true;
+        }
+        const finalUser = userRecord ?? resolved.user;
+        appendAudit(
+          db,
+          finalUser,
+          'LOGIN_SUCCESS',
+          'AuthSession',
+          finalUser.id,
+          `Authenticated via Supabase Auth (${finalUser.role}, ${claims.aal})`,
+        );
+        appendSecurityEvent(db, {
+          eventType: 'LOGIN_SUCCESS',
+          userId: finalUser.id,
+          emailHash,
+          outcome: 'allowed',
+          details: `Supabase login succeeded for role ${finalUser.role} (${claims.aal})`,
+        });
+        return finalUser;
+      });
+
+      const mfaVerified = authoritativeUser.role === 'admin' ? claims.aal === 'aal2' : true;
+      const jti = generateSessionId();
+      const csrfToken = deriveCsrfToken(jti);
+      const token = signSessionToken({
+        jti,
+        userId: authoritativeUser.id,
+        role: authoritativeUser.role,
+        mfaVerified,
+        issuedAt: Date.now(),
+        expiresAt: Date.now() + 1000 * 60 * 60 * 8,
+      });
+
+      setSessionCookie(res, token, { req, csrfToken });
+      return res.json({
+        user: sanitizeUserForClient(authoritativeUser),
+        token,
+        csrfToken,
+        mfaRequired: authoritativeUser.role === 'admin' && !mfaVerified,
+        mfaVerified,
+        mfaEnrolled: Boolean(authoritativeUser.mfaEnrolled),
+        aal: mfaVerified ? 'aal2' : 'aal1',
+      });
+    },
+  );
+
+  // Password reset trigger via Supabase Auth (uniform response prevents account enumeration)
+  app.post(
+    '/api/auth/password-reset',
+    rateLimit(5, 60_000, { failClosed: true, endpointGroup: 'auth_recovery' }),
+    async (req: Request, res: Response) => {
+      const parsed = z
+        .object({
+          email: z.string().trim().email('Valid email address is required').max(180),
+        })
+        .safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Valid email address is required.' });
+      }
+
+      const authClient: SupabaseAuthClientLike | null =
+        options.supabaseAuthClient !== undefined ? options.supabaseAuthClient : createSupabasePublicClient();
+      if (!authClient) {
+        return res.status(503).json({
+          error: 'Production identity provider (Supabase Auth) is not configured on this server.',
+          code: 'AUTH_PROVIDER_NOT_CONFIGURED',
+        });
+      }
+
+      const normalizedEmail = parsed.data.email.toLowerCase();
+      const emailHash = sha256Hex(normalizedEmail).slice(0, 16);
+      const redirectBase = (process.env.FRONTEND_PUBLIC_URL || 'https://celebrationsistersdecor.com').replace(/\/+$/, '');
+      try {
+        await authClient.auth.resetPasswordForEmail(normalizedEmail, {
+          redirectTo: `${redirectBase}/`,
+        });
+      } catch {
+        // Deliberately suppress provider errors to avoid account enumeration while logging security event
+      }
+
+      await withTransaction((db) => {
+        appendSecurityEvent(db, {
+          eventType: 'PASSWORD_RESET_REQUESTED',
+          emailHash,
+          outcome: 'allowed',
+          details: 'Password recovery email requested via Supabase Auth',
+        });
+      });
+
+      return res.json({
+        ok: true,
+        message: 'If an account matches that email address, password recovery instructions have been dispatched.',
+      });
+    },
+  );
 
   app.post(
     '/api/auth/switch',
@@ -708,10 +971,12 @@ export function createApp(options: CreateAppOptions = {}) {
     async (req: Request, res: Response) => {
       const { ctx } = await getAuth(req);
       if (!requireActiveAccount(ctx, res)) return;
-      const parsed = z.object({ code: z.string().min(6).max(12) }).safeParse(req.body);
-      const challenge = parsed.success
-        ? verifyAdminMfaChallenge(ctx.session, parsed.data.code)
-        : { verified: false, method: 'none' as const };
+      const parsed = z.object({ code: z.string().trim().min(6).max(16) }).safeParse(req.body);
+      const normalizedCode = parsed.success ? parsed.data.code.replace(/\s+/g, '') : '';
+      const challenge =
+        parsed.success && normalizedCode.length >= 6 && normalizedCode.length <= 12
+          ? verifyAdminMfaChallenge(ctx.session, normalizedCode)
+          : { verified: false, method: 'none' as const };
       if (!parsed.success || !challenge.verified) {
         await withTransaction((db) => {
           appendAudit(db, ctx.session, 'MFA_VERIFICATION_FAILED', 'AuthSession', ctx.session.id, 'Invalid MFA code entered');
@@ -737,13 +1002,16 @@ export function createApp(options: CreateAppOptions = {}) {
       });
       setSessionCookie(res, token, { req, csrfToken });
       await withTransaction((db) => {
+        if (ctx.sessionJti && ctx.sessionJti !== jti) {
+          db.revokedSessionIds[ctx.sessionJti] = ctx.sessionExpiresAt ?? Date.now() + 1000 * 60 * 60 * 8;
+        }
         appendAudit(
           db,
           ctx.session,
           'MFA_VERIFIED',
           'AuthSession',
           ctx.session.id,
-          `Privileged MFA verified (${challenge.method})`,
+          `Privileged MFA verified (${challenge.method}); rotated session JTI`,
         );
         appendSecurityEvent(db, {
           eventType: 'MFA_VERIFIED',
@@ -802,7 +1070,7 @@ export function createApp(options: CreateAppOptions = {}) {
           'MFA_RECOVERY_CODE_USED',
           'AuthSession',
           ctx.session.id,
-          `Consumed single-use MFA recovery code (${hashes.length} remaining)`,
+          `Consumed single-use MFA recovery code (${hashes.length} remaining); rotated session JTI`,
         );
         appendSecurityEvent(db, {
           eventType: 'MFA_RECOVERY_USED',
@@ -1080,7 +1348,7 @@ export function createApp(options: CreateAppOptions = {}) {
       return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid booking input.' });
     }
     const input = parsed.data;
-    const todayIso = new Date().toISOString().slice(0, 10);
+    const todayIso = getStudioTodayIso();
     if (input.eventDate < todayIso) {
       return res.status(400).json({ error: 'Event date cannot be in the past. Please choose an upcoming date.' });
     }
@@ -2323,15 +2591,53 @@ export function createApp(options: CreateAppOptions = {}) {
   app.get('/api/admin/metrics', async (req: Request, res: Response) => {
     const { db, ctx } = await getAuth(req);
     if (!requireAdminMfa(ctx, res)) return;
+    const persistence = await checkPersistenceHealth();
+    const auth = getIdentityProviderStatus();
+    const email = getEmailProviderStatus();
+    const metricsSnapshot = observability.getSnapshot();
+    const workerStatus = outboxWorker.getStatus();
+    const worker: ReadinessWorkerDiagnostics = {
+      ...workerStatus,
+      healthy: metricsSnapshot.notifications.workerHealthy,
+      lastHeartbeatAt: metricsSnapshot.notifications.lastWorkerHeartbeatAt,
+    };
+    const readiness = evaluateApplicationReadiness({
+      persistence,
+      auth,
+      email,
+      worker,
+      isProduction: process.env.NODE_ENV === 'production',
+    });
     const queueDepth = db.notificationOutbox.filter(
       (j) => j.status === 'Pending' || j.status === 'Retrying' || j.status === 'Claimed',
     ).length;
     const deadLetterCount = db.notificationOutbox.filter((j) => j.status === 'DeadLetter').length;
+    const activeSlotHolds = db.consultationSlotHolds.filter(
+      (h) => new Date(h.expiresAt).getTime() > Date.now(),
+    ).length;
     res.json({
-      metrics: observability.getSnapshot(),
+      metrics: metricsSnapshot,
       outbox: {
         queueDepth,
         deadLetterCount,
+      },
+      scheduling: {
+        activeSlotHolds,
+        totalConsultations: db.consultations.length,
+      },
+      readiness: {
+        status: readiness.status,
+        productionReady: readiness.productionReady,
+        checks: readiness.checks,
+        blockingReasons: readiness.blockingReasons,
+        worker,
+        email: {
+          provider: email.provider,
+          configured: email.configured,
+          webhookSecretConfigured: email.webhookSecretConfigured,
+          staffRecipientConfigured: email.staffRecipientConfigured,
+          liveDeliveryEnabled: email.liveDeliveryEnabled,
+        },
       },
     });
   });
@@ -2614,6 +2920,32 @@ export function createApp(options: CreateAppOptions = {}) {
           expiresAt: outcome.hold.expiresAt,
         },
       });
+    },
+  );
+
+  // 2b. Release a client's active temporary consultation slot hold immediately
+  app.delete(
+    '/api/consultations/holds',
+    rateLimit(30, 60_000, { endpointGroup: 'consultations:holds', failClosed: false }),
+    async (req: Request, res: Response) => {
+      const rawHolderKey =
+        (typeof req.body?.holderKey === 'string' ? req.body.holderKey : '') ||
+        (typeof req.query?.holderKey === 'string' ? req.query.holderKey : '') ||
+        (req.header('x-hold-key') || '');
+      const holderKey = rawHolderKey.trim();
+      if (holderKey.length < 6 || holderKey.length > 160) {
+        return res.status(400).json({ error: 'Valid holderKey is required to release a slot hold.' });
+      }
+      const holderHash = sha256Hex(holderKey);
+      const nowMs = Date.now();
+      const releasedCount = await withTransaction((db) => {
+        const before = db.consultationSlotHolds.length;
+        db.consultationSlotHolds = db.consultationSlotHolds.filter(
+          (h) => new Date(h.expiresAt).getTime() > nowMs && h.holderFingerprintHash !== holderHash,
+        );
+        return Math.max(0, before - db.consultationSlotHolds.length);
+      });
+      res.json({ ok: true, releasedCount });
     },
   );
 

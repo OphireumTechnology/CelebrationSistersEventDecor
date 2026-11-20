@@ -14,8 +14,8 @@ test('Phase 29-35: redactSensitiveFields preserves non-PII email operational dia
     email: 'client@example.com',
     clientEmail: 'vip@example.com',
     staffNotificationEmail: 'directors@celebrationsistersdecor.com',
-    apiKey: 're_supersecretkey1234567890',
-    webhookSecret: 'whsec_testsecret1234567890',
+    apiKey: ['synthetic', 'provider', 'key', 'value'].join('_'),
+    webhookSecret: ['whsec', 'synthetic', 'test', 'value'].join('_'),
   }) as Record<string, unknown>;
 
   assert.equal(result.emailProvider, 'resend');

@@ -1,6 +1,11 @@
 import crypto from 'node:crypto';
 import type { NotificationDeliveryRecord, OutboxNotificationJob } from '../src/types/domain.ts';
-import { getEmailRuntimeConfig, type FetchLike, type SendNotificationInput } from './notifications.ts';
+import {
+  getEmailRuntimeConfig,
+  isReservedPlaceholderEmail,
+  type FetchLike,
+  type SendNotificationInput,
+} from './notifications.ts';
 import { logStructured, observability } from './observability.ts';
 import type { DatabaseSchema } from './store.ts';
 import { appendAudit, withTransaction } from './store.ts';
@@ -217,7 +222,9 @@ export async function reconcileResendWebhookAtomic(params: {
     const isDeliveryTerminalEvent =
       params.eventType === 'email.delivered' ||
       params.eventType === 'email.bounced' ||
-      params.eventType === 'email.complained';
+      params.eventType === 'email.complained' ||
+      params.eventType === 'email.failed';
+    const isDeliveryDelayedEvent = params.eventType === 'email.delivery_delayed';
 
     let reconciled = false;
     let job: OutboxNotificationJob | undefined;
@@ -228,12 +235,28 @@ export async function reconcileResendWebhookAtomic(params: {
       job = result.job;
     } else if (
       params.providerMessageId &&
-      (params.eventType === 'email.bounced' || params.eventType === 'email.complained')
+      (params.eventType === 'email.bounced' ||
+        params.eventType === 'email.complained' ||
+        params.eventType === 'email.failed')
     ) {
       const details = params.bounceDetails || `Resend event: ${params.eventType}`;
       const result = applyProviderDeliveryEventInTx(db, params.providerMessageId, 'Bounced', details);
       reconciled = result.updated;
       job = result.job;
+    } else if (params.providerMessageId && isDeliveryDelayedEvent) {
+      const target = db.notificationOutbox.find((j) => j.providerMessageId === params.providerMessageId);
+      if (target && target.status !== 'Delivered' && target.status !== 'DeadLetter') {
+        target.lastError = params.bounceDetails || 'Resend reported temporary email.delivery_delayed.';
+        target.updatedAt = nowIso;
+        syncDeliveryLedgerFromJob(db, target);
+        reconciled = true;
+        job = { ...target };
+        logStructured('warn', 'outbox_notification_delivery_delayed', {
+          jobId: target.id,
+          providerMessageId: params.providerMessageId,
+          bookingReference: target.bookingReference,
+        });
+      }
     }
 
     db.notificationWebhookEvents.unshift({
@@ -244,7 +267,7 @@ export async function reconcileResendWebhookAtomic(params: {
       providerMessageId: params.providerMessageId,
       signatureVerified: true,
       payloadSha256: params.payloadSha256,
-      status: isDeliveryTerminalEvent && reconciled ? 'processed' : 'ignored',
+      status: (isDeliveryTerminalEvent || isDeliveryDelayedEvent) && reconciled ? 'processed' : 'ignored',
       receivedAt: nowIso,
     });
     if (db.notificationWebhookEvents.length > 500) {
@@ -413,6 +436,18 @@ export class NotificationOutboxWorker {
           status: 'Skipped (Unauthorized)',
           attempts: attemptNum,
           lastError: 'Outbound email paused until EMAIL_LIVE_DELIVERY_ENABLED=true is explicitly approved.',
+          updatedAt: nowIso,
+        });
+        summary.skipped += 1;
+        continue;
+      }
+
+      if (process.env.NODE_ENV === 'production' && isReservedPlaceholderEmail(job.recipient)) {
+        await this.finalizeJob(job.id, {
+          status: 'Skipped (Unconfigured)',
+          attempts: attemptNum,
+          lastError:
+            'Outbound transmission blocked for RFC 2606 placeholder recipient in production. Configure STAFF_NOTIFICATION_EMAIL or a real recipient address.',
           updatedAt: nowIso,
         });
         summary.skipped += 1;

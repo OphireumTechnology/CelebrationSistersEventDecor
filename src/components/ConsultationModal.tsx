@@ -431,15 +431,33 @@ export function ConsultationModal({
     };
   }, [open, mode, step, clientTimezone, method, fetchAvailability]);
 
+  const releaseActiveHold = useCallback(() => {
+    if (!holdExpiresAt || confirmed) return;
+    setHoldExpiresAt(null);
+    apiFetch('/api/consultations/holds', {
+      method: 'DELETE',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Hold-Key': holderKeyRef.current,
+      },
+      body: JSON.stringify({ holderKey: holderKeyRef.current }),
+    }).catch(() => {});
+  }, [holdExpiresAt, confirmed]);
+
+  const handleRequestClose = useCallback(() => {
+    releaseActiveHold();
+    onClose();
+  }, [releaseActiveHold, onClose]);
+
   // Keyboard Escape handler
   useEffect(() => {
     if (!open) return;
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose();
+      if (event.key === 'Escape') handleRequestClose();
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [open, onClose]);
+  }, [open, handleRequestClose]);
 
   const activeDay = useMemo(
     () => availabilityDays.find((d) => d.date === selectedDayIso) || availabilityDays[0] || null,
@@ -933,7 +951,7 @@ export function ConsultationModal({
             <button
               ref={closeButtonRef}
               type="button"
-              onClick={onClose}
+              onClick={handleRequestClose}
               className="min-h-[44px] min-w-[44px] flex items-center justify-center text-[var(--cs-charcoal-muted)] hover:text-[var(--cs-purple)] rounded-md cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--cs-purple)]"
               aria-label="Close modal"
             >
@@ -1544,6 +1562,9 @@ export function ConsultationModal({
                         aria-current={isCurrent ? 'step' : undefined}
                         onClick={() => {
                           if (s.num < step) {
+                            if (s.num <= 2 && step >= 3) {
+                              releaseActiveHold();
+                            }
                             setError(null);
                             setStep(s.num as 1 | 2 | 3 | 4);
                           }
@@ -2189,8 +2210,14 @@ export function ConsultationModal({
                   type="button"
                   onClick={() => {
                     setError(null);
-                    if (step === 1) onClose();
-                    else setStep((step - 1) as 1 | 2 | 3);
+                    if (step === 1) {
+                      handleRequestClose();
+                    } else {
+                      if (step === 3) {
+                        releaseActiveHold();
+                      }
+                      setStep((step - 1) as 1 | 2 | 3);
+                    }
                   }}
                   className="min-h-[44px] px-4 py-2 text-xs font-medium text-[var(--cs-charcoal-muted)] hover:text-[var(--cs-charcoal)] inline-flex items-center gap-1.5 cursor-pointer"
                 >

@@ -132,6 +132,20 @@ export async function validateMigrationsDirectory(
   if (!/CREATE\s+POLICY\s+notification_outbox_worker_scoped\s+ON\s+notification_outbox/i.test(combinedSql)) {
     errors.push('Migration 008 must define least-privilege notification_outbox_worker_scoped policy under FORCE RLS.');
   }
+  for (const forceWriteTable of [
+    'consultation_slot_holds',
+    'crm_follow_up_tasks',
+    'staff_availability_rules',
+    'notification_webhook_events',
+  ]) {
+    const writePolicyPattern = new RegExp(
+      `CREATE\\s+POLICY\\s+[a-z0-9_]+\\s+ON\\s+${forceWriteTable}\\s+FOR\\s+ALL\\b`,
+      'i',
+    );
+    if (!writePolicyPattern.test(combinedSql)) {
+      errors.push(`Missing FOR ALL operational write policy under FORCE RLS for table: ${forceWriteTable}`);
+    }
+  }
   if (!/excl_consultations_planner_buffered_overlap/i.test(combinedSql)) {
     errors.push('Migration 007 must enforce buffered consultation overlap exclusion constraint.');
   }
