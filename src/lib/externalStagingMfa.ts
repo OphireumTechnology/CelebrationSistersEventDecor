@@ -2,6 +2,7 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
 const PROJECT_REF = 'nswxwwmtcasmkjtmrdqg';
 let client: SupabaseClient | null = null;
+let pendingTotpFactorId: string | null = null;
 
 /** Explicit opt-in only: browser never receives a service-role key. */
 export function getExternalStagingMfaClient(): SupabaseClient | null {
@@ -23,8 +24,11 @@ export async function enrollExternalStagingTotp() {
   }
   const { data, error } = await supabase.auth.mfa.enroll({factorType:'totp', friendlyName:'Celebration Sisters staging administrator'});
   if (error) throw error;
+  pendingTotpFactorId = data.id;
   return { factorId:data.id, qr:data.totp.qr_code, secret:data.totp.secret, uri:data.totp.uri };
 }
+
+export function getPendingExternalTotpFactorId(): string | null { return pendingTotpFactorId; }
 
 export async function verifyExternalStagingTotp(factorId:string, code:string) {
   const supabase = getExternalStagingMfaClient();
@@ -35,5 +39,6 @@ export async function verifyExternalStagingTotp(factorId:string, code:string) {
   if (aalError || aal.currentLevel !== 'aal2') throw new Error('Supabase AAL2 verification did not complete.');
   const {data:session} = await supabase.auth.getSession();
   if (!session.session?.access_token) throw new Error('No authenticated AAL2 access token returned.');
+  pendingTotpFactorId = null;
   return {accessToken:session.session.access_token};
 }
