@@ -14,7 +14,7 @@ import { PublicHomeView } from './components/PublicHomeView';
 import { ServiceDivisionCatalog } from './components/ServiceDivisionCatalog';
 import { apiFetch, isBackendConfigured, setApiAccessToken, setApiCsrfToken } from './lib/apiClient';
 import type { UserSession } from './types/domain';
-import { getExternalStagingMfaClient, enrollExternalStagingTotp, verifyExternalStagingTotp } from './lib/externalStagingMfa';
+import { getExternalStagingMfaClient, enrollExternalStagingTotp, verifyExternalStagingTotp, getPendingExternalTotpFactorId } from './lib/externalStagingMfa';
 
 const DEFAULT_GUEST: UserSession = {
   id: 'guest-public',
@@ -159,9 +159,9 @@ export default function App() {
       try {
         const {data:factors,error} = await externalClient.auth.mfa.listFactors();
         if (error) throw error;
-        const factor = factors.totp[0];
-        if (!factor) return {ok:false,error:'Enroll an authenticator before verifying MFA.'};
-        const verified = await verifyExternalStagingTotp(factor.id,code);
+        const factorId = getPendingExternalTotpFactorId() ?? factors.totp[0]?.id;
+        if (!factorId) return {ok:false,error:'Enroll an authenticator before verifying MFA.'};
+        const verified = await verifyExternalStagingTotp(factorId,code);
         setApiAccessToken(verified.accessToken);
         setMfaRequired(false);
         setMfaEnrolled(true);
