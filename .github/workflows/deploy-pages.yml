@@ -35,7 +35,7 @@ jobs:
         env:
           GITHUB_PAGES: 'true'
           GITHUB_PAGES_CUSTOM_DOMAIN: 'true'
-          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL || 'https://celebrationsisterseventdecor-production.up.railway.app' }}
           VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ vars.VITE_SUPABASE_ANON_KEY }}
       - name: Validate compiled entrypoint
@@ -54,7 +54,8 @@ jobs:
             exit 1
           fi
           if [ -z "${VITE_API_BASE_URL:-}" ]; then
-            echo "::warning::VITE_API_BASE_URL repository variable is unset. Static GitHub Pages build will safely disable live API calls instead of issuing 404s until Railway HTTPS backend URL is set in Settings -> Secrets and variables -> Actions -> Variables."
+            echo "::error::VITE_API_BASE_URL must be configured for production booking."
+            exit 1
           else
             case "$VITE_API_BASE_URL" in
               https://*) ;;
@@ -69,7 +70,7 @@ jobs:
             fi
           fi
         env:
-          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL || 'https://celebrationsisterseventdecor-production.up.railway.app' }}
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
