@@ -107,6 +107,7 @@ import {
   type DatabaseSchema,
 } from './store.ts';
 import { buildTotpProvisioningUri, generateTotpSecret } from './totp.ts';
+import { stagingExternalAuthEnabled, STAGING_ADMIN_SUBJECT } from './stagingExternalAuthPolicy.ts';
 
 export interface SupabaseAuthClientLike {
   auth: {
@@ -463,6 +464,14 @@ export function createApp(options: CreateAppOptions = {}) {
   });
 
   function requireAdminMfa(ctx: AuthenticatedContext, res: Response): boolean {
+    // External Auth mode does not accept locally signed admin cookies as proof of AAL2.
+    if (stagingExternalAuthEnabled(process.env) &&
+        (ctx.authMethod !== 'supabase_jwt' ||
+         ctx.session.supabaseUserId !== STAGING_ADMIN_SUBJECT ||
+         ctx.aal !== 'aal2')) {
+      res.status(403).json({ error: 'Verified external administrator AAL2 session required.', code: 'MFA_REQUIRED' });
+      return false;
+    }
     return requireAdminWithMfa(ctx, res);
   }
 
