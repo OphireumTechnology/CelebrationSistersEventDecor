@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import express from 'express';
+import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,9 +8,15 @@ import { chromium } from 'playwright-core';
 import { createApp } from '../server/app.ts';
 import { generateTotpCode } from '../server/totp.ts';
 
-const CHROMIUM_EXECUTABLE =
-  process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ||
+const SANDBOX_CHROMIUM_PATH =
   '/ms-playwright/chromium_headless_shell-1247/chrome-headless-shell-linux64/chrome-headless-shell';
+
+function resolveChromiumExecutablePath(): string | undefined {
+  const configured = (process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || '').trim();
+  if (configured) return configured;
+  if (fsSync.existsSync(SANDBOX_CHROMIUM_PATH)) return SANDBOX_CHROMIUM_PATH;
+  return undefined;
+}
 
 interface AcceptanceCheck {
   id: string;
@@ -72,8 +79,9 @@ async function main() {
   let browser: Awaited<ReturnType<typeof chromium.launch>> | null = null;
 
   try {
+    const executablePath = resolveChromiumExecutablePath();
     browser = await chromium.launch({
-      executablePath: CHROMIUM_EXECUTABLE,
+      ...(executablePath ? { executablePath } : {}),
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
     });

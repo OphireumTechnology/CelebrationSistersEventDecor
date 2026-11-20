@@ -17,12 +17,13 @@ describe('Phase 17F — SQLSTATE Error Classification, Staging Harnesses & Concu
   it('classifies PostgreSQL SQLSTATE 23P01/23505/40001 -> 409, 42501 -> 403, and 08006/57P01 -> 503 with zero PII leakage', () => {
     const excl = classifyDatabaseError({
       code: '23P01',
-      message: 'conflicting key value violates exclusion constraint "consultations_no_overlapping_active_slot" (client@secret.com)',
+      message:
+        'conflicting key value violates exclusion constraint "excl_consultations_planner_buffered_overlap" (client@secret.com)',
     });
     assert.equal(excl?.httpStatus, 409);
     assert.equal(excl?.code, 'SLOT_CONFLICT');
     assert.equal(excl?.message.includes('client@secret.com'), false);
-    assert.equal(excl?.message.includes('consultations_no_overlapping_active_slot'), false);
+    assert.equal(excl?.message.includes('excl_consultations_planner_buffered_overlap'), false);
 
     const unique = classifyDatabaseError({ code: '23505', message: 'duplicate key value' });
     assert.equal(unique?.httpStatus, 409);
@@ -205,5 +206,31 @@ describe('Phase 17F — SQLSTATE Error Classification, Staging Harnesses & Concu
       if (prevAdapter === undefined) delete process.env.PERSISTENCE_ADAPTER;
       else process.env.PERSISTENCE_ADAPTER = prevAdapter;
     }
+  });
+
+  it('keeps run-migrations.ts schema_migrations DDL compatible with migrations 005-008 filename/checksum columns', async () => {
+    const runnerSrc = await fs.readFile(path.resolve(process.cwd(), 'scripts/run-migrations.ts'), 'utf8');
+    assert.match(runnerSrc, /filename TEXT NOT NULL DEFAULT ''/i);
+    assert.match(runnerSrc, /ADD COLUMN IF NOT EXISTS filename TEXT NOT NULL DEFAULT ''/i);
+    assert.match(runnerSrc, /ADD COLUMN IF NOT EXISTS checksum_sha256 TEXT/i);
+    assert.doesNotMatch(runnerSrc, /checksum_sha256 TEXT NOT NULL/i);
+    assert.match(runnerSrc, /INSERT INTO public\.schema_migrations \(version, checksum_sha256, filename\)/i);
+    assert.match(runnerSrc, /ON CONFLICT \(version\) DO UPDATE/i);
+  });
+
+  it('keeps verify-staging-postgres.ts SQL strictly aligned with real migrations 001-008 columns, constraints & roles', async () => {
+    const verifierSrc = await fs.readFile(path.resolve(process.cwd(), 'scripts/verify-staging-postgres.ts'), 'utf8');
+    assert.match(verifierSrc, /excl_consultations_planner_buffered_overlap/);
+    assert.match(verifierSrc, /'notification_worker'/);
+    assert.match(verifierSrc, /consultation_start_utc/);
+    assert.match(verifierSrc, /consultation_end_utc/);
+    assert.match(verifierSrc, /v_vendor_booking_briefs/);
+    assert.match(verifierSrc, /consultation_slot_holds/);
+    assert.match(verifierSrc, /restoredConnectivityVerified/);
+    // Ensure previously defective phantom column/constraint/role names never return
+    assert.doesNotMatch(verifierSrc, /consultations_no_overlapping_active_slot/);
+    assert.doesNotMatch(verifierSrc, /\bclient_user_id\b/);
+    assert.doesNotMatch(verifierSrc, /\brecipient_email\b/);
+    assert.doesNotMatch(verifierSrc, /withRoleContext\('worker'/);
   });
 });

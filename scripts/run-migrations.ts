@@ -57,17 +57,28 @@ export async function runMigrationsOnClient(
   await client.query(`
     CREATE TABLE IF NOT EXISTS public.schema_migrations (
       version TEXT PRIMARY KEY,
-      checksum_sha256 TEXT NOT NULL,
+      filename TEXT NOT NULL DEFAULT '',
+      checksum_sha256 TEXT,
       applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
+  await client.query(`
+    ALTER TABLE public.schema_migrations
+      ADD COLUMN IF NOT EXISTS filename TEXT NOT NULL DEFAULT '';
+  `);
+  await client.query(`
+    ALTER TABLE public.schema_migrations
+      ADD COLUMN IF NOT EXISTS checksum_sha256 TEXT;
+  `);
 
-  const existingResult = await client.query<{ version: string; checksum_sha256: string }>(
+  const existingResult = await client.query<{ version: string; checksum_sha256: string | null }>(
     `SELECT version, checksum_sha256 FROM public.schema_migrations ORDER BY version ASC`,
   );
   const appliedMap = new Map<string, string>();
   for (const row of existingResult.rows) {
-    appliedMap.set(row.version, row.checksum_sha256);
+    if (row.checksum_sha256) {
+      appliedMap.set(row.version, row.checksum_sha256);
+    }
   }
 
   const applied: string[] = [];
@@ -95,8 +106,12 @@ export async function runMigrationsOnClient(
     try {
       await client.query(file.sql);
       await client.query(
-        `INSERT INTO public.schema_migrations (version, checksum_sha256) VALUES ($1, $2)`,
-        [file.version, file.checksumSha256],
+        `INSERT INTO public.schema_migrations (version, checksum_sha256, filename)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (version) DO UPDATE
+           SET checksum_sha256 = EXCLUDED.checksum_sha256,
+               filename = EXCLUDED.filename`,
+        [file.version, file.checksumSha256, file.filename],
       );
       await client.query('COMMIT');
       applied.push(file.filename);

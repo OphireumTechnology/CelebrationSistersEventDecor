@@ -1,19 +1,24 @@
 # Phase 17F — Railway Staging Backend & Live Availability Acceptance (`REQ-RAIL-01`)
 
 **Public Website Probed Live (`2026-11-19`):** https://celebrationsistersdecor.com/  
-**Live Bundle Verified:** `/assets/index-bdbFLwYt.js` (deployed from GitHub `main` SHA `6b540d458257f5566c2c2fc916fb92154f980142` via Run `44619161406`)  
-**Turnkey Staging Verifiers:** `scripts/verify-staging-railway-and-resend.ts`, `scripts/phase16-browser-acceptance.ts` (`TARGET_FRONTEND_URL` + `TARGET_API_BASE_URL` enabled)  
+**Live Bundle Verified:** `/assets/index-bdbFLwYt.js` (deployed from GitHub `main` SHA `5f1982df7a86b9c49da9ce0781b8215b79a97f1e` via Run `44621911905`)  
+**Turnkey Staging Verifiers:** `scripts/verify-staging-railway-and-resend.ts`, `scripts/phase16-browser-acceptance.ts` (`TARGET_FRONTEND_URL` + `TARGET_API_BASE_URL` + portable Chromium resolution enabled)  
 **Requirement Status:** **`BLOCKED`** *(live website zero-404 repair verified in real Chromium on `https://celebrationsistersdecor.com/`; live Railway staging deployment & `VITE_API_BASE_URL` cutover blocked by missing Railway credentials and GitHub repository variable write access in sandbox)*
 
 ---
 
 ## 1. Live Headless Chromium Verification on `https://celebrationsistersdecor.com/` (`VERIFIED`)
 
-After commit `6b540d458257f5566c2c2fc916fb92154f980142` deployed via Run `44619161406`, real headless Chromium directly loaded `https://celebrationsistersdecor.com/` and clicked "Book a Consultation":
+After commit `5f1982df7a86b9c49da9ce0781b8215b79a97f1e` deployed via Run `44621911905`, real headless Chromium directly loaded `https://celebrationsistersdecor.com/` and clicked "Book a Consultation":
 
 ```json
 {
+  "httpStatus": 200,
+  "url": "https://celebrationsistersdecor.com/",
   "title": "Celebration Sisters Event Decor — Luxury Event Planning & Design",
+  "scripts": [
+    "/assets/index-bdbFLwYt.js"
+  ],
   "dialogVisible": true,
   "apiResponses": [],
   "api404Count": 0,
@@ -42,7 +47,7 @@ After commit `6b540d458257f5566c2c2fc916fb92154f980142` deployed via Run `446191
 1. **`scripts/verify-staging-railway-and-resend.ts` (13 checks):**
    - Verified end-to-end against a live Express server in `tests/phase17f-staging-harnesses.test.ts` (Test 3 — **13/13 checks passed**: `/health`, `/ready`, `/api/auth/config`, CORS preflight with `X-Consultation-Token` + `Idempotency-Key`, live `/api/consultations/availability`, 120-minute notice rejection, booking creation + outbox queuing, `Idempotency-Key` replay, wrong-token `403` vs valid-token `200`, reschedule + cancel release, plus 3 Svix webhook security checks).
 2. **`scripts/phase16-browser-acceptance.ts` (20 Playwright scenarios):**
-   - Upgraded in Phase 17F to accept `TARGET_FRONTEND_URL` and `TARGET_API_BASE_URL` so all 20 Desktop (`1440x900`) and Mobile (`390x844`) Playwright scenarios can execute directly against real Railway Staging HTTPS + PostgreSQL 16+ services with zero script changes.
+   - Supports `TARGET_FRONTEND_URL` + `TARGET_API_BASE_URL` and portable Chromium resolution (works both inside the AI Studio sandbox and on standard macOS/Linux/CI Playwright installations).
    - Local compiled execution passed **20 / 20** (`0` console errors, `0` pageerrors).
 
 ---
