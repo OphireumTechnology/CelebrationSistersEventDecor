@@ -54,6 +54,37 @@ export async function runMigrationsOnClient(
   const dryRun = Boolean(options?.dryRun);
   const files = await loadMigrationFiles(options?.migrationsDir);
 
+  // Dry-run must never create or alter schema_migrations, even on a fresh database.
+  // Inspect the catalog first so an absent history table is treated as all pending.
+  if (dryRun) {
+    const catalog = await client.query<{ migrations_table: string | null }>(
+      "SELECT to_regclass('public.schema_migrations') AS migrations_table",
+    );
+    const hasHistory = Boolean(catalog.rows[0]?.migrations_table);
+    const history = hasHistory
+      ? await client.query<{ version: string; checksum_sha256: string | null }>(
+          'SELECT version, checksum_sha256 FROM public.schema_migrations ORDER BY version ASC',
+        )
+      : { rows: [] as { version: string; checksum_sha256: string | null }[] };
+    const existing = new Map(history.rows.map((row) => [row.version, row.checksum_sha256]));
+    const skipped: string[] = [];
+    const pending: string[] = [];
+    for (const file of files) {
+      if (!existing.has(file.version)) {
+        pending.push(file.filename);
+        continue;
+      }
+      const checksum = existing.get(file.version);
+      if (!checksum || checksum !== file.checksumSha256) {
+        throw new Error(
+          `MIGRATION_CHECKSUM_MISMATCH: Applied migration "${file.version}" has missing or mismatched checksum in schema_migrations.`,
+        );
+      }
+      skipped.push(file.filename);
+    }
+    return { dryRun: true, totalFiles: files.length, applied: [], skipped, pending };
+  }
+
   await client.query(`
     CREATE TABLE IF NOT EXISTS public.schema_migrations (
       version TEXT PRIMARY KEY,
