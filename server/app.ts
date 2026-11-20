@@ -934,6 +934,9 @@ export function createApp(options: CreateAppOptions = {}) {
     '/api/auth/mfa/totp/enroll',
     rateLimit(5, 60_000, { failClosed: true, endpointGroup: 'mfa' }),
     async (req: Request, res: Response) => {
+      if (stagingExternalAuthEnabled(process.env)) {
+        return res.status(409).json({code:'SUPABASE_MFA_REQUIRED',error:'Enroll MFA through Supabase Auth mfa.enroll and mfa.challengeAndVerify in the authenticated client; application-local TOTP is not Supabase AAL2.'});
+      }
       const { db: preflightDb, ctx } = await getAuth(req);
       if (!requireActiveAccount(ctx, res)) return;
       if (ctx.session.role !== 'admin') {
@@ -1013,6 +1016,9 @@ export function createApp(options: CreateAppOptions = {}) {
     '/api/auth/mfa/verify',
     rateLimit(10, 60_000, { failClosed: true, endpointGroup: 'mfa' }),
     async (req: Request, res: Response) => {
+      if (stagingExternalAuthEnabled(process.env)) {
+        return res.status(409).json({code:'SUPABASE_MFA_REQUIRED',error:'Use the Supabase Auth challengeAndVerify flow to obtain a genuine AAL2 access token.'});
+      }
       const { ctx } = await getAuth(req);
       if (!requireActiveAccount(ctx, res)) return;
       const parsed = z.object({ code: z.string().trim().min(6).max(16) }).safeParse(req.body);
