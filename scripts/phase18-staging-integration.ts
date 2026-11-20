@@ -1,5 +1,6 @@
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
+import { verifyStagingRailwayAndResend } from './verify-staging-railway-and-resend.ts';
 if (process.env.STAGING_DB_CONFIRM !== 'YES_ISOLATED_STAGING' || process.env.RAILWAY_ENVIRONMENT_NAME !== 'staging') throw new Error('staging-only runner');
 const port = Number(process.env.PORT || 8080);
 let status = 'running';
@@ -38,6 +39,15 @@ async function run(){
  await check('invalid-bearer-session','/api/auth/session',[200],{Authorization:'Bearer invalid.staging.jwt'});
  await check('anonymous-bookings','/api/bookings',[401,403]);
  await check('forged-role-bookings','/api/bookings',[401,403],{'x-user-role':'admin','x-user-id':'fake-staging-user'});
+ try {
+  const journey=await verifyStagingRailwayAndResend({apiBaseUrl:base,frontendOrigin:'https://celebrationsistersdecor.com',requireHttps:false,requirePostgres:true,requireCanonicalMigrations:true,checkUnauthenticatedGuards:true,requireSupabaseAuth:false,requireResendLive:false});
+  for(const c of journey.checks) {
+   results.push({name:c.id,passed:c.passed,detail:c.detail});
+   console.log('PHASE18_JOURNEY '+JSON.stringify({id:c.id,passed:c.passed,detail:c.detail}));
+  }
+ } catch(e) {
+  results.push({name:'booking-journey-runtime',passed:false,error:e instanceof Error?e.message:'unexpected error'});
+ }
  status=results.every(r=>r.passed===true)?'passed':'failed';
  console.log('PHASE18_SUMMARY '+JSON.stringify({status,results}));
 }
