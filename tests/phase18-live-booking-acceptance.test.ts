@@ -171,9 +171,11 @@ test('Phase 18: getStudioTodayIso resolves Columbia, SC (America/New_York) date 
 
 test('Phase 18: Header-based X-Consultation-Token self-service lifecycle + cross-origin CORS preflight', async () => {
   const prevOrigins = process.env.ALLOWED_ORIGINS;
-  const prevDataPath = process.env.DATA_FILE_PATH;
+  const prevDbPath = process.env.CS_DB_PATH;
+  const prevAdapter = process.env.PERSISTENCE_ADAPTER;
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-phase18-'));
-  process.env.DATA_FILE_PATH = path.join(tmpDir, 'db.json');
+  process.env.CS_DB_PATH = path.join(tmpDir, 'db.json');
+  process.env.PERSISTENCE_ADAPTER = 'json-local';
   process.env.ALLOWED_ORIGINS = 'https://celebrationsistersdecor.com,https://www.celebrationsistersdecor.com';
   const srv = await startTestServer();
 
@@ -218,7 +220,7 @@ test('Phase 18: Header-based X-Consultation-Token self-service lifecycle + cross
       headers: {
         'Content-Type': 'application/json',
         Origin: 'https://celebrationsistersdecor.com',
-        'Idempotency-Key': 'phase18-header-token-lifecycle-1',
+        'Idempotency-Key': `phase18-header-token-lifecycle-${Date.now()}`,
       },
       body: JSON.stringify({
         eventType: 'Full-Service Wedding Planning & Floral Production',
@@ -312,8 +314,10 @@ test('Phase 18: Header-based X-Consultation-Token self-service lifecycle + cross
     await srv.close();
     if (prevOrigins === undefined) delete process.env.ALLOWED_ORIGINS;
     else process.env.ALLOWED_ORIGINS = prevOrigins;
-    if (prevDataPath === undefined) delete process.env.DATA_FILE_PATH;
-    else process.env.DATA_FILE_PATH = prevDataPath;
+    if (prevDbPath === undefined) delete process.env.CS_DB_PATH;
+    else process.env.CS_DB_PATH = prevDbPath;
+    if (prevAdapter === undefined) delete process.env.PERSISTENCE_ADAPTER;
+    else process.env.PERSISTENCE_ADAPTER = prevAdapter;
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
@@ -331,5 +335,9 @@ test('Phase 18: Frontend ConsultationModal & deploy-pages.yml security and produ
 
   const workflowSource = fs.readFileSync(path.resolve(process.cwd(), '.github/workflows/deploy-pages.yml'), 'utf8');
   assert.match(workflowSource, /celebrationsisterseventdecor-production\.up\.railway\.app/);
-  assert.match(workflowSource, /ERROR: VITE_API_BASE_URL is empty/);
+  assert.match(
+    workflowSource,
+    /if \[ -z "\$\{VITE_API_BASE_URL:-\}" \]; then[\s\S]*?(::error::|ERROR:).*VITE_API_BASE_URL[\s\S]*?exit 1/,
+    'deploy-pages.yml must fail closed with exit 1 when VITE_API_BASE_URL is empty',
+  );
 });

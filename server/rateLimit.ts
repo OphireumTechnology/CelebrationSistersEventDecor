@@ -102,7 +102,9 @@ export class PostgresRateLimitStore implements RateLimitStore {
   private readonly fallback = new InMemoryRateLimitStore();
   private readonly queryTimeoutMs: number;
   private readonly retryAfterSecondsOnOutage: number;
-  private tableBootstrapAttempted = false;
+  private tableBootstrapPromise: Promise<void> | null = null;
+  private tableBootstrapDone = false;
+  private tableBootstrapFailed = false;
 
   constructor(
     private readonly db: PgQueryable,
@@ -171,15 +173,31 @@ export class PostgresRateLimitStore implements RateLimitStore {
             ? (firstErr as { code: string }).code
             : '';
         // Fresh Railway PostgreSQL instances that have not yet run db/migrations/004 return 42P01 (undefined_table).
-        // Bootstrap the idempotent rate_limit_buckets table once (matching migration 004 DDL) and retry.
+        // Coordinate a single-flight idempotent bootstrap (matching migration 004 DDL) so concurrent cold-start
+        // requests all await the same DDL completion and retry cleanly without spurious 503s.
         // Real DB outages, timeouts, and restricted roles without CREATE privileges still fail closed (503).
-        if (firstCode === '42P01' && !this.tableBootstrapAttempted) {
-          this.tableBootstrapAttempted = true;
-          await this.ensureRateLimitTable();
-          logStructured('warn', 'rate_limit_table_bootstrapped', {
-            endpointGroup: options.endpointGroup || 'general',
-            message: 'Bootstrapped missing rate_limit_buckets table (apply db/migrations 001-008 via scripts/run-migrations.ts).',
-          });
+        if (firstCode === '42P01' && !this.tableBootstrapFailed) {
+          if (!this.tableBootstrapDone) {
+            if (!this.tableBootstrapPromise) {
+              this.tableBootstrapPromise = this.ensureRateLimitTable()
+                .then(() => {
+                  this.tableBootstrapDone = true;
+                  logStructured('warn', 'rate_limit_table_bootstrapped', {
+                    endpointGroup: options.endpointGroup || 'general',
+                    message:
+                      'Bootstrapped missing rate_limit_buckets table (apply db/migrations 001-008 via scripts/run-migrations.ts).',
+                  });
+                })
+                .catch((bootstrapErr) => {
+                  this.tableBootstrapFailed = true;
+                  throw bootstrapErr;
+                })
+                .finally(() => {
+                  this.tableBootstrapPromise = null;
+                });
+            }
+            await this.tableBootstrapPromise;
+          }
           res = await this.upsertBucket(key, resetAt.toISOString());
         } else {
           throw firstErr;

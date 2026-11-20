@@ -20,6 +20,10 @@ export interface StagingApiVerifyOptions {
   resendWebhookSecret?: string;
   requireHttps?: boolean;
   requirePostgres?: boolean;
+  requireCanonicalMigrations?: boolean;
+  checkUnauthenticatedGuards?: boolean;
+  requireSupabaseAuth?: boolean;
+  requireResendLive?: boolean;
 }
 
 export interface StagingApiCheckResult {
@@ -70,18 +74,75 @@ export async function verifyStagingRailwayAndResend(
   const readyRes = await fetch(`${baseUrl}/ready`);
   const readyBody = (await readyRes.json()) as {
     ok?: boolean;
-    persistence?: { adapter?: string; ready?: boolean; connected?: boolean };
-    email?: { configured?: boolean; liveDeliveryEnabled?: boolean };
+    persistence?: {
+      adapter?: string;
+      ready?: boolean;
+      connected?: boolean;
+      schema?: {
+        rateLimitTablePresent?: boolean;
+        migrationsTablePresent?: boolean;
+        migrationsAppliedCount?: number;
+      };
+    };
+    auth?: {
+      provider?: string;
+      supabaseConfigured?: boolean;
+      readyForProductionAuth?: boolean;
+    };
+    email?: { configured?: boolean; liveDeliveryEnabled?: boolean; provider?: string };
   };
   const pgOk = options.requirePostgres
     ? readyBody.persistence?.adapter === 'postgres' && readyBody.persistence?.connected === true
     : readyBody.persistence?.ready === true;
+  const schema = readyBody.persistence?.schema;
+  const migrationsOk = options.requireCanonicalMigrations
+    ? Boolean(
+        schema?.rateLimitTablePresent === true &&
+          schema?.migrationsTablePresent === true &&
+          (schema?.migrationsAppliedCount ?? 0) >= 8,
+      )
+    : true;
   checks.push({
     id: 'STG-API-02',
-    check: 'GET /ready confirms database connectivity & readiness',
-    passed: readyRes.status === 200 && readyBody.ok === true && pgOk,
-    detail: `status=${readyRes.status}, adapter=${readyBody.persistence?.adapter}, connected=${readyBody.persistence?.connected}`,
+    check: 'GET /ready confirms database connectivity, readiness & schema state',
+    passed: readyRes.status === 200 && readyBody.ok === true && pgOk && migrationsOk,
+    detail: `status=${readyRes.status}, adapter=${readyBody.persistence?.adapter}, connected=${readyBody.persistence?.connected}, rateLimitTable=${String(schema?.rateLimitTablePresent)}, migrationsApplied=${String(schema?.migrationsAppliedCount ?? 'n/a')}`,
   });
+
+  if (options.requireSupabaseAuth) {
+    checks.push({
+      id: 'STG-AUTH-01',
+      check: 'GET /ready confirms Supabase Auth is configured and ready for production auth',
+      passed:
+        readyBody.auth?.supabaseConfigured === true && readyBody.auth?.readyForProductionAuth === true,
+      detail: `provider=${readyBody.auth?.provider ?? 'unknown'}, supabaseConfigured=${String(readyBody.auth?.supabaseConfigured)}, readyForProductionAuth=${String(readyBody.auth?.readyForProductionAuth)}`,
+    });
+  }
+
+  if (options.requireResendLive) {
+    checks.push({
+      id: 'STG-RES-00',
+      check: 'GET /ready confirms Resend live email delivery is configured and enabled',
+      passed:
+        readyBody.email?.configured === true && readyBody.email?.liveDeliveryEnabled === true,
+      detail: `provider=${readyBody.email?.provider ?? 'unknown'}, configured=${String(readyBody.email?.configured)}, liveDeliveryEnabled=${String(readyBody.email?.liveDeliveryEnabled)}`,
+    });
+  }
+
+  if (options.checkUnauthenticatedGuards) {
+    const [unauthConsults, unauthMetrics] = await Promise.all([
+      fetch(`${baseUrl}/api/consultations`),
+      fetch(`${baseUrl}/api/admin/metrics`),
+    ]);
+    checks.push({
+      id: 'STG-SEC-01',
+      check: 'Protected admin & consultation listing routes reject unauthenticated access (401/403)',
+      passed:
+        (unauthConsults.status === 401 || unauthConsults.status === 403) &&
+        (unauthMetrics.status === 401 || unauthMetrics.status === 403),
+      detail: `consultations=${unauthConsults.status}, adminMetrics=${unauthMetrics.status}`,
+    });
+  }
 
   // 2. Auth config bootstrap (zero-404 production posture)
   const authCfgRes = await fetch(`${baseUrl}/api/auth/config`);
@@ -342,7 +403,13 @@ async function main() {
         mode: 'self-check',
         guardRequired: 'STAGING_API_CONFIRM=YES_ISOLATED_STAGING',
         envRequired: ['STAGING_API_BASE_URL'],
-        optionalEnv: ['STAGING_FRONTEND_ORIGIN', 'STAGING_RESEND_TEST_EMAIL', 'RESEND_WEBHOOK_SECRET'],
+        optionalEnv: [
+          'STAGING_FRONTEND_ORIGIN',
+          'STAGING_RESEND_TEST_EMAIL',
+          'RESEND_WEBHOOK_SECRET',
+          'STAGING_REQUIRE_SUPABASE_AUTH',
+          'STAGING_REQUIRE_RESEND_LIVE',
+        ],
       }),
     );
     return;
@@ -363,6 +430,10 @@ async function main() {
     resendWebhookSecret: process.env.RESEND_WEBHOOK_SECRET,
     requireHttps: true,
     requirePostgres: true,
+    requireCanonicalMigrations: true,
+    checkUnauthenticatedGuards: true,
+    requireSupabaseAuth: process.env.STAGING_REQUIRE_SUPABASE_AUTH === 'true',
+    requireResendLive: process.env.STAGING_REQUIRE_RESEND_LIVE === 'true',
   });
 
   console.log(JSON.stringify(report, null, 2));
