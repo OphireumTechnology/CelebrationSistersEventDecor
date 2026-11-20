@@ -7,6 +7,7 @@ import {
   type VerifyProviderTokenOptions,
 } from './identityProvider.ts';
 import { verifyTotpCode } from './totp.ts';
+import { stagingExternalAuthEnabled, STAGING_ADMIN_SUBJECT, STAGING_AUTH_PROJECT_REF } from './stagingExternalAuthPolicy.ts';
 
 export const SESSION_COOKIE_NAME = 'cs_session';
 export const CSRF_COOKIE_NAME = 'cs_csrf';
@@ -322,7 +323,13 @@ export async function resolveAuthenticatedContextAsync(
 
     // Standard 3-part JWS indicates an external identity provider JWT (Supabase Auth)
     if (rawToken.split('.').length === 3) {
-      const claims = await verifyProviderAccessToken(rawToken, providerVerifyOptions);
+      // Explicit staging-only external issuer. Never let a failed external verification
+      // fall back to another issuer, local token, email, or mutable role metadata.
+      const externalStaging = stagingExternalAuthEnabled(process.env);
+      const verificationOptions = externalStaging
+        ? { supabaseUrl: `https://${STAGING_AUTH_PROJECT_REF}.supabase.co` }
+        : providerVerifyOptions;
+      const claims = await verifyProviderAccessToken(rawToken, verificationOptions);
       if (!claims) {
         return guestContext(true);
       }
@@ -330,6 +337,19 @@ export async function resolveAuthenticatedContextAsync(
         return guestContext(true, true);
       }
       const resolved = resolveTrustedUserFromClaims(claims, registeredUsers);
+      // External Auth never creates an admin. The UUID must already be bound
+      // to a trusted active staging administrator record; otherwise deny.
+      if (externalStaging && claims.sub === STAGING_ADMIN_SUBJECT &&
+          (resolved.user.role !== 'admin' ||
+           resolved.user.supabaseUserId !== STAGING_ADMIN_SUBJECT ||
+           resolved.accountStatus !== 'active')) {
+        return guestContext(true);
+      }
+      // A different issuer's JWT may not inherit an existing privileged record.
+      if (externalStaging && resolved.user.role === 'admin' &&
+          (claims.sub !== STAGING_ADMIN_SUBJECT || claims.aal !== 'aal2')) {
+        return guestContext(true);
+      }
       return {
         session: resolved.user,
         sessionJti: claims.sessionId ? `sb:${claims.sessionId}` : undefined,
