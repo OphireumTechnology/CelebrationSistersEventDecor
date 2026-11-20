@@ -409,6 +409,25 @@ export function createApp(options: CreateAppOptions = {}) {
       options.providerVerifyOptions,
       db.revokedSessionIds,
     );
+    // Central fail-closed privilege boundary: ALL route handlers receive a
+    // non-admin context unless the current request carries genuine external
+    // Supabase AAL2 for the pinned immutable staging administrator UUID.
+    // AAL1 is allowed only on the MFA enrollment/challenge endpoints.
+    if (stagingExternalAuthEnabled(process.env) && ctx.session.role === 'admin') {
+      const mfaPath = req.path === '/api/auth/mfa/totp/enroll' ||
+        req.path === '/api/auth/mfa/verify' ||
+        req.path === '/api/auth/mfa/recover';
+      const validExternal = ctx.authMethod === 'supabase_jwt' &&
+        ctx.session.supabaseUserId === STAGING_ADMIN_SUBJECT;
+      if (!validExternal || (!mfaPath && ctx.aal !== 'aal2')) {
+        return { db, ctx: {
+          ...ctx,
+          session: { ...ctx.session, role: 'guest' as const },
+          mfaVerified: false,
+          spoofAttemptDetected: true,
+        } };
+      }
+    }
     return { db, ctx };
   }
 
