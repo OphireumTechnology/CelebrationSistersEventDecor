@@ -38,6 +38,7 @@ import {
 import { generateConceptProposal, getGeminiConfigStatus, runConciergeTurn } from './gemini.ts';
 import {
   createSupabasePublicClient,
+  createStagingExternalAuthClient,
   getIdentityProviderStatus,
   resolveTrustedUserFromClaims,
   verifyProviderAccessToken,
@@ -628,7 +629,8 @@ export function createApp(options: CreateAppOptions = {}) {
       const normalizedEmail = parsed.data.email.toLowerCase();
       const emailHash = sha256Hex(normalizedEmail).slice(0, 16);
       const authClient: SupabaseAuthClientLike | null =
-        options.supabaseAuthClient !== undefined ? options.supabaseAuthClient : createSupabasePublicClient();
+        options.supabaseAuthClient !== undefined ? options.supabaseAuthClient :
+          stagingExternalAuthEnabled(process.env) ? createStagingExternalAuthClient() : createSupabasePublicClient();
 
       if (!authClient) {
         return res.status(503).json({
@@ -669,7 +671,10 @@ export function createApp(options: CreateAppOptions = {}) {
         });
       }
 
-      const claims = await verifyProviderAccessToken(accessToken, options.providerVerifyOptions);
+      const claims = await verifyProviderAccessToken(accessToken,
+        stagingExternalAuthEnabled(process.env)
+          ? { supabaseUrl: 'https://nswxwwmtcasmkjtmrdqg.supabase.co' }
+          : options.providerVerifyOptions);
       if (!claims) {
         await withTransaction((db) => {
           appendSecurityEvent(db, {
@@ -735,6 +740,15 @@ export function createApp(options: CreateAppOptions = {}) {
         });
       }
 
+      if (stagingExternalAuthEnabled(process.env) && claims.sub === STAGING_ADMIN_SUBJECT &&
+          (resolved.user.role !== 'admin' || resolved.user.supabaseUserId !== STAGING_ADMIN_SUBJECT)) {
+        return res.status(403).json({error:'Staging administrator identity has not been securely bound.',code:'STAGING_ADMIN_BINDING_REQUIRED'});
+      }
+      if (stagingExternalAuthEnabled(process.env) && resolved.user.role === 'admin' &&
+          claims.sub !== STAGING_ADMIN_SUBJECT) {
+        return res.status(403).json({error:'Administrator identity is not authorized in staging.',code:'STAGING_ADMIN_FORBIDDEN'});
+      }
+
       const authoritativeUser = await withTransaction((db) => {
         let userRecord = db.users.find(
           (u) => u.id === resolved.user.id || (u.supabaseUserId && u.supabaseUserId === claims.sub),
@@ -785,11 +799,13 @@ export function createApp(options: CreateAppOptions = {}) {
         expiresAt: Date.now() + 1000 * 60 * 60 * 8,
       });
 
-      setSessionCookie(res, token, { req, csrfToken });
+      // In external Auth staging mode return the genuine provider JWT, never a
+      // locally signed token that could incorrectly claim provider AAL2.
+      if (!stagingExternalAuthEnabled(process.env)) setSessionCookie(res, token, { req, csrfToken });
       return res.json({
         user: sanitizeUserForClient(authoritativeUser),
-        token,
-        csrfToken,
+        token: stagingExternalAuthEnabled(process.env) ? accessToken : token,
+        csrfToken: stagingExternalAuthEnabled(process.env) ? undefined : csrfToken,
         mfaRequired: authoritativeUser.role === 'admin' && !mfaVerified,
         mfaVerified,
         mfaEnrolled: Boolean(authoritativeUser.mfaEnrolled),
