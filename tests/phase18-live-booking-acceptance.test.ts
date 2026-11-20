@@ -331,5 +331,7 @@ test('Phase 18: Frontend ConsultationModal & deploy-pages.yml security and produ
 
   const workflowSource = fs.readFileSync(path.resolve(process.cwd(), '.github/workflows/deploy-pages.yml'), 'utf8');
   assert.match(workflowSource, /celebrationsisterseventdecor-production\.up\.railway\.app/);
-  assert.match(workflowSource, /ERROR: VITE_API_BASE_URL is empty/);
+  assert.match(workflowSource, /::error::VITE_API_BASE_URL must be configured for production booking\./);
+  assert.match(workflowSource, /if \[ -z "\$\{VITE_API_BASE_URL:-\}" \]; then/);
+  assert.match(workflowSource, /exit 1/);
 });
