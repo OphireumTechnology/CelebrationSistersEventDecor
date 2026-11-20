@@ -1,5 +1,6 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from 'jose';
+import { stagingExternalAuthEnabled, STAGING_AUTH_PROJECT_REF } from './stagingExternalAuthPolicy.ts';
 import type { AccountStatus, UserRole, UserSession } from '../src/types/domain.ts';
 
 export interface IdentityProviderStatus {
@@ -264,4 +265,15 @@ export function resolveTrustedUserFromClaims(
     mfaVerified: claims.aal === 'aal2',
     emailPrivilegeBindBlocked,
   };
+}
+
+/** Separate, public-key-only client for staging verification against existing Auth users.
+ * Never use a production service-role key or mutate Auth admin records. */
+export function createStagingExternalAuthClient(): SupabaseClient | null {
+  if (!stagingExternalAuthEnabled(process.env)) return null;
+  const key = process.env.PHASE19_EXTERNAL_AUTH_ANON_KEY?.trim();
+  if (!key) return null;
+  return createClient(`https://${STAGING_AUTH_PROJECT_REF}.supabase.co`, key, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  });
 }

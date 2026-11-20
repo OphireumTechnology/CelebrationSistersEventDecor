@@ -38,6 +38,7 @@ import {
 import { generateConceptProposal, getGeminiConfigStatus, runConciergeTurn } from './gemini.ts';
 import {
   createSupabasePublicClient,
+  createStagingExternalAuthClient,
   getIdentityProviderStatus,
   resolveTrustedUserFromClaims,
   verifyProviderAccessToken,
@@ -107,6 +108,7 @@ import {
   type DatabaseSchema,
 } from './store.ts';
 import { buildTotpProvisioningUri, generateTotpSecret } from './totp.ts';
+import { stagingExternalAuthEnabled, STAGING_ADMIN_SUBJECT } from './stagingExternalAuthPolicy.ts';
 
 export interface SupabaseAuthClientLike {
   auth: {
@@ -407,6 +409,25 @@ export function createApp(options: CreateAppOptions = {}) {
       options.providerVerifyOptions,
       db.revokedSessionIds,
     );
+    // Central fail-closed privilege boundary: ALL route handlers receive a
+    // non-admin context unless the current request carries genuine external
+    // Supabase AAL2 for the pinned immutable staging administrator UUID.
+    // AAL1 is allowed only on the MFA enrollment/challenge endpoints.
+    if (stagingExternalAuthEnabled(process.env) && ctx.session.role === 'admin') {
+      const mfaPath = req.path === '/api/auth/mfa/totp/enroll' ||
+        req.path === '/api/auth/mfa/verify' ||
+        req.path === '/api/auth/mfa/recover';
+      const validExternal = ctx.authMethod === 'supabase_jwt' &&
+        ctx.session.supabaseUserId === STAGING_ADMIN_SUBJECT;
+      if (!validExternal || (!mfaPath && ctx.aal !== 'aal2')) {
+        return { db, ctx: {
+          ...ctx,
+          session: { ...ctx.session, role: 'guest' as const },
+          mfaVerified: false,
+          spoofAttemptDetected: true,
+        } };
+      }
+    }
     return { db, ctx };
   }
 
@@ -463,6 +484,14 @@ export function createApp(options: CreateAppOptions = {}) {
   });
 
   function requireAdminMfa(ctx: AuthenticatedContext, res: Response): boolean {
+    // External Auth mode does not accept locally signed admin cookies as proof of AAL2.
+    if (stagingExternalAuthEnabled(process.env) &&
+        (ctx.authMethod !== 'supabase_jwt' ||
+         ctx.session.supabaseUserId !== STAGING_ADMIN_SUBJECT ||
+         ctx.aal !== 'aal2')) {
+      res.status(403).json({ error: 'Verified external administrator AAL2 session required.', code: 'MFA_REQUIRED' });
+      return false;
+    }
     return requireAdminWithMfa(ctx, res);
   }
 
@@ -619,7 +648,8 @@ export function createApp(options: CreateAppOptions = {}) {
       const normalizedEmail = parsed.data.email.toLowerCase();
       const emailHash = sha256Hex(normalizedEmail).slice(0, 16);
       const authClient: SupabaseAuthClientLike | null =
-        options.supabaseAuthClient !== undefined ? options.supabaseAuthClient : createSupabasePublicClient();
+        options.supabaseAuthClient !== undefined ? options.supabaseAuthClient :
+          stagingExternalAuthEnabled(process.env) ? createStagingExternalAuthClient() : createSupabasePublicClient();
 
       if (!authClient) {
         return res.status(503).json({
@@ -660,7 +690,10 @@ export function createApp(options: CreateAppOptions = {}) {
         });
       }
 
-      const claims = await verifyProviderAccessToken(accessToken, options.providerVerifyOptions);
+      const claims = await verifyProviderAccessToken(accessToken,
+        stagingExternalAuthEnabled(process.env)
+          ? { supabaseUrl: 'https://nswxwwmtcasmkjtmrdqg.supabase.co' }
+          : options.providerVerifyOptions);
       if (!claims) {
         await withTransaction((db) => {
           appendSecurityEvent(db, {
@@ -726,6 +759,15 @@ export function createApp(options: CreateAppOptions = {}) {
         });
       }
 
+      if (stagingExternalAuthEnabled(process.env) && claims.sub === STAGING_ADMIN_SUBJECT &&
+          (resolved.user.role !== 'admin' || resolved.user.supabaseUserId !== STAGING_ADMIN_SUBJECT)) {
+        return res.status(403).json({error:'Staging administrator identity has not been securely bound.',code:'STAGING_ADMIN_BINDING_REQUIRED'});
+      }
+      if (stagingExternalAuthEnabled(process.env) && resolved.user.role === 'admin' &&
+          claims.sub !== STAGING_ADMIN_SUBJECT) {
+        return res.status(403).json({error:'Administrator identity is not authorized in staging.',code:'STAGING_ADMIN_FORBIDDEN'});
+      }
+
       const authoritativeUser = await withTransaction((db) => {
         let userRecord = db.users.find(
           (u) => u.id === resolved.user.id || (u.supabaseUserId && u.supabaseUserId === claims.sub),
@@ -776,11 +818,13 @@ export function createApp(options: CreateAppOptions = {}) {
         expiresAt: Date.now() + 1000 * 60 * 60 * 8,
       });
 
-      setSessionCookie(res, token, { req, csrfToken });
+      // In external Auth staging mode return the genuine provider JWT, never a
+      // locally signed token that could incorrectly claim provider AAL2.
+      if (!stagingExternalAuthEnabled(process.env)) setSessionCookie(res, token, { req, csrfToken });
       return res.json({
         user: sanitizeUserForClient(authoritativeUser),
-        token,
-        csrfToken,
+        token: stagingExternalAuthEnabled(process.env) ? accessToken : token,
+        csrfToken: stagingExternalAuthEnabled(process.env) ? undefined : csrfToken,
         mfaRequired: authoritativeUser.role === 'admin' && !mfaVerified,
         mfaVerified,
         mfaEnrolled: Boolean(authoritativeUser.mfaEnrolled),
@@ -890,6 +934,9 @@ export function createApp(options: CreateAppOptions = {}) {
     '/api/auth/mfa/totp/enroll',
     rateLimit(5, 60_000, { failClosed: true, endpointGroup: 'mfa' }),
     async (req: Request, res: Response) => {
+      if (stagingExternalAuthEnabled(process.env)) {
+        return res.status(409).json({code:'SUPABASE_MFA_REQUIRED',error:'Enroll MFA through Supabase Auth mfa.enroll and mfa.challengeAndVerify in the authenticated client; application-local TOTP is not Supabase AAL2.'});
+      }
       const { db: preflightDb, ctx } = await getAuth(req);
       if (!requireActiveAccount(ctx, res)) return;
       if (ctx.session.role !== 'admin') {
@@ -969,6 +1016,9 @@ export function createApp(options: CreateAppOptions = {}) {
     '/api/auth/mfa/verify',
     rateLimit(10, 60_000, { failClosed: true, endpointGroup: 'mfa' }),
     async (req: Request, res: Response) => {
+      if (stagingExternalAuthEnabled(process.env)) {
+        return res.status(409).json({code:'SUPABASE_MFA_REQUIRED',error:'Use the Supabase Auth challengeAndVerify flow to obtain a genuine AAL2 access token.'});
+      }
       const { ctx } = await getAuth(req);
       if (!requireActiveAccount(ctx, res)) return;
       const parsed = z.object({ code: z.string().trim().min(6).max(16) }).safeParse(req.body);
