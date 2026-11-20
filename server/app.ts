@@ -202,9 +202,14 @@ export function evaluateApplicationReadiness(params: {
     );
   }
 
-  const workerReady = worker.healthy;
-  if (!workerReady) {
+  const workerPollingBlocked = isProduction && worker.pollingDisabled;
+  const workerReady = worker.healthy && !workerPollingBlocked;
+  if (!worker.healthy) {
     blockingReasons.push('Background notification outbox worker heartbeat is unhealthy.');
+  } else if (workerPollingBlocked) {
+    blockingReasons.push(
+      'Background notification outbox worker polling is disabled in production (DISABLE_OUTBOX_POLLING=true).',
+    );
   }
 
   const productionReady =

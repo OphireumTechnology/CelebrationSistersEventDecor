@@ -1,0 +1,17 @@
+# Remaining External Blockers Register
+
+**Deliverable Mapping:** `docs/phase29-35/11_REMAINING_BLOCKERS.md`  
+**Audit Timestamp:** `2026-11-20T13:58Z`  
+**Open Source-Code Defects:** **`0`**  
+**Blocked External Requirements:** **`15 / 48`** (grouped into **`6`** actionable external access blockers)
+
+---
+
+| Blocker ID | Affected Requirements | Verified Evidence of Current Blocker | Exact Missing Access / Tooling | Resolution Action |
+|---|---|---|---|---|
+| **BLK-01** | `SRC-06` | Sandbox has no `.git`, `GITHUB_TOKEN`, `gh`, `docker`, or `package-lock.json` (`main` `288d20ea` is green on Run `44679267813`, but Phase 29–35 delta is local-only) | Authorized Git workstation with push access + Docker Engine | Commit Phase 29–35 delta to `release/phase29-35-production-readiness`, run `npm ci`, `npm audit --audit-level=high`, `docker build`, push & open PR against `main`, confirm green hosted CI. |
+| **BLK-02** | `DB-05`, `DB-06`, `OPS-03` | Live Railway `/ready` confirmed `migrationsAppliedCount: 0` & 6 missing canonical tables + missing `excl_consultations_planner_buffered_overlap`; sandbox has no staging `DATABASE_URL` or `psql`/`pg_dump`/`pg_restore` | Isolated Staging PostgreSQL 16+ URL (`DATABASE_URL`), restore DB URL (`STAGING_RESTORE_DATABASE_URL`), `STAGING_DB_CONFIRM=YES_ISOLATED_STAGING`, PostgreSQL client tools | Run `scripts/run-migrations.ts --dry-run`, then `scripts/verify-staging-postgres.ts --backup-restore-drill` on isolated staging PostgreSQL. |
+| **BLK-03** | `BE-06`, `BOOK-05`, `OPS-04`, `OPS-05` | Live Railway `/ready` returns HTTP `503 not_ready`; sandbox has no `RAILWAY_TOKEN` or isolated staging Railway URL | Isolated Staging Railway deployment (`RAILWAY_TOKEN`, `STAGING_API_BASE_URL`, `STAGING_API_CONFIRM=YES_ISOLATED_STAGING`) + alerting access | Deploy `release/phase29-35-production-readiness` to staging Railway, run `scripts/verify-staging-railway-and-resend.ts`, rehearse restart/rollback, and verify alerts. |
+| **BLK-04** | `AUTH-06`, `BOOK-06`, `SEC-06` | Live Railway `/ready` confirmed `supabaseConfigured: false`; live Pages bundle has `hasViteSupabaseUrl: false` | Isolated Staging Supabase project (`SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_JWT_SECRET`, `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`) + bound staging test users | Provision staging Supabase Auth, bind immutable admin/staff/planner/vendor UUIDs, enroll admin TOTP MFA, verify `STG-AUTH-01` & live cross-account isolation. |
+| **BLK-05** | `MAIL-04`, `MAIL-05`, `MAIL-06` | Live Railway `/ready` confirmed `email.configured: false`; live DNS on `celebrationsistersdecor.com` confirmed Porkbun-only SPF and `ENOTFOUND` for `_dmarc`, `resend._domainkey`, and `send` MX | DNS admin access for `celebrationsistersdecor.com`, Resend staging credentials (`RESEND_API_KEY`, `EMAIL_FROM`, `STAFF_NOTIFICATION_EMAIL`, `RESEND_WEBHOOK_SECRET`, `EMAIL_LIVE_DELIVERY_ENABLED=true`), approved QA inbox | Publish SPF/DKIM/DMARC/MX records and verify domain in Resend; configure staging webhook; run `verify-staging-railway-and-resend.ts` with `STAGING_REQUIRE_RESEND_LIVE=true` and confirm inbox receipt + webhook `Delivered` reconciliation. |
+| **BLK-06** | `OPS-06` | Staging acceptance (`STAGING_VERIFIED`) not yet achieved; production mutations require explicit owner authorization | Explicit Owner Sign-Off after `STAGING_VERIFIED` (`47/48` pre-cutover) | Present completed staging evidence package to owner for production migration, env activation, and PR merge approval. |

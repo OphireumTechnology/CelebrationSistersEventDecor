@@ -13,6 +13,13 @@ export function redactStringValue(input: string): string {
   return input.replace(SECRET_VALUE_PATTERN, '[REDACTED]');
 }
 
+const SAFE_OPERATIONAL_DIAGNOSTIC_KEYS = new Set([
+  'emailProvider',
+  'emailLiveEnabled',
+  'emailConfigured',
+  'emailVerified',
+]);
+
 export function redactSensitiveFields<T>(value: T, depth = 0): T {
   if (depth > 6 || value === null || value === undefined) {
     return value;
@@ -26,7 +33,7 @@ export function redactSensitiveFields<T>(value: T, depth = 0): T {
   if (typeof value === 'object') {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      if (SENSITIVE_KEY_PATTERN.test(k)) {
+      if (!SAFE_OPERATIONAL_DIAGNOSTIC_KEYS.has(k) && SENSITIVE_KEY_PATTERN.test(k)) {
         out[k] = '[REDACTED]';
       } else {
         out[k] = redactSensitiveFields(v, depth + 1);
