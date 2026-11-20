@@ -162,9 +162,9 @@ BEGIN
       ADD CONSTRAINT excl_consultations_planner_buffered_overlap
       EXCLUDE USING gist (
         assigned_planner_id WITH =,
-        tstzrange(
-          consultation_start_utc,
-          consultation_end_utc + (buffer_after_minutes * INTERVAL '1 minute'),
+        tsrange(
+          consultation_start_utc AT TIME ZONE 'UTC',
+          (consultation_end_utc AT TIME ZONE 'UTC') + (buffer_after_minutes * INTERVAL '1 minute'),
           '[)'
         ) WITH &&
       )

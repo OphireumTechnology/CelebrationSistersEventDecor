@@ -1,6 +1,11 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
-import { createRemoteJWKSet, jwtVerify, type JWTPayload } from 'jose';
+import { createRemoteJWKSet, decodeProtectedHeader, jwtVerify, type JWTPayload } from 'jose';
+import { stagingExternalAuthEnabled, STAGING_AUTH_PROJECT_REF } from './stagingExternalAuthPolicy.ts';
 import type { AccountStatus, UserRole, UserSession } from '../src/types/domain.ts';
+
+const ASYMMETRIC_JWT_ALGS = ['ES256', 'RS256', 'EdDSA'] as const;
+const SYMMETRIC_JWT_ALGS = ['HS256'] as const;
+const ALLOWED_JWT_ALGS = new Set<string>([...ASYMMETRIC_JWT_ALGS, ...SYMMETRIC_JWT_ALGS]);
 
 export interface IdentityProviderStatus {
   provider: 'supabase' | 'staging-session';
@@ -8,6 +13,7 @@ export interface IdentityProviderStatus {
   adminClientConfigured: boolean;
   jwtVerificationConfigured: boolean;
   readyForProductionAuth: boolean;
+  externalStagingAuthActive?: boolean;
   mfaPolicy: 'totp_required_for_admin';
   reason: string;
 }
@@ -27,6 +33,7 @@ export interface VerifyProviderTokenOptions {
   supabaseUrl?: string;
   jwtSecret?: string;
   keyResolver?: TokenKeyResolver;
+  useJwksOnly?: boolean;
 }
 
 const jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
@@ -46,10 +53,11 @@ export function getIdentityProviderStatus(): IdentityProviderStatus {
   const anonKey = (process.env.SUPABASE_ANON_KEY || '').trim();
   const serviceKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
   const jwtSecret = (process.env.SUPABASE_JWT_SECRET || '').trim();
+  const externalStagingAuthActive = stagingExternalAuthEnabled(process.env);
 
   const supabaseConfigured = Boolean(url && anonKey);
   const adminClientConfigured = Boolean(url && serviceKey);
-  const jwtVerificationConfigured = Boolean(url || jwtSecret);
+  const jwtVerificationConfigured = Boolean(url || jwtSecret || externalStagingAuthActive);
   const readyForProductionAuth = supabaseConfigured && (adminClientConfigured || Boolean(jwtSecret));
 
   if (readyForProductionAuth) {
@@ -59,6 +67,7 @@ export function getIdentityProviderStatus(): IdentityProviderStatus {
       adminClientConfigured,
       jwtVerificationConfigured,
       readyForProductionAuth: true,
+      externalStagingAuthActive,
       mfaPolicy: 'totp_required_for_admin',
       reason: 'Supabase Auth environment configuration detected.',
     };
@@ -70,6 +79,7 @@ export function getIdentityProviderStatus(): IdentityProviderStatus {
     adminClientConfigured,
     jwtVerificationConfigured,
     readyForProductionAuth: false,
+    externalStagingAuthActive,
     mfaPolicy: 'totp_required_for_admin',
     reason: isProd
       ? 'Production customer authentication is blocked until SUPABASE_URL, SUPABASE_ANON_KEY, and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_JWT_SECRET) are configured.'
@@ -96,21 +106,43 @@ export function createSupabaseAdminClient(): SupabaseClient | null {
 }
 
 /**
- * Cryptographically verifies a Supabase Auth access JWT (signature, issuer, audience, expiry).
- * Never trusts client-editable user_metadata role claims.
+ * Cryptographically verifies a Supabase Auth access JWT (signature, issuer, audience, expiry, algorithm).
+ * Routes asymmetric tokens (ES256/RS256/EdDSA) directly to issuer-specific JWKS even when SUPABASE_JWT_SECRET
+ * is set for another project, and never trusts client-editable user_metadata role claims.
  */
 export async function verifyProviderAccessToken(
   token: string,
   options: VerifyProviderTokenOptions = {},
 ): Promise<VerifiedProviderClaims | null> {
-  const rawUrl = (options.supabaseUrl ?? process.env.SUPABASE_URL ?? '').trim().replace(/\/+$/, '');
-  const rawSecret = (options.jwtSecret ?? process.env.SUPABASE_JWT_SECRET ?? '').trim();
+  const envUrl = (process.env.SUPABASE_URL ?? '').trim().replace(/\/+$/, '');
+  const rawUrl = (options.supabaseUrl ?? envUrl).trim().replace(/\/+$/, '');
+  const explicitOverrideToDifferentProject = Boolean(options.supabaseUrl && envUrl && rawUrl !== envUrl);
+  const rawSecret = options.useJwksOnly
+    ? ''
+    : (options.jwtSecret ?? (explicitOverrideToDifferentProject ? '' : process.env.SUPABASE_JWT_SECRET ?? '')).trim();
 
   if (!options.keyResolver && !rawUrl && !rawSecret) {
     return null;
   }
 
-  const verifyOptions = {
+  let tokenAlg = '';
+  try {
+    const header = decodeProtectedHeader(token);
+    tokenAlg = typeof header.alg === 'string' ? header.alg : '';
+  } catch {
+    return null;
+  }
+
+  if (!tokenAlg || !ALLOWED_JWT_ALGS.has(tokenAlg)) {
+    return null;
+  }
+
+  const isAsymmetricAlg = (ASYMMETRIC_JWT_ALGS as readonly string[]).includes(tokenAlg);
+  if (options.useJwksOnly && !isAsymmetricAlg) {
+    return null;
+  }
+
+  const baseVerifyOptions = {
     audience: 'authenticated',
     ...(rawUrl ? { issuer: `${rawUrl}/auth/v1` } : {}),
   };
@@ -119,15 +151,27 @@ export async function verifyProviderAccessToken(
     let payload: JWTPayload;
 
     if (options.keyResolver) {
-      const verified = await jwtVerify(token, options.keyResolver, verifyOptions);
+      if (!isAsymmetricAlg) return null;
+      const verified = await jwtVerify(token, options.keyResolver, {
+        ...baseVerifyOptions,
+        algorithms: [...ASYMMETRIC_JWT_ALGS],
+      });
       payload = verified.payload;
-    } else if (rawSecret) {
-      const secretKey = new TextEncoder().encode(rawSecret);
-      const verified = await jwtVerify(token, secretKey, verifyOptions);
+    } else if (isAsymmetricAlg) {
+      if (!rawUrl) return null;
+      const jwks = getRemoteJwks(rawUrl);
+      const verified = await jwtVerify(token, jwks, {
+        ...baseVerifyOptions,
+        algorithms: [...ASYMMETRIC_JWT_ALGS],
+      });
       payload = verified.payload;
     } else {
-      const jwks = getRemoteJwks(rawUrl);
-      const verified = await jwtVerify(token, jwks, verifyOptions);
+      if (!rawSecret) return null;
+      const secretKey = new TextEncoder().encode(rawSecret);
+      const verified = await jwtVerify(token, secretKey, {
+        ...baseVerifyOptions,
+        algorithms: [...SYMMETRIC_JWT_ALGS],
+      });
       payload = verified.payload;
     }
 
@@ -264,4 +308,15 @@ export function resolveTrustedUserFromClaims(
     mfaVerified: claims.aal === 'aal2',
     emailPrivilegeBindBlocked,
   };
+}
+
+/** Separate, public-key-only client for staging verification against existing Auth users.
+ * Never use a production service-role key or mutate Auth admin records. */
+export function createStagingExternalAuthClient(): SupabaseClient | null {
+  if (!stagingExternalAuthEnabled(process.env)) return null;
+  const key = process.env.PHASE19_EXTERNAL_AUTH_ANON_KEY?.trim();
+  if (!key) return null;
+  return createClient(`https://${STAGING_AUTH_PROJECT_REF}.supabase.co`, key, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  });
 }

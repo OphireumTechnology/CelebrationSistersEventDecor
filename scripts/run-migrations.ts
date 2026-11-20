@@ -85,81 +85,88 @@ export async function runMigrationsOnClient(
     return { dryRun: true, totalFiles: files.length, applied: [], skipped, pending };
   }
 
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS public.schema_migrations (
-      version TEXT PRIMARY KEY,
-      filename TEXT NOT NULL DEFAULT '',
-      checksum_sha256 TEXT,
-      applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-  await client.query(`
-    ALTER TABLE public.schema_migrations
-      ADD COLUMN IF NOT EXISTS filename TEXT NOT NULL DEFAULT '';
-  `);
-  await client.query(`
-    ALTER TABLE public.schema_migrations
-      ADD COLUMN IF NOT EXISTS checksum_sha256 TEXT;
-  `);
-
-  const existingResult = await client.query<{ version: string; checksum_sha256: string | null }>(
-    `SELECT version, checksum_sha256 FROM public.schema_migrations ORDER BY version ASC`,
+  const MIGRATION_ADVISORY_LOCK_KEY = '728491034218';
+  const lockResult = await client.query<{ acquired?: boolean }>(
+    `SELECT pg_try_advisory_lock(${MIGRATION_ADVISORY_LOCK_KEY}) AS acquired`,
   );
-  const appliedMap = new Map<string, string>();
-  for (const row of existingResult.rows) {
-    if (row.checksum_sha256) {
-      appliedMap.set(row.version, row.checksum_sha256);
-    }
+  if (lockResult.rows.length > 0 && lockResult.rows[0]?.acquired !== true) {
+    throw new Error(
+      'MIGRATION_LOCK_CONTENTION: Another migration runner currently holds the PostgreSQL advisory lock.',
+    );
   }
 
-  const applied: string[] = [];
-  const skipped: string[] = [];
-  const pending: string[] = [];
-
-  for (const file of files) {
-    const existingChecksum = appliedMap.get(file.version);
-    if (existingChecksum) {
-      if (existingChecksum !== file.checksumSha256) {
-        throw new Error(
-          `MIGRATION_CHECKSUM_MISMATCH: Applied migration "${file.version}" has checksum ${existingChecksum.slice(0, 12)}... in schema_migrations, but workspace file has ${file.checksumSha256.slice(0, 12)}...`,
-        );
-      }
-      skipped.push(file.filename);
-      continue;
-    }
-
-    if (dryRun) {
-      pending.push(file.filename);
-      continue;
-    }
-
-    await client.query('BEGIN');
-    try {
-      await client.query(file.sql);
-      await client.query(
-        `INSERT INTO public.schema_migrations (version, checksum_sha256, filename)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (version) DO UPDATE
-           SET checksum_sha256 = EXCLUDED.checksum_sha256,
-               filename = EXCLUDED.filename`,
-        [file.version, file.checksumSha256, file.filename],
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS public.schema_migrations (
+        version TEXT PRIMARY KEY,
+        filename TEXT NOT NULL DEFAULT '',
+        checksum_sha256 TEXT,
+        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
-      await client.query('COMMIT');
-      applied.push(file.filename);
-    } catch (err) {
-      await client.query('ROLLBACK').catch(() => {});
-      const message = err instanceof Error ? err.message : String(err);
-      throw new Error(`MIGRATION_FAILED (${file.filename}): ${message}`);
-    }
-  }
+    `);
+    await client.query(`
+      ALTER TABLE public.schema_migrations
+        ADD COLUMN IF NOT EXISTS filename TEXT NOT NULL DEFAULT '';
+    `);
+    await client.query(`
+      ALTER TABLE public.schema_migrations
+        ADD COLUMN IF NOT EXISTS checksum_sha256 TEXT;
+    `);
 
-  return {
-    dryRun,
-    totalFiles: files.length,
-    applied,
-    skipped,
-    pending,
-  };
+    const existingResult = await client.query<{ version: string; checksum_sha256: string | null }>(
+      `SELECT version, checksum_sha256 FROM public.schema_migrations ORDER BY version ASC`,
+    );
+    const appliedMap = new Map<string, string | null>();
+    for (const row of existingResult.rows) {
+      appliedMap.set(row.version, row.checksum_sha256 ?? null);
+    }
+
+    const applied: string[] = [];
+    const skipped: string[] = [];
+    const pending: string[] = [];
+
+    for (const file of files) {
+      if (appliedMap.has(file.version)) {
+        const existingChecksum = appliedMap.get(file.version);
+        if (!existingChecksum || existingChecksum !== file.checksumSha256) {
+          throw new Error(
+            `MIGRATION_CHECKSUM_MISMATCH: Applied migration "${file.version}" has checksum ${(existingChecksum || 'NULL').slice(0, 12)}... in schema_migrations, but workspace file has ${file.checksumSha256.slice(0, 12)}...`,
+          );
+        }
+        skipped.push(file.filename);
+        continue;
+      }
+
+      await client.query('BEGIN');
+      try {
+        await client.query(file.sql);
+        await client.query(
+          `INSERT INTO public.schema_migrations (version, checksum_sha256, filename)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (version) DO UPDATE
+             SET checksum_sha256 = EXCLUDED.checksum_sha256,
+                 filename = EXCLUDED.filename`,
+          [file.version, file.checksumSha256, file.filename],
+        );
+        await client.query('COMMIT');
+        applied.push(file.filename);
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(`MIGRATION_FAILED (${file.filename}): ${message}`);
+      }
+    }
+
+    return {
+      dryRun,
+      totalFiles: files.length,
+      applied,
+      skipped,
+      pending,
+    };
+  } finally {
+    await client.query(`SELECT pg_advisory_unlock(${MIGRATION_ADVISORY_LOCK_KEY})`).catch(() => {});
+  }
 }
 
 async function main() {
