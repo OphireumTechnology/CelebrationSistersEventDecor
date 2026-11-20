@@ -159,7 +159,7 @@ export default function App() {
       try {
         const {data:factors,error} = await externalClient.auth.mfa.listFactors();
         if (error) throw error;
-        const factor = factors.totp.find(f=>f.status === 'unverified') ?? factors.totp.find(f=>f.status === 'verified');
+        const factor = factors.totp[0];
         if (!factor) return {ok:false,error:'Enroll an authenticator before verifying MFA.'};
         const verified = await verifyExternalStagingTotp(factor.id,code);
         setApiAccessToken(verified.accessToken);
