@@ -14,6 +14,7 @@ import { PublicHomeView } from './components/PublicHomeView';
 import { ServiceDivisionCatalog } from './components/ServiceDivisionCatalog';
 import { apiFetch, isBackendConfigured, setApiAccessToken, setApiCsrfToken } from './lib/apiClient';
 import type { UserSession } from './types/domain';
+import { getExternalStagingMfaClient, enrollExternalStagingTotp, verifyExternalStagingTotp } from './lib/externalStagingMfa';
 
 const DEFAULT_GUEST: UserSession = {
   id: 'guest-public',
@@ -116,6 +117,14 @@ export default function App() {
       if (!res.ok) {
         return { ok: false, error: data.error || 'Sign-in failed. Verify your email and password.' };
       }
+      const externalClient = getExternalStagingMfaClient();
+      if (externalClient) {
+        const {data:externalLogin,error:externalError} = await externalClient.auth.signInWithPassword({email,password});
+        if (externalError || !externalLogin.session) return {ok:false,error:'Unable to establish external Supabase session.'};
+        setApiAccessToken(externalLogin.session.access_token);
+      } else if (data.token) {
+        setApiAccessToken(data.token);
+      }
       setApiCsrfToken(data.csrfToken ?? null);
       setCurrentUser(data.user);
       setMfaRequired(Boolean(data.mfaRequired));
@@ -145,6 +154,20 @@ export default function App() {
   };
 
   const handleVerifyMfa = async (code: string): Promise<{ ok: boolean; error?: string }> => {
+    const externalClient = getExternalStagingMfaClient();
+    if (externalClient) {
+      try {
+        const {data:factors,error} = await externalClient.auth.mfa.listFactors();
+        if (error) throw error;
+        const factor = factors.totp.find(f=>f.status === 'unverified') ?? factors.totp.find(f=>f.status === 'verified');
+        if (!factor) return {ok:false,error:'Enroll an authenticator before verifying MFA.'};
+        const verified = await verifyExternalStagingTotp(factor.id,code);
+        setApiAccessToken(verified.accessToken);
+        setMfaRequired(false);
+        setMfaEnrolled(true);
+        return {ok:true};
+      } catch(e) {return {ok:false,error:e instanceof Error?e.message:'External MFA verification failed.'};}
+    }
     const res = await apiFetch('/api/auth/mfa/verify', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -162,6 +185,12 @@ export default function App() {
   };
 
   const handleEnrollTotp = async (recoveryCode?: string): Promise<TotpEnrollmentResult> => {
+    if (getExternalStagingMfaClient()) {
+      try {
+        const factor = await enrollExternalStagingTotp();
+        return {ok:true,secret:factor.secret,otpauthUri:factor.uri,recoveryCodes:[]};
+      } catch(e) {return {ok:false,error:e instanceof Error?e.message:'External MFA enrollment failed.'};}
+    }
     try {
       const res = await apiFetch('/api/auth/mfa/totp/enroll', {
         method: 'POST',
