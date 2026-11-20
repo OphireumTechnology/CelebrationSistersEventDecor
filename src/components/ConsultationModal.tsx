@@ -203,6 +203,46 @@ function formatShortDayLabel(dateIso: string): { weekday: string; dayNum: string
   };
 }
 
+function getStudioTodayIso(): string {
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/New_York',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(new Date());
+    const map: Record<string, string> = {};
+    for (const p of parts) {
+      if (p.type !== 'literal') map[p.type] = p.value;
+    }
+    if (map.year && map.month && map.day) {
+      return `${map.year}-${map.month}-${map.day}`;
+    }
+  } catch {
+    // Fallback to UTC calendar date if Intl timezone data is unavailable
+  }
+  return new Date().toISOString().slice(0, 10);
+}
+
+function formatSlotInClientTimezone(startUtc: string, timeZone: string, fallback: string): string {
+  const dt = new Date(startUtc);
+  if (Number.isNaN(dt.getTime())) return fallback;
+  try {
+    return new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      weekday: 'short',
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      timeZoneName: 'short',
+    }).format(dt);
+  } catch {
+    return fallback;
+  }
+}
+
 function formatMethodLabel(method: ConsultationMethod): string {
   if (method === 'in_person_columbia') return 'In-Person (Columbia, SC Studio)';
   if (method === 'phone') return 'Executive Phone Consultation';
@@ -244,6 +284,7 @@ export function ConsultationModal({
   const [selectedDayIso, setSelectedDayIso] = useState<string>('');
   const [selectedSlot, setSelectedSlot] = useState<ComputedSlot | null>(null);
   const [holdExpiresAt, setHoldExpiresAt] = useState<string | null>(null);
+  const [holdingSlot, setHoldingSlot] = useState(false);
 
   // Step 3: Client Details & Consent
   const [clientName, setClientName] = useState('');
@@ -287,7 +328,7 @@ export function ConsultationModal({
   const idempotencyKeyRef = useRef<string>(createKey('cs-consult'));
   const holderKeyRef = useRef<string>(createKey('cs-hold'));
   const closeButtonRef = useRef<HTMLButtonElement | null>(null);
-  const todayIso = new Date().toISOString().slice(0, 10);
+  const todayIso = useMemo(() => getStudioTodayIso(), []);
 
   const fetchAvailability = useCallback(
     async (tz: string, consultationMethod: ConsultationMethod, excludeId?: string) => {
@@ -345,6 +386,7 @@ export function ConsultationModal({
     setClientTimezone(detectClientTimezone());
     setSelectedSlot(null);
     setHoldExpiresAt(null);
+    setHoldingSlot(false);
     setClientName('');
     setClientEmail('');
     setClientPhone('');
@@ -447,12 +489,14 @@ export function ConsultationModal({
     }
 
     if (step === 2) {
+      if (holdingSlot) return;
       const msg = validateStep2();
       if (msg || !selectedSlot) {
         setError(msg || 'Please choose a time slot.');
         return;
       }
       // Reserve a temporary 10-minute slot hold so no one books it while user completes Step 3–4
+      setHoldingSlot(true);
       try {
         const res = await apiFetch('/api/consultations/holds', {
           method: 'POST',
@@ -475,6 +519,8 @@ export function ConsultationModal({
         setHoldExpiresAt(data.hold?.expiresAt || null);
       } catch {
         // Proceed — final server validation on POST /api/consultations remains authoritative
+      } finally {
+        setHoldingSlot(false);
       }
       setStep(3);
       return;
@@ -628,7 +674,12 @@ export function ConsultationModal({
     try {
       if (manageMode === 'consultation') {
         const res = await apiFetch(
-          `/api/consultations/status?referenceCode=${encodeURIComponent(trackRef.trim())}&accessToken=${encodeURIComponent(trackToken.trim())}`,
+          `/api/consultations/status?referenceCode=${encodeURIComponent(trackRef.trim())}`,
+          {
+            headers: {
+              'X-Consultation-Token': trackToken.trim(),
+            },
+          },
         );
         const data = await readApiJson<{ consultation?: ManagedConsultation; error?: string }>(res);
         if (!res.ok || !data.consultation) {
@@ -682,11 +733,13 @@ export function ConsultationModal({
     try {
       const res = await apiFetch(`/api/consultations/${encodeURIComponent(managedConsultation.id)}/reschedule`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Consultation-Token': trackToken.trim(),
+        },
         body: JSON.stringify({
           newStartUtc: rescheduleSlot.startUtc,
           plannerId: rescheduleSlot.plannerId,
-          accessToken: trackToken.trim(),
           reason: 'Rescheduled by client online',
         }),
       });
@@ -726,9 +779,11 @@ export function ConsultationModal({
     try {
       const res = await apiFetch(`/api/consultations/${encodeURIComponent(managedConsultation.id)}/cancel`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Consultation-Token': trackToken.trim(),
+        },
         body: JSON.stringify({
-          accessToken: trackToken.trim(),
           reason: cancelReason.trim() || 'Cancelled by client online',
         }),
       });
@@ -760,9 +815,11 @@ export function ConsultationModal({
     try {
       const res = await apiFetch(`/api/consultations/${encodeURIComponent(managedConsultation.id)}/client-details`, {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Consultation-Token': trackToken.trim(),
+        },
         body: JSON.stringify({
-          accessToken: trackToken.trim(),
           clientPhone: editPhone.trim() || undefined,
           preferredContactMethod: editPreferredContact,
           eventTheme: editEventTheme.trim(),
@@ -813,8 +870,11 @@ export function ConsultationModal({
     try {
       const res = await apiFetch(`/api/consultations/${encodeURIComponent(managedConsultation.id)}/token/revoke`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ accessToken: trackToken.trim() }),
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Consultation-Token': trackToken.trim(),
+        },
+        body: JSON.stringify({}),
       });
       const data = await readApiJson<{ revoked?: boolean; error?: string }>(res);
       if (!res.ok || !data.revoked) {
@@ -1756,8 +1816,26 @@ export function ConsultationModal({
                 </div>
 
                 {availabilityError && (
-                  <div role="alert" className="p-3.5 text-xs text-red-800 bg-red-50 border border-red-200 rounded-md">
-                    {availabilityError}
+                  <div
+                    role="alert"
+                    className="p-3.5 text-xs text-red-800 bg-red-50 border border-red-200 rounded-md flex flex-wrap items-center justify-between gap-2"
+                  >
+                    <span>{availabilityError}</span>
+                    <button
+                      type="button"
+                      disabled={availabilityLoading}
+                      onClick={() => {
+                        fetchAvailability(clientTimezone, method).then((days) => {
+                          setAvailabilityDays(days);
+                          const firstOpen = days.find((d) => d.availableCount > 0) || days[0];
+                          setSelectedDayIso(firstOpen?.date || '');
+                        });
+                      }}
+                      className="inline-flex items-center gap-1.5 min-h-[36px] px-3 py-1.5 rounded bg-white border border-red-300 text-red-800 hover:bg-red-100 cursor-pointer disabled:opacity-50"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      Retry Availability
+                    </button>
                   </div>
                 )}
 
@@ -2044,10 +2122,14 @@ export function ConsultationModal({
                       </button>
                     </div>
                     <p className="font-semibold text-[var(--cs-purple)] tabular-nums">
-                      {selectedSlot.dateLocal} · {selectedSlot.displayLabel} ({clientTimezone})
+                      {formatSlotInClientTimezone(
+                        selectedSlot.startUtc,
+                        clientTimezone,
+                        `${selectedSlot.dateLocal} · ${selectedSlot.displayLabel}`,
+                      )}
                     </p>
                     <p className="text-[var(--cs-charcoal-muted)] tabular-nums">
-                      Studio Time (ET): {selectedSlot.studioDisplayLabel} · {selectedSlot.durationMinutes} min
+                      Studio Time (ET): {selectedSlot.dateLocal} · {selectedSlot.studioDisplayLabel} · {selectedSlot.durationMinutes} min
                     </p>
                     <p className="text-[var(--cs-charcoal-muted)]">
                       Format: {formatMethodLabel(method)}
@@ -2117,10 +2199,11 @@ export function ConsultationModal({
                 </button>
                 <button
                   type="button"
+                  disabled={holdingSlot}
                   onClick={handleNextStep}
-                  className="min-h-[44px] px-6 py-2.5 text-sm font-medium text-white bg-[var(--cs-purple)] hover:bg-[var(--cs-purple-hover)] rounded-md inline-flex items-center gap-2 cursor-pointer"
+                  className="min-h-[44px] px-6 py-2.5 text-sm font-medium text-white bg-[var(--cs-purple)] hover:bg-[var(--cs-purple-hover)] rounded-md inline-flex items-center gap-2 cursor-pointer disabled:opacity-60"
                 >
-                  {step === 3 ? 'Review Consultation' : 'Continue'}
+                  {holdingSlot ? 'Reserving Slot...' : step === 3 ? 'Review Consultation' : 'Continue'}
                   <ArrowRight className="w-4 h-4" />
                 </button>
               </div>

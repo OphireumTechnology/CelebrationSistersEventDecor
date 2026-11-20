@@ -79,6 +79,7 @@ import {
   findPlannerSlotConflict,
   formatFullDateTimeForTimezone,
   generateConsultationAccessToken,
+  getStudioTodayIso,
   isValidIanaTimezone,
   STUDIO_TIMEZONE,
   SUPPORTED_TIMEZONES,
@@ -2329,7 +2330,7 @@ export function createApp(options: CreateAppOptions = {}) {
       const startDate =
         typeof req.query.startDate === 'string' && isValidIsoCalendarDate(req.query.startDate)
           ? req.query.startDate
-          : new Date().toISOString().slice(0, 10);
+          : getStudioTodayIso();
       const daysRaw = Number(req.query.days ?? 14);
       const days = Number.isFinite(daysRaw) ? Math.min(31, Math.max(1, Math.floor(daysRaw))) : 14;
       const requestedTz =
@@ -2492,7 +2493,7 @@ export function createApp(options: CreateAppOptions = {}) {
       if (!isValidIanaTimezone(input.clientTimezone)) {
         return res.status(400).json({ error: 'Unsupported timezone provided.' });
       }
-      const todayIso = new Date().toISOString().slice(0, 10);
+      const todayIso = getStudioTodayIso();
       if (input.eventDate < todayIso) {
         return res.status(400).json({ error: 'Target event date cannot be in the past.' });
       }
@@ -3200,22 +3201,24 @@ export function createApp(options: CreateAppOptions = {}) {
         });
 
         const staffEmail = getStaffNotificationRecipient();
-        const staffTpl = buildInternalOperationsAlertTemplate({
-          heading: 'Consultation Rescheduled',
-          referenceCode: consultation.referenceCode,
-          clientName: consultation.clientName,
-          eventTitle: consultation.eventTitle,
-          details: `Moved from ${prevWindowStudio} to ${newWindowStudio} (Planner: ${consultation.assignedPlannerName}).${parsed.data.reason ? ` Reason: ${parsed.data.reason}` : ''}`,
-        });
-        enqueueOutboxNotification(db, {
-          idempotencyKey: `consultation:${consultation.id}:staff_reschedule_alert:${consultation.rescheduleCount}`,
-          category: 'staff_reschedule_alert',
-          recipient: staffEmail,
-          bookingReference: consultation.referenceCode,
-          subject: staffTpl.subject,
-          htmlBody: staffTpl.htmlBody,
-          textBody: staffTpl.textBody,
-        });
+        if (staffEmail) {
+          const staffTpl = buildInternalOperationsAlertTemplate({
+            heading: 'Consultation Rescheduled',
+            referenceCode: consultation.referenceCode,
+            clientName: consultation.clientName,
+            eventTitle: consultation.eventTitle,
+            details: `Moved from ${prevWindowStudio} to ${newWindowStudio} (Planner: ${consultation.assignedPlannerName}).${parsed.data.reason ? ` Reason: ${parsed.data.reason}` : ''}`,
+          });
+          enqueueOutboxNotification(db, {
+            idempotencyKey: `consultation:${consultation.id}:staff_reschedule_alert:${consultation.rescheduleCount}`,
+            category: 'staff_reschedule_alert',
+            recipient: staffEmail,
+            bookingReference: consultation.referenceCode,
+            subject: staffTpl.subject,
+            htmlBody: staffTpl.htmlBody,
+            textBody: staffTpl.textBody,
+          });
+        }
 
         appendAudit(
           db,
@@ -3320,22 +3323,24 @@ export function createApp(options: CreateAppOptions = {}) {
         });
 
         const staffEmail = getStaffNotificationRecipient();
-        const staffTpl = buildInternalOperationsAlertTemplate({
-          heading: 'Consultation Cancelled',
-          referenceCode: consultation.referenceCode,
-          clientName: consultation.clientName,
-          eventTitle: consultation.eventTitle,
-          details: `Slot ${prevWindowStudio} released. Reason: ${consultation.cancelReason}`,
-        });
-        enqueueOutboxNotification(db, {
-          idempotencyKey: `consultation:${consultation.id}:staff_cancellation_alert`,
-          category: 'staff_cancellation_alert',
-          recipient: staffEmail,
-          bookingReference: consultation.referenceCode,
-          subject: staffTpl.subject,
-          htmlBody: staffTpl.htmlBody,
-          textBody: staffTpl.textBody,
-        });
+        if (staffEmail) {
+          const staffTpl = buildInternalOperationsAlertTemplate({
+            heading: 'Consultation Cancelled',
+            referenceCode: consultation.referenceCode,
+            clientName: consultation.clientName,
+            eventTitle: consultation.eventTitle,
+            details: `Slot ${prevWindowStudio} released. Reason: ${consultation.cancelReason}`,
+          });
+          enqueueOutboxNotification(db, {
+            idempotencyKey: `consultation:${consultation.id}:staff_cancellation_alert`,
+            category: 'staff_cancellation_alert',
+            recipient: staffEmail,
+            bookingReference: consultation.referenceCode,
+            subject: staffTpl.subject,
+            htmlBody: staffTpl.htmlBody,
+            textBody: staffTpl.textBody,
+          });
+        }
 
         appendAudit(
           db,

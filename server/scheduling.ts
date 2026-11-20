@@ -14,6 +14,24 @@ import { sha256Hex } from './auth.ts';
 export const STUDIO_TIMEZONE = 'America/New_York';
 
 /**
+ * Returns the current calendar date (YYYY-MM-DD) in Columbia, SC studio time (America/New_York),
+ * preventing evening US clients (after 7–8 PM ET) from experiencing UTC next-day date drift.
+ */
+export function getStudioTodayIso(nowMs: number = Date.now()): string {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: STUDIO_TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date(nowMs));
+  const map: Record<string, string> = {};
+  for (const p of parts) {
+    if (p.type !== 'literal') map[p.type] = p.value;
+  }
+  return `${map.year}-${map.month}-${map.day}`;
+}
+
+/**
  * Single authoritative studio preparation cutoff for consultation bookings & holds (2 hours).
  * Shared identically by availability generation, hold creation, booking creation, and rescheduling.
  */

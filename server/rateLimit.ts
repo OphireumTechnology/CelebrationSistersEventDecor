@@ -102,6 +102,7 @@ export class PostgresRateLimitStore implements RateLimitStore {
   private readonly fallback = new InMemoryRateLimitStore();
   private readonly queryTimeoutMs: number;
   private readonly retryAfterSecondsOnOutage: number;
+  private tableBootstrapAttempted = false;
 
   constructor(
     private readonly db: PgQueryable,
@@ -109,6 +110,46 @@ export class PostgresRateLimitStore implements RateLimitStore {
   ) {
     this.queryTimeoutMs = options.queryTimeoutMs ?? (Number(process.env.RATE_LIMIT_DB_TIMEOUT_MS) || 3_000);
     this.retryAfterSecondsOnOutage = options.retryAfterSecondsOnOutage ?? 15;
+  }
+
+  private async upsertBucket(key: string, resetAtIso: string) {
+    return queryWithTimeout(
+      this.db.query<{ request_count: number; reset_at: string }>(
+        `INSERT INTO rate_limit_buckets (bucket_key, request_count, reset_at)
+         VALUES ($1, 1, $2)
+         ON CONFLICT (bucket_key) DO UPDATE
+         SET request_count = CASE
+               WHEN rate_limit_buckets.reset_at <= NOW() THEN 1
+               ELSE rate_limit_buckets.request_count + 1
+             END,
+             reset_at = CASE
+               WHEN rate_limit_buckets.reset_at <= NOW() THEN EXCLUDED.reset_at
+               ELSE rate_limit_buckets.reset_at
+             END
+         RETURNING request_count, reset_at`,
+        [key, resetAtIso],
+      ),
+      this.queryTimeoutMs,
+    );
+  }
+
+  private async ensureRateLimitTable(): Promise<void> {
+    await queryWithTimeout(
+      this.db.query(`
+        CREATE TABLE IF NOT EXISTS rate_limit_buckets (
+          bucket_key TEXT PRIMARY KEY,
+          request_count INTEGER NOT NULL DEFAULT 1,
+          reset_at TIMESTAMPTZ NOT NULL
+        )
+      `),
+      this.queryTimeoutMs,
+    );
+    await queryWithTimeout(
+      this.db.query(
+        'CREATE INDEX IF NOT EXISTS idx_rate_limit_buckets_reset ON rate_limit_buckets (reset_at)',
+      ),
+      this.queryTimeoutMs,
+    );
   }
 
   async consume(
@@ -121,24 +162,29 @@ export class PostgresRateLimitStore implements RateLimitStore {
     const resetAt = new Date(now + windowMs);
     const startedAt = Date.now();
     try {
-      const res = await queryWithTimeout(
-        this.db.query<{ request_count: number; reset_at: string }>(
-          `INSERT INTO rate_limit_buckets (bucket_key, request_count, reset_at)
-           VALUES ($1, 1, $2)
-           ON CONFLICT (bucket_key) DO UPDATE
-           SET request_count = CASE
-                 WHEN rate_limit_buckets.reset_at <= NOW() THEN 1
-                 ELSE rate_limit_buckets.request_count + 1
-               END,
-               reset_at = CASE
-                 WHEN rate_limit_buckets.reset_at <= NOW() THEN EXCLUDED.reset_at
-                 ELSE rate_limit_buckets.reset_at
-               END
-           RETURNING request_count, reset_at`,
-          [key, resetAt.toISOString()],
-        ),
-        this.queryTimeoutMs,
-      );
+      let res;
+      try {
+        res = await this.upsertBucket(key, resetAt.toISOString());
+      } catch (firstErr) {
+        const firstCode =
+          typeof firstErr === 'object' && firstErr && 'code' in firstErr && typeof (firstErr as { code?: unknown }).code === 'string'
+            ? (firstErr as { code: string }).code
+            : '';
+        // Fresh Railway PostgreSQL instances that have not yet run db/migrations/004 return 42P01 (undefined_table).
+        // Bootstrap the idempotent rate_limit_buckets table once (matching migration 004 DDL) and retry.
+        // Real DB outages, timeouts, and restricted roles without CREATE privileges still fail closed (503).
+        if (firstCode === '42P01' && !this.tableBootstrapAttempted) {
+          this.tableBootstrapAttempted = true;
+          await this.ensureRateLimitTable();
+          logStructured('warn', 'rate_limit_table_bootstrapped', {
+            endpointGroup: options.endpointGroup || 'general',
+            message: 'Bootstrapped missing rate_limit_buckets table (apply db/migrations 001-008 via scripts/run-migrations.ts).',
+          });
+          res = await this.upsertBucket(key, resetAt.toISOString());
+        } else {
+          throw firstErr;
+        }
+      }
       observability.recordDbQuery(Date.now() - startedAt, false);
 
       const row = res.rows[0];

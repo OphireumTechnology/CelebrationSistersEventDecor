@@ -18,12 +18,19 @@ export interface PostgresTlsDiagnostics {
   sslMode: string;
 }
 
+export interface PersistenceSchemaDiagnostics {
+  rateLimitTablePresent: boolean;
+  migrationsTablePresent: boolean;
+  migrationsAppliedCount: number;
+}
+
 export interface PersistenceReadinessStatus {
   adapter: 'json-local' | 'postgres';
   ready: boolean;
   connected?: boolean;
   latencyMs?: number;
   tls?: PostgresTlsDiagnostics;
+  schema?: PersistenceSchemaDiagnostics;
   reason: string;
 }
 
@@ -320,12 +327,36 @@ export async function checkPersistenceHealth(): Promise<PersistenceReadinessStat
   try {
     const pool = getPgPool();
     await pool.query('SELECT 1 AS ok');
+    let schema: PersistenceSchemaDiagnostics | undefined;
+    try {
+      const regRes = await pool.query<{
+        rate_limit_tbl: string | null;
+        migrations_tbl: string | null;
+      }>(
+        `SELECT to_regclass('public.rate_limit_buckets') AS rate_limit_tbl,
+                to_regclass('public.schema_migrations') AS migrations_tbl`,
+      );
+      const row = regRes.rows[0];
+      const rateLimitTablePresent = Boolean(row?.rate_limit_tbl);
+      const migrationsTablePresent = Boolean(row?.migrations_tbl);
+      let migrationsAppliedCount = 0;
+      if (migrationsTablePresent) {
+        const countRes = await pool.query<{ cnt: string | number }>(
+          'SELECT COUNT(*)::int AS cnt FROM schema_migrations',
+        );
+        migrationsAppliedCount = Number(countRes.rows[0]?.cnt ?? 0);
+      }
+      schema = { rateLimitTablePresent, migrationsTablePresent, migrationsAppliedCount };
+    } catch {
+      // Minimal test pools that mock only SELECT 1 safely omit optional schema diagnostics
+    }
     return {
       adapter: 'postgres',
       ready: true,
       connected: true,
       latencyMs: Date.now() - startedAt,
       tls: baseStatus.tls,
+      ...(schema ? { schema } : {}),
       reason: 'PostgreSQL connection verified via live health query.',
     };
   } catch (err) {
