@@ -18,10 +18,16 @@ export interface PostgresTlsDiagnostics {
   sslMode: string;
 }
 
+export const REQUIRED_CANONICAL_MIGRATION_COUNT = 8;
+
 export interface PersistenceSchemaDiagnostics {
   rateLimitTablePresent: boolean;
   migrationsTablePresent: boolean;
   migrationsAppliedCount: number;
+  essentialTablesPresent?: boolean;
+  missingEssentialTables?: string[];
+  overlapConstraintPresent?: boolean;
+  canonicalSchemaReady?: boolean;
 }
 
 export interface PersistenceReadinessStatus {
@@ -332,9 +338,19 @@ export async function checkPersistenceHealth(): Promise<PersistenceReadinessStat
       const regRes = await pool.query<{
         rate_limit_tbl: string | null;
         migrations_tbl: string | null;
+        consultations_tbl?: string | null;
+        holds_tbl?: string | null;
+        outbox_tbl?: string | null;
+        webhooks_tbl?: string | null;
+        crm_tasks_tbl?: string | null;
       }>(
         `SELECT to_regclass('public.rate_limit_buckets') AS rate_limit_tbl,
-                to_regclass('public.schema_migrations') AS migrations_tbl`,
+                to_regclass('public.schema_migrations') AS migrations_tbl,
+                to_regclass('public.consultations') AS consultations_tbl,
+                to_regclass('public.consultation_slot_holds') AS holds_tbl,
+                to_regclass('public.notification_outbox') AS outbox_tbl,
+                to_regclass('public.notification_webhook_events') AS webhooks_tbl,
+                to_regclass('public.crm_follow_up_tasks') AS crm_tasks_tbl`,
       );
       const row = regRes.rows[0];
       const rateLimitTablePresent = Boolean(row?.rate_limit_tbl);
@@ -346,7 +362,56 @@ export async function checkPersistenceHealth(): Promise<PersistenceReadinessStat
         );
         migrationsAppliedCount = Number(countRes.rows[0]?.cnt ?? 0);
       }
-      schema = { rateLimitTablePresent, migrationsTablePresent, migrationsAppliedCount };
+
+      const hasExtendedCatalog = Boolean(row && 'consultations_tbl' in row);
+      if (hasExtendedCatalog) {
+        const tableChecks: Array<[string, string | null | undefined]> = [
+          ['rate_limit_buckets', row?.rate_limit_tbl],
+          ['schema_migrations', row?.migrations_tbl],
+          ['consultations', row?.consultations_tbl],
+          ['consultation_slot_holds', row?.holds_tbl],
+          ['notification_outbox', row?.outbox_tbl],
+          ['notification_webhook_events', row?.webhooks_tbl],
+          ['crm_follow_up_tasks', row?.crm_tasks_tbl],
+        ];
+        const missingEssentialTables = tableChecks
+          .filter(([, present]) => !present)
+          .map(([tableName]) => tableName);
+        const essentialTablesPresent = missingEssentialTables.length === 0;
+
+        let overlapConstraintPresent = false;
+        try {
+          const conRes = await pool.query<{ present: boolean }>(
+            `SELECT EXISTS (
+               SELECT 1
+               FROM pg_constraint
+               WHERE conname = 'excl_consultations_planner_buffered_overlap'
+             ) AS present`,
+          );
+          overlapConstraintPresent = Boolean(conRes.rows[0]?.present);
+        } catch {
+          overlapConstraintPresent = false;
+        }
+
+        const canonicalSchemaReady =
+          rateLimitTablePresent &&
+          migrationsTablePresent &&
+          migrationsAppliedCount >= REQUIRED_CANONICAL_MIGRATION_COUNT &&
+          essentialTablesPresent &&
+          overlapConstraintPresent;
+
+        schema = {
+          rateLimitTablePresent,
+          migrationsTablePresent,
+          migrationsAppliedCount,
+          essentialTablesPresent,
+          missingEssentialTables,
+          overlapConstraintPresent,
+          canonicalSchemaReady,
+        };
+      } else {
+        schema = { rateLimitTablePresent, migrationsTablePresent, migrationsAppliedCount };
+      }
     } catch {
       // Minimal test pools that mock only SELECT 1 safely omit optional schema diagnostics
     }

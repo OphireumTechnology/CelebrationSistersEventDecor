@@ -616,4 +616,12 @@ export class NotificationOutboxWorker {
       this.timer = null;
     }
   }
+
+  getStatus(): { workerId: string; pollingActive: boolean; pollingDisabled: boolean } {
+    return {
+      workerId: this.workerId,
+      pollingActive: Boolean(this.timer),
+      pollingDisabled: process.env.DISABLE_OUTBOX_POLLING === 'true',
+    };
+  }
 }

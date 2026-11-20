@@ -74,6 +74,9 @@ export async function verifyStagingRailwayAndResend(
   const readyRes = await fetch(`${baseUrl}/ready`);
   const readyBody = (await readyRes.json()) as {
     ok?: boolean;
+    status?: string;
+    productionReady?: boolean;
+    blockingReasons?: string[];
     persistence?: {
       adapter?: string;
       ready?: boolean;
@@ -82,6 +85,9 @@ export async function verifyStagingRailwayAndResend(
         rateLimitTablePresent?: boolean;
         migrationsTablePresent?: boolean;
         migrationsAppliedCount?: number;
+        essentialTablesPresent?: boolean;
+        overlapConstraintPresent?: boolean;
+        canonicalSchemaReady?: boolean;
       };
     };
     auth?: {
@@ -99,14 +105,16 @@ export async function verifyStagingRailwayAndResend(
     ? Boolean(
         schema?.rateLimitTablePresent === true &&
           schema?.migrationsTablePresent === true &&
-          (schema?.migrationsAppliedCount ?? 0) >= 8,
+          (schema?.migrationsAppliedCount ?? 0) >= 8 &&
+          schema?.essentialTablesPresent !== false &&
+          schema?.overlapConstraintPresent !== false,
       )
     : true;
   checks.push({
     id: 'STG-API-02',
-    check: 'GET /ready confirms database connectivity, readiness & schema state',
+    check: 'GET /ready confirms database connectivity, readiness & canonical schema state',
     passed: readyRes.status === 200 && readyBody.ok === true && pgOk && migrationsOk,
-    detail: `status=${readyRes.status}, adapter=${readyBody.persistence?.adapter}, connected=${readyBody.persistence?.connected}, rateLimitTable=${String(schema?.rateLimitTablePresent)}, migrationsApplied=${String(schema?.migrationsAppliedCount ?? 'n/a')}`,
+    detail: `status=${readyRes.status}, readyStatus=${readyBody.status ?? 'n/a'}, adapter=${readyBody.persistence?.adapter}, connected=${readyBody.persistence?.connected}, rateLimitTable=${String(schema?.rateLimitTablePresent)}, migrationsApplied=${String(schema?.migrationsAppliedCount ?? 'n/a')}, overlapConstraint=${String(schema?.overlapConstraintPresent ?? 'n/a')}`,
   });
 
   if (options.requireSupabaseAuth) {

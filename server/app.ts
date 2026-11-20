@@ -72,6 +72,8 @@ import {
   checkPersistenceHealth,
   getPersistenceAdapterMode,
   getPgPool,
+  REQUIRED_CANONICAL_MIGRATION_COUNT,
+  type PersistenceReadinessStatus,
 } from './repositories/postgresRepository.ts';
 import {
   canTransitionConsultationStatus,
@@ -107,6 +109,123 @@ export interface CreateAppOptions {
   notificationFetch?: FetchLike;
   outboxWorker?: NotificationOutboxWorker;
   trustProxy?: boolean | number | string;
+}
+
+export interface ReadinessWorkerDiagnostics {
+  workerId: string;
+  pollingActive: boolean;
+  pollingDisabled: boolean;
+  healthy: boolean;
+  lastHeartbeatAt: string | null;
+}
+
+export interface ApplicationReadinessEvaluation {
+  ok: boolean;
+  httpStatus: 200 | 503;
+  status: 'ready' | 'not_ready';
+  productionReady: boolean;
+  blockingReasons: string[];
+  checks: {
+    database: boolean;
+    migrations: boolean;
+    schemaObjects: boolean;
+    auth: boolean;
+    email: boolean;
+    worker: boolean;
+  };
+}
+
+/**
+ * Evaluates full application readiness separately from process liveness (/health).
+ * In production (NODE_ENV=production), returns HTTP 503 whenever PostgreSQL connectivity,
+ * canonical migrations (001-008), essential schema objects/constraints, Supabase Auth,
+ * Resend notification/webhook configuration, or background worker health are unavailable.
+ * Never exposes credentials, connection strings, or internal secrets.
+ */
+export function evaluateApplicationReadiness(params: {
+  persistence: PersistenceReadinessStatus;
+  auth: ReturnType<typeof getIdentityProviderStatus>;
+  email: ReturnType<typeof getEmailProviderStatus>;
+  worker: ReadinessWorkerDiagnostics;
+  isProduction: boolean;
+}): ApplicationReadinessEvaluation {
+  const { persistence, auth, email, worker, isProduction } = params;
+  const blockingReasons: string[] = [];
+
+  const databaseReady =
+    persistence.ready && (persistence.adapter !== 'postgres' || persistence.connected === true);
+  if (!databaseReady) {
+    blockingReasons.push('Database connectivity is unavailable.');
+  }
+
+  let migrationsReady = true;
+  let schemaObjectsReady = true;
+  if (persistence.adapter === 'postgres') {
+    const schema = persistence.schema;
+    const applied = schema?.migrationsAppliedCount ?? 0;
+    migrationsReady =
+      Boolean(schema?.migrationsTablePresent) && applied >= REQUIRED_CANONICAL_MIGRATION_COUNT;
+    if (!migrationsReady) {
+      blockingReasons.push(
+        `Canonical PostgreSQL migrations incomplete (${applied}/${REQUIRED_CANONICAL_MIGRATION_COUNT} applied).`,
+      );
+    }
+
+    const rateLimitOk = Boolean(schema?.rateLimitTablePresent);
+    const essentialTablesOk = schema?.essentialTablesPresent !== false;
+    const overlapConstraintOk = schema?.overlapConstraintPresent !== false;
+    schemaObjectsReady = Boolean(schema) && rateLimitOk && essentialTablesOk && overlapConstraintOk;
+    if (!schemaObjectsReady) {
+      const missingTables = schema?.missingEssentialTables?.length
+        ? `missing tables: ${schema.missingEssentialTables.join(', ')}`
+        : !rateLimitOk
+          ? 'missing rate_limit_buckets table'
+          : 'required schema objects incomplete';
+      const constraintNote =
+        schema?.overlapConstraintPresent === false
+          ? '; missing consultation overlap exclusion constraint'
+          : '';
+      blockingReasons.push(`PostgreSQL schema objects not ready (${missingTables}${constraintNote}).`);
+    }
+  }
+
+  const authReady = auth.readyForProductionAuth;
+  if (!authReady) {
+    blockingReasons.push('Supabase production authentication is not fully configured.');
+  }
+
+  const emailReady =
+    email.configured && email.webhookSecretConfigured && email.staffRecipientConfigured;
+  if (!emailReady) {
+    blockingReasons.push(
+      'Notification provider requires RESEND_API_KEY, EMAIL_FROM, STAFF_NOTIFICATION_EMAIL, and RESEND_WEBHOOK_SECRET.',
+    );
+  }
+
+  const workerReady = worker.healthy;
+  if (!workerReady) {
+    blockingReasons.push('Background notification outbox worker heartbeat is unhealthy.');
+  }
+
+  const productionReady =
+    databaseReady && migrationsReady && schemaObjectsReady && authReady && emailReady && workerReady;
+
+  const ok = isProduction ? productionReady : databaseReady;
+  return {
+    ok,
+    httpStatus: ok ? 200 : 503,
+    status: ok ? 'ready' : 'not_ready',
+    productionReady,
+    blockingReasons,
+    checks: {
+      database: databaseReady,
+      migrations: migrationsReady,
+      schemaObjects: schemaObjectsReady,
+      auth: authReady,
+      email: emailReady,
+      worker: workerReady,
+    },
+  };
 }
 
 function isValidIsoCalendarDate(dateStr: string): boolean {
@@ -335,11 +454,31 @@ export function createApp(options: CreateAppOptions = {}) {
     const ai = getGeminiConfigStatus();
     const auth = getIdentityProviderStatus();
     const email = getEmailProviderStatus();
-    res.status(persistence.ready ? 200 : 503).json({
-      ok: persistence.ready,
+    const metrics = observability.getSnapshot();
+    const workerStatus = outboxWorker.getStatus();
+    const worker: ReadinessWorkerDiagnostics = {
+      ...workerStatus,
+      healthy: metrics.notifications.workerHealthy,
+      lastHeartbeatAt: metrics.notifications.lastWorkerHeartbeatAt,
+    };
+    const readiness = evaluateApplicationReadiness({
       persistence,
       auth,
       email,
+      worker,
+      isProduction: process.env.NODE_ENV === 'production',
+    });
+
+    res.status(readiness.httpStatus).json({
+      ok: readiness.ok,
+      status: readiness.status,
+      productionReady: readiness.productionReady,
+      blockingReasons: readiness.blockingReasons,
+      checks: readiness.checks,
+      persistence,
+      auth,
+      email,
+      worker,
       ai: { model: ai.model, configured: ai.configured },
       requestId: res.getHeader('X-Request-Id'),
       timestamp: new Date().toISOString(),
@@ -351,12 +490,32 @@ export function createApp(options: CreateAppOptions = {}) {
     const ai = getGeminiConfigStatus();
     const auth = getIdentityProviderStatus();
     const email = getEmailProviderStatus();
-    res.status(persistence.ready ? 200 : 503).json({
-      ok: persistence.ready,
+    const metrics = observability.getSnapshot();
+    const workerStatus = outboxWorker.getStatus();
+    const worker: ReadinessWorkerDiagnostics = {
+      ...workerStatus,
+      healthy: metrics.notifications.workerHealthy,
+      lastHeartbeatAt: metrics.notifications.lastWorkerHeartbeatAt,
+    };
+    const readiness = evaluateApplicationReadiness({
+      persistence,
+      auth,
+      email,
+      worker,
+      isProduction: process.env.NODE_ENV === 'production',
+    });
+
+    res.status(readiness.httpStatus).json({
+      ok: readiness.ok,
+      status: readiness.status,
+      productionReady: readiness.productionReady,
+      blockingReasons: readiness.blockingReasons,
+      checks: readiness.checks,
       service: 'Celebration Sisters Event Decor Platform',
       persistence,
       auth,
       email,
+      worker,
       ai: { model: ai.model, configured: ai.configured, timeoutMs: ai.timeoutMs },
       requestId: res.getHeader('X-Request-Id'),
       timestamp: new Date().toISOString(),
