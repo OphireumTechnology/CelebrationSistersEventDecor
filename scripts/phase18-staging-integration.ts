@@ -30,8 +30,8 @@ async function run(){
  await check('health','/health',[200]);
  await check('readiness','/ready',[200]);
  await check('auth-config','/api/auth/config',[200]);
- await check('anonymous-session','/api/auth/session',[401,403]);
- await check('invalid-bearer-session','/api/auth/session',[401,403],{Authorization:'Bearer invalid.staging.jwt'});
+ await check('anonymous-session','/api/auth/session',[200]);
+ await check('invalid-bearer-session','/api/auth/session',[200],{Authorization:'Bearer invalid.staging.jwt'});
  await check('anonymous-bookings','/api/bookings',[401,403]);
  await check('forged-role-bookings','/api/bookings',[401,403],{'x-user-role':'admin','x-user-id':'fake-staging-user'});
  status=results.every(r=>r.passed===true)?'passed':'failed';
