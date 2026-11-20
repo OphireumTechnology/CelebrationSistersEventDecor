@@ -12,6 +12,7 @@ async function check(name:string,path:string,expected:number[],headers:Record<st
   const passed = expected.includes(response.status);
   if (path === '/ready') {
     const body = await response.json() as { checks?: Record<string,boolean>; blockingReasons?: string[]; persistence?: { adapter?:string; connected?:boolean; schema?:{ migrationsAppliedCount?:number } }; auth?:{ readyForProductionAuth?:boolean }; email?:{ configured?:boolean; liveDeliveryEnabled?:boolean } };
+    results.push({name:'resend-live-disabled',passed:body.email?.liveDeliveryEnabled===false});
     console.log('PHASE18_READINESS_DIAGNOSTIC '+JSON.stringify({httpStatus:response.status,checks:body.checks,blockingReasons:body.blockingReasons,persistence:{adapter:body.persistence?.adapter,connected:body.persistence?.connected,migrationsAppliedCount:body.persistence?.schema?.migrationsAppliedCount},authReady:body.auth?.readyForProductionAuth,emailConfigured:body.email?.configured,emailLive:body.email?.liveDeliveryEnabled}));
   }
   results.push({name,passed,httpStatus:response.status});
@@ -36,9 +37,10 @@ async function run(){
  await check('readiness','/ready',[200]);
  await check('auth-config','/api/auth/config',[200]);
  await check('anonymous-session','/api/auth/session',[200]);
- await check('invalid-bearer-session','/api/auth/session',[200],{Authorization:'Bearer invalid.staging.jwt'});
+ await check('invalid-bearer-protected-admin','/api/admin/metrics',[401,403],{Authorization:'Bearer invalid.staging.jwt'});
  await check('anonymous-bookings','/api/bookings',[401,403]);
  await check('forged-role-bookings','/api/bookings',[401,403],{'x-user-role':'admin','x-user-id':'fake-staging-user'});
+ await check('forged-role-admin','/api/admin/metrics',[401,403],{'x-user-role':'admin','x-user-id':'fake-staging-user'});
  try {
   const journey=await verifyStagingRailwayAndResend({apiBaseUrl:base,frontendOrigin:'https://celebrationsistersdecor.com',requireHttps:false,requirePostgres:true,requireCanonicalMigrations:true,checkUnauthenticatedGuards:true,requireSupabaseAuth:false,requireResendLive:false});
   for(const c of journey.checks) {
