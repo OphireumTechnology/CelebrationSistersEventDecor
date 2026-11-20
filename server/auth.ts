@@ -345,9 +345,9 @@ export async function resolveAuthenticatedContextAsync(
            resolved.accountStatus !== 'active')) {
         return guestContext(true);
       }
-      // A different issuer's JWT may not inherit an existing privileged record.
+      // AAL1 remains authenticated for MFA enrollment but cannot pass admin MFA guards.
       if (externalStaging && resolved.user.role === 'admin' &&
-          (claims.sub !== STAGING_ADMIN_SUBJECT || claims.aal !== 'aal2')) {
+          claims.sub !== STAGING_ADMIN_SUBJECT) {
         return guestContext(true);
       }
       return {
