@@ -9,6 +9,10 @@ async function check(name:string,path:string,expected:number[],headers:Record<st
  try {
   const response = await fetch(base+path,{headers,signal:AbortSignal.timeout(10000)});
   const passed = expected.includes(response.status);
+  if (path === '/ready') {
+    const body = await response.json() as { checks?: Record<string,boolean>; blockingReasons?: string[]; persistence?: { adapter?:string; connected?:boolean; schema?:{ migrationsAppliedCount?:number } }; auth?:{ readyForProductionAuth?:boolean }; email?:{ configured?:boolean; liveDeliveryEnabled?:boolean } };
+    console.log('PHASE18_READINESS_DIAGNOSTIC '+JSON.stringify({httpStatus:response.status,checks:body.checks,blockingReasons:body.blockingReasons,persistence:{adapter:body.persistence?.adapter,connected:body.persistence?.connected,migrationsAppliedCount:body.persistence?.schema?.migrationsAppliedCount},authReady:body.auth?.readyForProductionAuth,emailConfigured:body.email?.configured,emailLive:body.email?.liveDeliveryEnabled}));
+  }
   results.push({name,passed,httpStatus:response.status});
   console.log('PHASE18_CHECK '+JSON.stringify(results.at(-1)));
   return passed;
