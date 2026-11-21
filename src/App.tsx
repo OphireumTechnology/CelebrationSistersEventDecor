@@ -41,8 +41,8 @@ export interface TotpEnrollmentResult {
   recoveryCodes?: string[];
 }
 
-export default function App() {
-  const [activeRoute, setActiveRoute] = useState<AppRoute>('home');
+export default function App({ initialRoute = 'home' }: { initialRoute?: AppRoute } = {}) {
+  const [activeRoute, setActiveRoute] = useState<AppRoute>(initialRoute);
   const [selectedServiceId, setSelectedServiceId] = useState<string | null>(null);
 
   const externalStagingMode = Boolean(getExternalStagingMfaClient());

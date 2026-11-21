@@ -934,27 +934,40 @@ export function createApp(options: CreateAppOptions = {}) {
 
       const normalizedEmail = parsed.data.email.toLowerCase();
       const emailHash = sha256Hex(normalizedEmail).slice(0, 16);
-      const redirectBase = (process.env.FRONTEND_PUBLIC_URL || 'https://celebrationsistersdecor.com').replace(/\/+$/, '');
-      try {
-        await authClient.auth.resetPasswordForEmail(normalizedEmail, {
-          redirectTo: `${redirectBase}/`,
+      const frontendOrigin = process.env.FRONTEND_PUBLIC_URL?.trim() ||
+        (process.env.RAILWAY_ENVIRONMENT_NAME === 'staging' ? '' : 'https://celebrationsistersdecor.com');
+      const callbackBase = URL.parse(frontendOrigin);
+      if (!callbackBase || callbackBase.protocol !== 'https:' || callbackBase.username || callbackBase.password) {
+        return res.status(503).json({
+          code: 'AUTH_RECOVERY_NOT_CONFIGURED',
+          error: 'Password recovery is not configured for this environment.',
         });
+      }
+      const redirectTo = new URL('/?auth=recovery', callbackBase).href;
+      let providerAccepted = false;
+      try {
+        const result = await authClient.auth.resetPasswordForEmail(normalizedEmail, {
+          redirectTo,
+        });
+        providerAccepted = !result.error;
       } catch {
-        // Deliberately suppress provider errors to avoid account enumeration while logging security event
+        // Preserve the same public response for every account.
       }
 
       await withTransaction((db) => {
         appendSecurityEvent(db, {
           eventType: 'PASSWORD_RESET_REQUESTED',
           emailHash,
-          outcome: 'allowed',
-          details: 'Password recovery email requested via Supabase Auth',
+          outcome: providerAccepted ? 'allowed' : 'denied',
+          details: providerAccepted
+            ? 'Password recovery request accepted by Supabase Auth'
+            : 'Password recovery request failed at Supabase Auth',
         });
       });
 
       return res.json({
         ok: true,
-        message: 'If an account matches that email address, password recovery instructions have been dispatched.',
+        message: 'If an account matches that email address, check its inbox for password recovery instructions.',
       });
     },
   );

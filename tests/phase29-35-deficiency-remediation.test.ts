@@ -48,7 +48,9 @@ describe('Final Deficiency Remediation — 5 Prioritized Production Systems', ()
   let baseUrl: string;
   let nextMockJwt: string | null = null;
   let nextLoginError: string | null = null;
-  const resetCalls: string[] = [];
+  const resetProviderError = 'Provider-only diagnostic';
+  let nextResetError: string | null = null;
+  const resetCalls: Array<{ email: string; redirectTo?: string }> = [];
 
   async function mintSupabaseJwt(params: {
     sub: string;
@@ -81,9 +83,9 @@ describe('Final Deficiency Remediation — 5 Prioritized Production Systems', ()
         }
         return { data: { session: { access_token: nextMockJwt } }, error: null };
       },
-      resetPasswordForEmail: async (email: string) => {
-        resetCalls.push(email);
-        return { data: {}, error: null };
+      resetPasswordForEmail: async (email, options) => {
+        resetCalls.push({ email, redirectTo: options?.redirectTo });
+        return { data: {}, error: nextResetError ? { message: nextResetError } : null };
       },
     },
   };
@@ -118,6 +120,7 @@ describe('Final Deficiency Remediation — 5 Prioritized Production Systems', ()
     process.env.CS_DB_PATH = dbFile;
     nextMockJwt = null;
     nextLoginError = null;
+    nextResetError = null;
     resetCalls.length = 0;
   });
 
@@ -495,7 +498,23 @@ describe('Final Deficiency Remediation — 5 Prioritized Production Systems', ()
       body: JSON.stringify({ email: 'director@celebrationsistersdecor.com' }),
     });
     assert.equal(resetRes.status, 200);
-    assert.deepEqual(resetCalls, ['director@celebrationsistersdecor.com']);
+    assert.deepEqual(resetCalls, [{
+      email: 'director@celebrationsistersdecor.com',
+      redirectTo: new URL('/?auth=recovery', process.env.FRONTEND_PUBLIC_URL || 'https://celebrationsistersdecor.com').href,
+    }]);
+
+    nextResetError = resetProviderError;
+    const deliveryFailure = await fetch(`${baseUrl}/api/auth/password-reset`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'director@celebrationsistersdecor.com' }),
+    });
+    assert.equal(deliveryFailure.status, 200);
+    assert.deepEqual(await deliveryFailure.json(), await resetRes.json());
+    const recoveryEvents = (await readDb()).authSecurityEvents
+      .filter((entry) => entry.eventType === 'PASSWORD_RESET_REQUESTED');
+    assert.deepEqual(recoveryEvents.map((entry) => entry.outcome), ['denied', 'allowed']);
+    assert.ok(recoveryEvents.every((entry) => !entry.details?.includes(resetProviderError)));
   });
 
   // =========================================================================
