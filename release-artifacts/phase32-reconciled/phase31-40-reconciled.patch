@@ -1,0 +1,3690 @@
+diff --git a/.github/workflows/staging-deployment-gate.yml b/.github/workflows/staging-deployment-gate.yml
+new file mode 100644
+index 0000000..dd3d39a
+--- /dev/null
++++ b/.github/workflows/staging-deployment-gate.yml
+@@ -0,0 +1,63 @@
++name: Staging Deployment & Commit SHA Sync Gate
++
++on:
++  workflow_dispatch:
++    inputs:
++      expected_commit_sha:
++        description: '40-character GitHub CI-approved commit SHA to verify on Railway staging'
++        required: true
++        type: string
++      staging_url:
++        description: 'Railway staging HTTPS URL'
++        required: false
++        default: 'https://celebrationsisterseventdecor-staging-staging.up.railway.app'
++        type: string
++  workflow_run:
++    workflows: ['CI Verification & Production Hardening Checks']
++    types: [completed]
++    branches: ['ops/**', 'release/**']
++
++permissions:
++  contents: read
++
++concurrency:
++  group: staging-deploy-gate-${{ github.ref }}
++  cancel-in-progress: false
++
++jobs:
++  verify-railway-staging:
++    name: Independent Railway SHA Sync, Health, DB & Security Gate
++    runs-on: ubuntu-latest
++    timeout-minutes: 10
++    if: >-
++      github.event_name == 'workflow_dispatch' ||
++      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
++    steps:
++      - uses: actions/checkout@v4
++        with:
++          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_commit_sha || github.event.workflow_run.head_sha }}
++
++      - uses: actions/setup-node@v4
++        with:
++          node-version: '22'
++
++      - name: Run fail-closed Railway deployment & SHA verification gate
++        id: gate
++        env:
++          STAGING_URL: ${{ github.event_name == 'workflow_dispatch' && inputs.staging_url || 'https://celebrationsisterseventdecor-staging-staging.up.railway.app' }}
++          GITHUB_APPROVED_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_commit_sha || github.event.workflow_run.head_sha }}
++          RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
++          RAILWAY_PROJECT_ID: ${{ vars.RAILWAY_STAGING_PROJECT_ID || '786a7d31-23a8-4154-8185-0d5f07914c24' }}
++          RAILWAY_ENVIRONMENT_ID: ${{ vars.RAILWAY_STAGING_ENVIRONMENT_ID || '0ad6480e-6259-4a1a-81f8-a4bc89869cca' }}
++          RAILWAY_SERVICE_ID: ${{ vars.RAILWAY_STAGING_SERVICE_ID || '5ba79779-aa42-4516-b294-900ef137f23c' }}
++          STAGING_ADMIN_AAL2_TOKEN: ${{ secrets.STAGING_ADMIN_AAL2_TOKEN }}
++        run: |
++          node scripts/verify-staging-deployment.mjs --output staging-deployment-certification.json
++
++      - name: Upload machine-readable staging certification artifact
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: staging-deployment-certification-${{ github.run_id }}
++          path: staging-deployment-certification.json
++          retention-days: 30
+diff --git a/docs/final-certification/01_WORKSPACE_PRESERVATION_AND_RECOVERY_REPORT.md b/docs/final-certification/01_WORKSPACE_PRESERVATION_AND_RECOVERY_REPORT.md
+new file mode 100644
+index 0000000..c86e483
+--- /dev/null
++++ b/docs/final-certification/01_WORKSPACE_PRESERVATION_AND_RECOVERY_REPORT.md
+@@ -0,0 +1,53 @@
++# 01 — Workspace Preservation and Recovery Report
++
++**Project:** Celebration Sisters Event Decor  
++**Integration Branch:** `ops/staging-migration-job-20261121` (PR #21)  
++**Original Local Development Baseline SHA:** `de848c890138ee00db72ce08e093a0f337215226`  
++**Remote Integration Branch HEAD Discovered at Phase 31:** `fdf693187be1993aa151f0ab8b2f0b41fb44fff7`  
++**Backup Location:** `release-artifacts/phase31-backup/`  
++**Execution Timestamp:** 2026-11-20T22:46:46Z
++
++---
++
++## 1. Phase 31 Preservation Summary
++
++Before any reconciliation or further edits were performed, the entire Phase 21–30 repair delta was inventoried against remote `origin/ops/staging-migration-job-20261121` (`fdf693187be1993aa151f0ab8b2f0b41fb44fff7`) and backed up with cryptographic SHA-256 verification.
++
++### Preserved Backup Artifacts (`release-artifacts/phase31-backup/`)
++- `CHANGE_MANIFEST.json` — Complete machine-readable inventory of all preserved files, byte lengths, SHA-256 hashes, remote diff statuses, and excluded artifacts.
++- `SHA256SUMS.txt` — Exact SHA-256 checksums for all 20 preserved Phase 21–30 files.
++- `phase21-30-repair-delta.patch` (`151,189` bytes) — Clean unified Git patch generated against remote HEAD `fdf693187be1993aa151f0ab8b2f0b41fb44fff7`.
++- `phase21-30-repair-delta.bundle` (`44,432` bytes, commit `8829f655b978610bd67d56ea01b6fdc7255235d5`) — Verified self-contained Git bundle rooted on `fdf693187be1993aa151f0ab8b2f0b41fb44fff7`.
++
++### Excluded Artifacts (Strictly Kept Out of Backups & Commits)
++- `bun.lock` (prohibited by `.github/workflows/ci.yml`)
++- `.env` and any credential/secret files
++- `node_modules/`, `dist/`, `dist-server/`, `data/`
++
++---
++
++## 2. Preserved Mandatory Files Verified
++
++| File | Status vs Remote `fdf69318` | Preserved & SHA-256 Verified |
++| --- | --- | --- |
++| `server/identityProvider.ts` | Modified | **YES** |
++| `server/auth.ts` | Modified | **YES** |
++| `server/app.ts` | Modified | **YES** |
++| `scripts/run-migrations.ts` | Modified | **YES** |
++| `src/lib/externalStagingMfa.ts` | Modified | **YES** |
++| `src/App.tsx` | Modified | **YES** |
++| `src/components/PortalsWorkspace.tsx` | Modified | **YES** |
++| `tests/phase21-30-certification.test.ts` | Added | **YES** |
++| `docs/final-certification/` (12 baseline reports) | Added | **YES** (subsequently expanded to 14 Phase 31–40 deliverables and re-bundled in Phase 32) |
++
++---
++
++## 3. Restore Verification Proof
++
++To prove zero data loss before Phase 32 reconciliation:
++1. Cloned a fresh isolated repository from `fdf693187be1993aa151f0ab8b2f0b41fb44fff7`.
++2. Executed `git bundle verify release-artifacts/phase31-backup/phase21-30-repair-delta.bundle` -> **PASS**.
++3. Executed `git apply --check` and `git apply` on `phase21-30-repair-delta.patch` -> **PASS** (zero hunk failures or conflicts).
++4. Recomputed SHA-256 hashes of all 20 restored files and verified **20 / 20 exact byte-for-byte matches** against `SHA256SUMS.txt`.
++
++**Phase 31 Acceptance Status:** **VERIFIED**
+diff --git a/docs/final-certification/02_GITHUB_SOURCE_RECONCILIATION_REPORT.md b/docs/final-certification/02_GITHUB_SOURCE_RECONCILIATION_REPORT.md
+new file mode 100644
+index 0000000..ceca666
+--- /dev/null
++++ b/docs/final-certification/02_GITHUB_SOURCE_RECONCILIATION_REPORT.md
+@@ -0,0 +1,55 @@
++# 02 — GitHub Source Reconciliation Report
++
++**Project:** Celebration Sisters Event Decor  
++**Repository:** `https://github.com/OphireumTechnology/CelebrationSistersEventDecor`  
++**Integration Branch:** `ops/staging-migration-job-20261121` (PR #21, open, non-draft)  
++**Base Branch:** `main` (`f0ae105ab0f1344f0b0c8565de3be7eebe999d35`)  
++**Remote Branch HEAD Verified:** `fdf693187be1993aa151f0ab8b2f0b41fb44fff7` (`30` commits, `15` changed files, updated `2026-11-20T22:31:19Z`)  
++**Audit Timestamp:** 2026-11-20T22:48Z
++
++---
++
++## 1. Remote Advancement Discovered & Reconciled
++
++Comparing the local workspace baseline (`de848c890138ee00db72ce08e093a0f337215226`) against live remote `origin/ops/staging-migration-job-20261121` revealed **1 new remote commit**:
++- **`fdf693187be1993aa151f0ab8b2f0b41fb44fff7`** (`Sat Nov 21 06:31:18 2026 +0800`): `chore(staging): add fail-closed Railway commit and HTTPS health verification gate` — added `scripts/verify-staging-deployment.mjs` (39 lines).
++
++### Three-Way Reconciliation Outcome
++- **Merge Conflicts:** **0 conflicts** (`fdf69318` touched only `scripts/verify-staging-deployment.mjs`, disjoint from the 7 Phase 21–30 repaired source files).
++- **Remote Preservation & Phase 39 Enhancement:** `scripts/verify-staging-deployment.mjs` was reconciled into the workspace and upgraded (preserving backward compatibility with `STAGING_URL`, `EXPECTED_COMMIT_SHA`, `DEPLOYED_COMMIT_SHA`) to add independent Railway GraphQL API commit lookup, `/health` + `/ready` DB/migration/email-safety verification, unauthenticated auth-guard verification, and machine-readable JSON certification output.
++- **Dedicated Workflow Integration:** Added `.github/workflows/staging-deployment-gate.yml` and `tests/phase31-40-deployment-gate.test.ts` (5 new tests).
++
++---
++
++## 2. GitHub Write Access Status (**BLOCKED**)
++
++Environment inspection confirmed `GITHUB_TOKEN: false` and `GH_TOKEN: false` inside this sandbox, and `/app/applet` contains no `.git` remote credentials. Per Phase 32 rules, GitHub synchronization is **honestly classified as `BLOCKED`**, never `VERIFIED`.
++
++### Exact Recoverable Patch & Bundle Ready for Workstation Push
++
++A final reconciled Git patch and Git bundle rooted directly on remote HEAD `fdf693187be1993aa151f0ab8b2f0b41fb44fff7` are generated under `release-artifacts/phase32-reconciled/` (excluding `bun.lock`, `.env`, and generated directories).
++
++**Non-Destructive Workstation Integration Commands (No Force Push, No Merge to `main`):**
++```bash
++git fetch origin
++git checkout ops/staging-migration-job-20261121
++git pull --ff-only origin ops/staging-migration-job-20261121
++
++# Option A: Apply reconciled Git bundle directly onto ops/staging-migration-job-20261121
++git pull --ff-only /path/to/phase31-40-reconciled.bundle ops/staging-migration-job-20261121
++
++# Option B: Or apply unified patch and commit explicitly
++# git apply --check /path/to/phase31-40-reconciled.patch
++# git apply /path/to/phase31-40-reconciled.patch
++
++# Verify clean tree (ensure bun.lock is NOT staged)
++git status --short
++npm ci
++npm run typecheck
++npm run lint
++npm test
++npm run build
++git push origin ops/staging-migration-job-20261121
++```
++
++**Phase 32 Acceptance Status:** **BLOCKED** (reconciliation & recoverable bundle **VERIFIED** locally; remote GitHub push requires authorized workstation credentials).
+diff --git a/docs/final-certification/03_HOSTED_CI_AND_DOCKER_BUILD_REPORT.md b/docs/final-certification/03_HOSTED_CI_AND_DOCKER_BUILD_REPORT.md
+new file mode 100644
+index 0000000..2bc5a05
+--- /dev/null
++++ b/docs/final-certification/03_HOSTED_CI_AND_DOCKER_BUILD_REPORT.md
+@@ -0,0 +1,43 @@
++# 03 — Hosted CI and Docker Build Report
++
++**Project:** Celebration Sisters Event Decor  
++**Repository:** `https://github.com/OphireumTechnology/CelebrationSistersEventDecor`  
++**Branch:** `ops/staging-migration-job-20261121` (PR #21)  
++**Audit Timestamp:** 2026-11-20T22:48Z
++
++---
++
++## 1. Live Hosted GitHub Actions Evidence on Remote HEAD (`fdf693187be1993aa151f0ab8b2f0b41fb44fff7`)
++
++Queried directly from the GitHub Actions API:
++
++| Workflow Name | Run ID | Head Commit SHA | Conclusion | Jobs Verified |
++| --- | --- | --- | --- | --- |
++| `CI Verification & Production Hardening Checks` | `44829640388` | `fdf693187be1993aa151f0ab8b2f0b41fb44fff7` | **`success`** | `Typecheck, Lint, Test, Migrations, Audit & Runtime Smoke` (`136611019587`: 17/17 steps `success`); `Docker Production Image Build Check` (`136611340927`: 4/4 steps `success`) |
++| `Deploy Celebration Sisters frontend to GitHub Pages` | `44829640386` | `fdf693187be1993aa151f0ab8b2f0b41fb44fff7` | **`success`** | Frontend Pages deploy `success` |
++| `CI Verification & Production Hardening Checks` (prior) | `44826562917` | `de848c890138ee00db72ce08e093a0f337215226` | **`success`** | All steps + Docker build `success` |
++
++**Workflow Evidence URL:** `https://github.com/OphireumTechnology/CelebrationSistersEventDecor/actions/runs/44829640388`
++
++---
++
++## 2. Local CI-Equivalent Verification on Reconciled Phase 31–40 Workspace
++
++Because the reconciled Phase 21–40 repairs are not yet pushed to GitHub (`BLOCKED` in sandbox), every CI-equivalent check was executed locally on the updated workspace:
++
++| Check | Command | Exact Result |
++| --- | --- | --- |
++| TypeScript compilation | `npm run typecheck` (`tsc --noEmit`) | **PASS** (0 errors) |
++| Linter | `npm run lint` (`oxlint src server tests scripts server.ts`) | **PASS** (0 warnings, 0 errors) |
++| Complete automated test suite | `npm test` (28 test files) | **PASS — 132 / 132 passed**, 9 suites, 0 failed, 0 skipped |
++| Client & backend production build | `npm run build` (`vite build` + `esbuild`) | **PASS** (`dist/index.html` + `dist-server/server.mjs`) |
++| Real Chromium browser acceptance | `npx tsx scripts/phase16-browser-acceptance.ts` | **PASS — 20 / 20 passed** (`0` console errors, `0` page errors) |
++| Static secret scan | `grep -rnE ... src server scripts tests docs` | **PASS — `ZERO_SECRETS_FOUND`** |
++| Docker daemon image build | `docker build --tag celebration-sisters-prod:ci .` | **BLOCKED locally** (no `docker` binary in sandbox; verified green in hosted CI Run `44829640388` on `fdf69318`, pending re-run after Phase 32 push) |
++
++---
++
++## 3. Phase 33 Acceptance Status
++
++- **Hosted CI on Remote `fdf69318`:** **VERIFIED (`success`)**
++- **Hosted CI & Docker Build on New Reconciled Phase 21–40 Commit:** **BLOCKED** until the reconciled commit is pushed to `ops/staging-migration-job-20261121` and GitHub Actions executes against the new SHA.
+diff --git a/docs/final-certification/04_GITHUB_RAILWAY_COMMIT_SYNC_REPORT.md b/docs/final-certification/04_GITHUB_RAILWAY_COMMIT_SYNC_REPORT.md
+new file mode 100644
+index 0000000..97cd657
+--- /dev/null
++++ b/docs/final-certification/04_GITHUB_RAILWAY_COMMIT_SYNC_REPORT.md
+@@ -0,0 +1,72 @@
++# 04 — GitHub–Railway Commit Synchronization Report
++
++**Project:** Celebration Sisters Event Decor  
++**Railway Staging Project:** `celebration-sisters-staging` (`786a7d31-23a8-4154-8185-0d5f07914c24`)  
++**Railway Staging Environment:** `0ad6480e-6259-4a1a-81f8-a4bc89869cca`  
++**Railway Staging Backend Service:** `5ba79779-aa42-4516-b294-900ef137f23c`  
++**Staging URL:** `https://celebrationsisterseventdecor-staging-staging.up.railway.app/`  
++**Audit Timestamp:** 2026-11-20T22:48Z
++
++---
++
++## 1. Critical Synchronization Invariant Check
++
++```text
++GITHUB_APPROVED_SHA  ===  RAILWAY_DEPLOYED_SHA  ===  STAGING_TESTED_SHA
++```
++
++| Commit Variable | Current Observed Value | Independent Evidence Source |
++| --- | --- | --- |
++| `GITHUB_REMOTE_HEAD_SHA` (`ops/staging-migration-job-20261121`) | `fdf693187be1993aa151f0ab8b2f0b41fb44fff7` | GitHub API (`pulls/21` + CI Run `44829640388`) |
++| `WORKSPACE_RECONCILED_DELTA` | Unpushed local repairs on top of `fdf69318` | Preserved in `release-artifacts/phase32-reconciled/` |
++| `RAILWAY_DEPLOYED_SHA` | **UNVERIFIED / BLOCKED** (last independently verified SHA prior to this run: `de848c890138ee00db72ce08e093a0f337215226`) | `RAILWAY_API_TOKEN` / `RAILWAY_TOKEN` not provisioned in sandbox |
++
++---
++
++## 2. Fail-Closed Gate Execution Evidence (`scripts/verify-staging-deployment.mjs`)
++
++Running the upgraded verification gate without `RAILWAY_API_TOKEN` properly refused to fake synchronization and exited **`2` (`BLOCKED`)**:
++```json
++{
++  "status": "BLOCKED",
++  "exitCode": 2,
++  "executedAt": "2026-11-20T22:48:24.253Z",
++  "stagingUrl": "https://celebrationsisterseventdecor-staging-staging.up.railway.app",
++  "githubApprovedSha": "fdf693187be1993aa151f0ab8b2f0b41fb44fff7",
++  "railwayDeployedSha": null,
++  "stagingTestedSha": null,
++  "shaEvidenceSource": "none",
++  "checks": [
++    {
++      "id": "independent_evidence_present",
++      "passed": false,
++      "detail": "Missing independent deployment evidence: DEPLOYED_COMMIT_SHA (or RAILWAY_API_TOKEN + RAILWAY_SERVICE_ID + RAILWAY_ENVIRONMENT_ID)"
++    }
++  ]
++}
++```
++
++---
++
++## 3. Exact Manual Procedure to Complete Phase 34 Synchronization
++
++1. Push the reconciled commit from an authorized workstation to `ops/staging-migration-job-20261121` and record the new 40-character `GITHUB_APPROVED_SHA`.
++2. Confirm GitHub Actions `CI Verification & Production Hardening Checks` + `Docker Production Image Build Check` both complete with `success` on `GITHUB_APPROVED_SHA`.
++3. In Railway (`celebration-sisters-staging` -> service `5ba79779-aa42-4516-b294-900ef137f23c`):
++   - Verify source repository `OphireumTechnology/CelebrationSistersEventDecor` and branch `ops/staging-migration-job-20261121`.
++   - Record the previous successful deployment ID as the rollback candidate.
++   - Confirm `EMAIL_LIVE_DELIVERY_ENABLED=false` and `RAILWAY_ENVIRONMENT_NAME=staging` (do not alter production services or database).
++   - Deploy `GITHUB_APPROVED_SHA` and wait for `SUCCESS` status.
++4. Execute the independent post-deploy verification gate (or trigger `.github/workflows/staging-deployment-gate.yml` with `RAILWAY_API_TOKEN` configured as a repository secret):
++   ```bash
++   STAGING_URL=https://celebrationsisterseventdecor-staging-staging.up.railway.app \
++   GITHUB_APPROVED_SHA="<NEW_40_CHAR_SHA>" \
++   RAILWAY_API_TOKEN="<SECRET_RAILWAY_TOKEN>" \
++   RAILWAY_PROJECT_ID="786a7d31-23a8-4154-8185-0d5f07914c24" \
++   RAILWAY_ENVIRONMENT_ID="0ad6480e-6259-4a1a-81f8-a4bc89869cca" \
++   RAILWAY_SERVICE_ID="5ba79779-aa42-4516-b294-900ef137f23c" \
++   node scripts/verify-staging-deployment.mjs --output staging-deployment-certification.json
++   ```
++5. Confirm exit code `0` (`PASS`) and `githubApprovedSha === railwayDeployedSha === stagingTestedSha`.
++
++**Phase 34 Acceptance Status:** **BLOCKED** (requires GitHub push + Railway deployment access + `RAILWAY_API_TOKEN`).
+diff --git a/docs/final-certification/05_RAILWAY_BUILD_AND_RUNTIME_VERIFICATION_REPORT.md b/docs/final-certification/05_RAILWAY_BUILD_AND_RUNTIME_VERIFICATION_REPORT.md
+new file mode 100644
+index 0000000..1a8c725
+--- /dev/null
++++ b/docs/final-certification/05_RAILWAY_BUILD_AND_RUNTIME_VERIFICATION_REPORT.md
+@@ -0,0 +1,37 @@
++# 05 — Railway Build and Runtime Verification Report
++
++**Project:** Celebration Sisters Event Decor  
++**Railway Staging Service URL:** `https://celebrationsisterseventdecor-staging-staging.up.railway.app/`  
++**Public Website URL:** `https://celebrationsistersdecor.com/`  
++**Probe Timestamp:** 2026-11-20T22:48:43Z
++
++---
++
++## 1. Live Read-Only HTTPS Runtime Probes Executed
++
++All read-only probes were executed directly against live Railway staging (`scripts/verify-deployment-and-rollback.ts` + targeted negative route checks):
++
++| Endpoint / Check | HTTP Status | Observed Live Response / Contract | Result |
++| --- | --- | --- | --- |
++| `GET /health` | `200` | `ok: true`, `status: "alive"`, `X-Request-Id`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `X-Powered-By` hidden | **PASS** |
++| `GET /api/health` | `200` | Health alias responds cleanly | **PASS** |
++| `GET /ready` | `200` | `status: "ready"`, `productionReady: true`, `blockingReasons: []`, PostgreSQL `connected: true` (`4ms`), `migrationsAppliedCount: 8`, `overlapConstraintPresent: true`, `worker.pollingActive: true`, `email.liveDeliveryEnabled: false` | **PASS** |
++| `GET /api/auth/config` | `200` | `provider: "supabase"`, `demoPersonasAvailable: false`, `readyForProductionAuth: true`, `allowedOriginsCount: 2` | **PASS** |
++| `GET /api/consultations/availability` | `200` | `studioTimezone: "America/New_York"`, `days: 7` | **PASS** |
++| `GET /api/auth/session` (unauth) | `200` | Safe public guest context | **PASS** |
++| `GET /api/bookings` (unauth) | `401` | Fail-closed unauthorized | **PASS** |
++| `GET /api/consultations` (unauth) | `401` | Fail-closed unauthorized | **PASS** |
++| `GET /api/staff/checklists` (unauth) | `401` | Fail-closed unauthorized | **PASS** |
++| `GET /api/inventory` (unauth) | `401` | Fail-closed unauthorized | **PASS** |
++| `GET /api/admin/overview` (unauth) | `403` | Fail-closed forbidden | **PASS** |
++| `GET /api/admin/overview` (spoofed `x-user-id` & `x-user-role: admin`) | `403` | Spoofed headers strictly ignored & rejected | **PASS** |
++| `GET /api/nonexistent` | `404` | Clean 404 JSON error (zero HTTP 500s) | **PASS** |
++| CORS allowlist (`https://celebrationsistersdecor.com` vs untrusted) | `200` | Trusted origin echoed; untrusted origin rejected (`null`) | **PASS** |
++| Public Frontend `HEAD https://celebrationsistersdecor.com/` | `200` | Served via GitHub Pages (`text/html; charset=utf-8`) | **PASS** |
++
++---
++
++## 2. Unverified / Blocked Runtime Visibility
++
++- **Railway Build Logs, Runtime Container Logs, and Private Environment Variable Inspection:** **BLOCKED** (no `RAILWAY_API_TOKEN` or Railway CLI session in sandbox).
++- **Post-Deploy Verification of the New Phase 21–40 Reconciled Commit on Railway Staging:** **BLOCKED** until Phase 32 push and Phase 34 deployment complete.
+diff --git a/docs/final-certification/06_POSTGRESQL_AND_MIGRATION_SAFETY_REPORT.md b/docs/final-certification/06_POSTGRESQL_AND_MIGRATION_SAFETY_REPORT.md
+new file mode 100644
+index 0000000..5937726
+--- /dev/null
++++ b/docs/final-certification/06_POSTGRESQL_AND_MIGRATION_SAFETY_REPORT.md
+@@ -0,0 +1,31 @@
++# 06 — PostgreSQL and Migration Safety Report
++
++**Project:** Celebration Sisters Event Decor  
++**Canonical Migrations:** `db/migrations/001_initial_schema.sql` through `008_phase15_token_lifecycle_and_webhook_audit.sql` (8 files)  
++**Migration Runner:** `scripts/run-migrations.ts`  
++**Audit Timestamp:** 2026-11-20T22:49Z
++
++---
++
++## 1. Verified Schema, RLS & Migration Runner Controls
++
++| Control | Implementation & Evidence | Status |
++| --- | --- | --- |
++| Canonical migrations `001`–`008` ordering, SQL syntax & `FORCE ROW LEVEL SECURITY` write policies | Validated by `scripts/verify-migrations.ts`, `scripts/verify-deployment-and-rollback.ts`, `tests/phase14-postgres-rls.test.ts`, and `tests/phase29-35-deficiency-remediation.test.ts` | **VERIFIED** |
++| Pure `SELECT`-only `--dry-run` on fresh and migrated databases | `scripts/run-migrations.ts` runs only `to_regclass` and `SELECT version, checksum_sha256` with zero DDL/writes/locks (`tests/phase20-migration-readonly.test.ts`) | **VERIFIED** |
++| Concurrent migration advisory lock (`MIGRATION_LOCK_CONTENTION`) | Acquires `pg_try_advisory_lock(728491034218)` before any DDL, rejects non-true `acquired`, unlocks in `finally` (`tests/phase21-30-certification.test.ts`) | **VERIFIED** |
++| SHA-256 checksum drift & NULL-checksum fail-closed protection | Both dry-run and apply modes reject missing (`NULL`) or mismatched checksums (`MIGRATION_CHECKSUM_MISMATCH`) | **VERIFIED** |
++| Transactional rollback & idempotent rerun | Each pending migration executes in `BEGIN ... COMMIT` with explicit `ROLLBACK` on SQL failure; rerun skips all 8 cleanly (`tests/phase21-30-certification.test.ts`) | **VERIFIED** |
++| Live Railway staging `/ready` DB telemetry | Confirmed `adapter: "postgres"`, `connected: true` (`4ms`), `migrationsAppliedCount: 8`, `essentialTablesPresent: true`, `overlapConstraintPresent: true`, `worker.pollingActive: true` | **VERIFIED** |
++
++---
++
++## 2. Blocked Live Staging PostgreSQL Operations
++
++Sandbox environment variables confirmed `STAGING_DATABASE_URL: false` and `DATABASE_URL: false`, and `psql`/`pg_dump`/`pg_restore` binaries are unavailable locally. The following live staging PostgreSQL verifications remain **BLOCKED** pending operator execution with `STAGING_DATABASE_URL`:
++
++1. Live connected read-only dry-run: `DATABASE_URL="$STAGING_DATABASE_URL" npx tsx scripts/run-migrations.ts --dry-run`
++2. Live two-process advisory lock contention test on an isolated staging/test PostgreSQL database.
++3. Live non-superuser RLS isolation probe: `DATABASE_URL="$STAGING_DATABASE_URL" npx tsx scripts/setup-staging-rls-probe.ts`
++4. Live read-only `public.users` administrator binding audit for `fd9523dd-eb07-4cca-9040-62feea3f5353`.
++5. Live isolated `pg_dump` / `pg_restore` backup and recovery rehearsal.
+diff --git a/docs/final-certification/07_AUTHENTICATION_AND_JWT_SECURITY_REPORT.md b/docs/final-certification/07_AUTHENTICATION_AND_JWT_SECURITY_REPORT.md
+new file mode 100644
+index 0000000..f163666
+--- /dev/null
++++ b/docs/final-certification/07_AUTHENTICATION_AND_JWT_SECURITY_REPORT.md
+@@ -0,0 +1,46 @@
++# 07 — Authentication and JWT Security Report
++
++**Project:** Celebration Sisters Event Decor  
++**Trusted External Staging Issuer (Read-Only):** `https://nswxwwmtcasmkjtmrdqg.supabase.co/auth/v1` (`ES256`, `kid: c61ff1b2-e23a-4649-9f45-3108f1c77b8d`)  
++**Dedicated Staging Supabase Project:** `https://diasvulceaahmorucoro.supabase.co/auth/v1` (`ES256`, `kid: 7bf015f5-760b-4fff-8ca8-afb536a87c07`)  
++**Trusted Staging Admin Subject UUID:** `fd9523dd-eb07-4cca-9040-62feea3f5353`  
++**Audit Timestamp:** 2026-11-20T22:49Z
++
++---
++
++## 1. Cryptographic JWT & Issuer Verification Hardening (`server/identityProvider.ts`, `server/auth.ts`)
++
++- **Protected-Header Algorithm Routing & Pinning:** Decodes JWT protected header `alg` before verification; immediately rejects `alg: none` and unknown algorithms. Asymmetric algorithms (`ES256`, `RS256`, `EdDSA`) always verify via issuer-specific JWKS even if `SUPABASE_JWT_SECRET` is configured in Railway environment variables.
++- **External Staging `useJwksOnly: true`:** Forces issuer JWKS verification for `nswxwwmtcasmkjtmrdqg`, rejecting `HS256` tokens forged with `SUPABASE_JWT_SECRET`.
++- **Key Rotation Support:** Tested with multi-key `kid` rotation (`kid-rot-1` -> `kid-rot-2`) in `tests/phase21-30-certification.test.ts`.
++- **Strict Claim Enforcement:** Enforces exact issuer (`iss`), audience (`authenticated`), expiration (`exp`), and signature validity; ignores mutable `user_metadata.role` and prevents email-to-privilege binding (`tests/phase19-jwt-role-isolation.test.ts`).
++
++---
++
++## 2. Consolidated Frontend Session Lifecycle (`src/App.tsx`)
++
++- **Single Sign-In Path:** Eliminated dual `/api/auth/login` + Supabase sign-in conflict in external staging mode; authenticates once via `signInWithPassword` and confirms authorization against `GET /api/auth/session` (failing closed with `signOutExternalStagingSession()` if rejected).
++- **Reload Restoration & Multi-Tab Sync:** Restores active Supabase session on boot, subscribes to `onAuthStateChange` (`TOKEN_REFRESHED`, `USER_UPDATED`, `SIGNED_OUT`), and cleans up subscription on unmount.
++- **Clean Logout:** Revokes server session via `POST /api/auth/logout`, signs out Supabase client, clears pending TOTP factor state, and resets in-memory tokens and UI state.
++
++---
++
++## 3. Closed Alternate Admin Authorization Paths (`server/app.ts`)
++
++| Vector | Behavior in External Staging Mode | Verified By |
++| --- | --- | --- |
++| `POST /api/auth/mfa/totp/enroll` | `409 SUPABASE_MFA_REQUIRED` | `tests/phase21-30-certification.test.ts` |
++| `POST /api/auth/mfa/verify` | `409 SUPABASE_MFA_REQUIRED` | `tests/phase21-30-certification.test.ts` |
++| `POST /api/auth/mfa/recover` | `409 SUPABASE_MFA_REQUIRED` | `tests/phase21-30-certification.test.ts` |
++| `POST /api/auth/mfa/totp/revoke` | `409 SUPABASE_MFA_REQUIRED` | `tests/phase21-30-certification.test.ts` |
++| `POST /api/auth/password-reset` | `409 EXTERNAL_AUTH_READ_ONLY` | `tests/phase21-30-certification.test.ts` |
++| Forged local HMAC admin cookie (`mfaVerified: true`) | Demoted to `guest` (`403`) | `tests/phase21-30-certification.test.ts` |
++| Spoofed `x-user-id` / `x-user-role: admin` headers | Rejected (`403`) | Live Railway staging probe + `tests/auth-and-rbac.test.ts` |
++| `POST /api/auth/switch` demo switching | Disabled (`demoPersonasAvailable: false`) | Live Railway staging `/api/auth/config` |
++
++---
++
++## 4. Remaining External Auth Blockers
++
++- Live staging browser session verification (login, reload, token refresh, logout) with real external Supabase credentials after deploying the reconciled commit to Railway staging: **BLOCKED**.
++- Live staging PostgreSQL `public.users` SQL binding audit for `fd9523dd-eb07-4cca-9040-62feea3f5353`: **BLOCKED** (no `STAGING_DATABASE_URL`).
+diff --git a/docs/final-certification/08_ADMINISTRATOR_MFA_CERTIFICATION_REPORT.md b/docs/final-certification/08_ADMINISTRATOR_MFA_CERTIFICATION_REPORT.md
+new file mode 100644
+index 0000000..eb4aec5
+--- /dev/null
++++ b/docs/final-certification/08_ADMINISTRATOR_MFA_CERTIFICATION_REPORT.md
+@@ -0,0 +1,32 @@
++# 08 — Administrator MFA Certification Report
++
++**Project:** Celebration Sisters Event Decor  
++**Trusted External Staging Issuer:** `https://nswxwwmtcasmkjtmrdqg.supabase.co/auth/v1`  
++**Designated Staging Admin Subject UUID:** `fd9523dd-eb07-4cca-9040-62feea3f5353`  
++**Audit Timestamp:** 2026-11-20T22:50Z
++
++---
++
++## 1. Non-Mutating Code & Automated MFA Lifecycle Verification (`VERIFIED`)
++
++Verified in `src/lib/externalStagingMfa.ts`, `src/App.tsx`, `src/components/PortalsWorkspace.tsx`, `server/app.ts`, and `tests/phase21-30-certification.test.ts` (all passing locally inside the `132 / 132` test suite):
++
++- **Pending Factor-ID Handoff:** `enrollExternalStagingTotp()` captures `factor.id` and stores ONLY `{ factorId, userId, createdAt }` (15-minute TTL) in `window.sessionStorage`. TOTP `secret`, `qr_code`, and `otpauth://` URI are strictly excluded from browser storage and logs (asserted programmatically).
++- **Reload & Interrupted Enrollment Recovery:** `resolveExternalTotpFactorId()` verifies pinned admin UUID, recovers pending factor across full page reload via `sessionStorage` + `listFactors()`, prevents duplicate verified enrollments, and supports explicit `{ replaceUnverified: true }` cleanup of stale unverified factors.
++- **Secure QR Display:** `PortalsWorkspace.tsx` renders `<img src={totpEnrollment.qrCode}>` strictly gated on `startsWith('data:image/')`.
++- **Backend AAL2 Independence:** `handleVerifyMfa()` verifies 6-digit TOTP, refreshes the Supabase session, and calls `GET /api/auth/session`—unlocking Executive Administration ONLY when the backend independently confirms `mfaVerified: true && aal === 'aal2'`.
++- **AAL1 Restriction & Logout:** `getAuth()` permits `aal1` strictly on `GET /api/auth/session` (no `csrfToken`) and `POST /api/auth/logout`, denying all protected data and admin endpoints (`401`/`403`) until `aal2` is achieved.
++
++---
++
++## 2. Live Interactive Account-Holder MFA Certification (`BLOCKED`)
++
++Per Global Development & Security Rules, real account `fd9523dd-eb07-4cca-9040-62feea3f5353` on `nswxwwmtcasmkjtmrdqg` was **NOT** mutated automatically, and no MFA challenge evidence was fabricated.
++
++### Required Human Account-Holder Sequence (After Phase 34 Staging Deployment)
++1. Sign into staging portal with email and password -> verify MFA gate appears and `GET /api/admin/overview` returns `403`.
++2. Enroll authenticator (if no verified factor exists), scan QR code, and optionally reload the page to verify the amber pending-enrollment recovery banner with zero secret stored in DevTools `sessionStorage`.
++3. Enter live 6-digit TOTP code -> verify `GET /api/auth/session` returns `{ mfaVerified: true, aal: "aal2" }` and `GET /api/admin/overview` returns `200`.
++4. Sign out -> confirm session revocation, sign back in, and verify MFA re-challenge is required before admin access unlocks.
++
++**Phase 36 Acceptance Status:** **BLOCKED** (code & non-mutating lifecycle **VERIFIED**; live interactive account-holder AAL2 challenge requires the designated account holder after staging deployment).
+diff --git a/docs/final-certification/09_CUSTOMER_ISOLATION_AND_BOOKING_ACCEPTANCE_REPORT.md b/docs/final-certification/09_CUSTOMER_ISOLATION_AND_BOOKING_ACCEPTANCE_REPORT.md
+new file mode 100644
+index 0000000..a97eaed
+--- /dev/null
++++ b/docs/final-certification/09_CUSTOMER_ISOLATION_AND_BOOKING_ACCEPTANCE_REPORT.md
+@@ -0,0 +1,37 @@
++# 09 — Customer Isolation and Booking Acceptance Report
++
++**Project:** Celebration Sisters Event Decor  
++**Audit Timestamp:** 2026-11-20T22:50Z
++
++---
++
++## 1. Local Automated Isolation & Booking Verification (`VERIFIED`)
++
++### Cross-Account Isolation (`tests/auth-and-rbac.test.ts` & `tests/phase21-30-certification.test.ts`)
++- Customer A (`user-client-camille`) cannot read Customer B (`user-client-elena`) bookings (`bkg-102` excluded).
++- Cross-account email matching cannot leak records bound to another `clientId` (repaired in `server/app.ts` `GET /api/consultations`; regression test confirms Customer B's bound consultation sharing Customer A's email is hidden from A and visible to B).
++- Customer A receives fail-closed denial across every cross-tenant/privileged endpoint:
++  - `GET /api/admin/overview` -> `403`
++  - `GET /api/staff/checklists` -> `403`
++  - `GET /api/inventory` -> `403`
++  - `GET /api/vendors` -> `403`
++  - `POST /api/bookings/bkg-102/contract/sign` -> `403`
++  - `POST /api/bookings/bkg-102/quotes` -> `403`
++  - `PATCH /api/bookings/bkg-102/status` -> `403`
++  - `PATCH /api/bookings/bkg-102/assignments` -> `403`
++  - `POST /api/bookings/bkg-102/messages` -> `404` (anti-enumeration denial)
++  - `PATCH /api/bookings/bkg-102/milestones/ms-1` -> `404` (anti-enumeration denial)
++
++### End-to-End Booking, Concurrency & Real Chromium Acceptance (`VERIFIED`)
++- **Automated Booking & Concurrency Tests (`npm test` — `132 / 132 PASS`):** Verified live availability, slot holds + `DELETE /api/consultations/holds` immediate release, Columbia ET today validation, `Idempotency-Key` deduplication, conflict exclusion, rescheduling, cancellation, and transactional rollback.
++- **Real Headless Chromium Browser Acceptance (`scripts/phase16-browser-acceptance.ts` — `20 / 20 PASS` at 2026-11-20T22:49:17Z):**
++  - Desktop `1440x900` + Mobile `390x844` (`pageOverflow=0px`, `modalOverflow=0px`, `ctaHeight=44px`).
++  - Full wizard booking (`CS-2027-0065`), HTTP `503` outage alert without false confirmation, wrong `csa_` token rejection, client online rescheduling & cancellation, admin MFA confirmation (`CS-2027-0066`), planner assignment & CRM persistence across reload, proposal handoff, Admin Email Outbox verification, and **`0` console errors / `0` page errors**.
++
++---
++
++## 2. Blocked Live Staging Customer & Concurrency Gates
++
++- **Live Staging Customer A vs. Customer B Authenticated Write & Isolation Run (`REQ-36`):** **BLOCKED** pending deployment of the reconciled commit and staging test identity tokens.
++- **Live Staging PostgreSQL Non-Superuser RLS Probe (`REQ-37`):** **BLOCKED** (`STAGING_DATABASE_URL` unavailable in sandbox).
++- **Live Staging Concurrent Double-Booking Race Against Railway PostgreSQL Exclusion Constraint (`REQ-38`):** **BLOCKED** (requires authorized live staging write run).
+diff --git a/docs/final-certification/10_EMAIL_AND_NOTIFICATION_SAFETY_REPORT.md b/docs/final-certification/10_EMAIL_AND_NOTIFICATION_SAFETY_REPORT.md
+new file mode 100644
+index 0000000..3694968
+--- /dev/null
++++ b/docs/final-certification/10_EMAIL_AND_NOTIFICATION_SAFETY_REPORT.md
+@@ -0,0 +1,33 @@
++# 10 — Email and Notification Safety Report
++
++**Project:** Celebration Sisters Event Decor  
++**Staging Probe Target:** `https://celebrationsisterseventdecor-staging-staging.up.railway.app/ready`  
++**Audit Timestamp:** 2026-11-20T22:48:43Z
++
++---
++
++## 1. Live Staging Safety Verification (`VERIFIED`)
++
++Live read-only inspection of Railway staging `/ready` confirmed:
++- `email.provider`: `"resend"`
++- `email.configured`: `true` (`fromAddressConfigured: true`, `staffRecipientConfigured: true`, `webhookSecretConfigured: true`)
++- **`email.liveDeliveryEnabled`: `false`** — outbound customer email delivery remains safely disabled on staging; real customers cannot receive accidental staging emails.
++- `worker.pollingActive`: `true`, `worker.healthy`: `true` (active outbox heartbeat confirmed).
++- `scripts/verify-staging-deployment.mjs` now explicitly fails closed (`exitCode: 1`) if `email.liveDeliveryEnabled !== false` during staging deployment verification unless explicitly overridden.
++
++---
++
++## 2. Automated Outbox, Template & Webhook Verification (`VERIFIED`)
++
++Verified inside the `132 / 132` passing test suite (`tests/phase13-outbox-and-persistence.test.ts`, `tests/phase15-e2e-and-hardening.test.ts`, `tests/phase29-35-deficiency-remediation.test.ts`, `tests/production-hardening.test.ts`):
++- Durable outbox enqueueing decoupled from booking persistence (email failure never corrupts booking state).
++- Retry backoff and terminal failure recording without PII/secret leakage in structured logs.
++- RFC 2606 placeholder domain suppression (`example.com`, `.test`) in production dispatch guards.
++- Signed Svix/Resend webhook HMAC signature verification, duplicate webhook protection, and atomic status reconciliation (`email.sent`, `email.delivered`, `email.delivery_delayed`, `email.bounced`, `email.failed`).
++- Admin Email Outbox rendering verified in real Chromium (`P16-BA-09`).
++
++---
++
++## 3. Blocked External Email Gate
++
++- **Controlled Isolated Test-Inbox Delivery & Live Signed Resend Webhook Callback (`REQ-44`):** **BLOCKED** — intentionally paused in staging (`EMAIL_LIVE_DELIVERY_ENABLED=false`) and requires authorized Resend staging test-inbox credentials and explicit operator execution. Production live email remains prohibited until separate approval.
+diff --git a/docs/final-certification/11_ROLLBACK_AND_RECOVERY_VERIFICATION_REPORT.md b/docs/final-certification/11_ROLLBACK_AND_RECOVERY_VERIFICATION_REPORT.md
+new file mode 100644
+index 0000000..c120873
+--- /dev/null
++++ b/docs/final-certification/11_ROLLBACK_AND_RECOVERY_VERIFICATION_REPORT.md
+@@ -0,0 +1,38 @@
++# 11 — Rollback and Recovery Verification Report
++
++**Project:** Celebration Sisters Event Decor  
++**Audit Timestamp:** 2026-11-20T22:50Z
++
++---
++
++## 1. Phase 39 Release Verification Gate Implemented & Tested (`VERIFIED`)
++
++To ensure a green GitHub CI run can never be mistaken for a verified Railway deployment:
++
++1. **Upgraded `scripts/verify-staging-deployment.mjs`:**
++   - Queries Railway GraphQL API (`https://backboard.railway.app/graphql/v2`) independently via `RAILWAY_API_TOKEN` + `RAILWAY_SERVICE_ID` + `RAILWAY_ENVIRONMENT_ID` to retrieve the latest `SUCCESS` deployment's `meta.commitHash`, deployment ID, and Railway evidence URL.
++   - Enforces strict three-way SHA equality: `GITHUB_APPROVED_SHA === RAILWAY_DEPLOYED_SHA === STAGING_TESTED_SHA`.
++   - Verifies HTTPS origin, same-origin path safety, `GET /health`, `GET /ready` (database, migrations, overlap constraint, auth, worker, and `email.liveDeliveryEnabled === false`), unauthenticated fail-closed guards (`/api/bookings=401`, `/api/admin/overview=403`), and optional authenticated AAL2 check.
++   - Emits a machine-readable JSON certification result (`PASS` exit `0`, `FAILED` exit `1`, `BLOCKED` exit `2`) and writes it to `--output <path>`.
++2. **Dedicated Workflow `.github/workflows/staging-deployment-gate.yml`:**
++   - Runs strictly separate from `.github/workflows/ci.yml` (`workflow_dispatch` or post-CI `workflow_run` on `ops/**` and `release/**`).
++   - Uploads `staging-deployment-certification.json` via `actions/upload-artifact@v4` with 30-day retention.
++3. **Automated Gate Tests (`tests/phase31-40-deployment-gate.test.ts` — `5 / 5 PASS`):**
++   - Verified missing evidence (`BLOCKED`, exit `2`), independent Railway GraphQL SHA mismatch (`FAILED`, exit `1`), full pass (`PASS`, exit `0`), non-HTTPS/cross-origin rejection, staging live-email rejection, broken auth guard rejection, and workflow separation.
++
++---
++
++## 2. Rollback & Recovery Procedures Ready
++
++- **Railway Backend Rollback:** Redeploy the previously recorded known-good immutable Docker deployment ID in `celebration-sisters-staging` (`5ba79779-aa42-4516-b294-900ef137f23c`) without altering environment secrets or dropping tables, then verify recovery via `scripts/verify-deployment-and-rollback.ts` and `scripts/verify-staging-deployment.mjs`.
++- **GitHub Pages Rollback:** Re-run the last green `Deploy Celebration Sisters frontend to GitHub Pages` run (e.g., Run `44829640386`).
++- **PostgreSQL Backup & Restore:** `pg_dump --format=custom` snapshot prior to any future approved production schema change + isolated `pg_restore` into a disposable verification DB + `npx tsx scripts/run-migrations.ts --dry-run`.
++- **Emergency Email Kill Switch:** Set `EMAIL_LIVE_DELIVERY_ENABLED=false` and confirm `/ready` reports `liveDeliveryEnabled: false`.
++
++---
++
++## 3. Blocked Live Rehearsal Gates
++
++- **Live Railway Staging Rollback Rehearsal (`REQ-46`):** **BLOCKED** (requires Railway deployment/rollback permissions + `RAILWAY_API_TOKEN`).
++- **Live PostgreSQL `pg_dump` / `pg_restore` Recovery Rehearsal (`REQ-14`):** **BLOCKED** (requires `STAGING_DATABASE_URL` and PostgreSQL client tools).
++- **Branch Protection Required Status Check for `verify-railway-staging`:** Pending repository admin configuration after `.github/workflows/staging-deployment-gate.yml` is pushed to GitHub.
+diff --git a/docs/final-certification/12_FINAL_48_REQUIREMENT_CERTIFICATION_MATRIX.md b/docs/final-certification/12_FINAL_48_REQUIREMENT_CERTIFICATION_MATRIX.md
+new file mode 100644
+index 0000000..7cae85c
+--- /dev/null
++++ b/docs/final-certification/12_FINAL_48_REQUIREMENT_CERTIFICATION_MATRIX.md
+@@ -0,0 +1,73 @@
++# 12 — Final 48-Requirement Certification Matrix
++
++**Project:** Celebration Sisters Event Decor  
++**Audit Date:** 2026-11-20T22:50Z  
++**Remote Integration Branch HEAD:** `fdf693187be1993aa151f0ab8b2f0b41fb44fff7` (`ops/staging-migration-job-20261121`, PR #21)  
++**Workspace Delta:** Reconciled Phase 21–40 repairs preserved in `release-artifacts/phase31-backup/` and `release-artifacts/phase32-reconciled/`
++
++---
++
++## 1. Exact Percentage Totals
++
++```text
++VERIFIED_PERCENTAGE   = 33 / 48 × 100 = 68.75%
++BLOCKED_PERCENTAGE    = 15 / 48 × 100 = 31.25%
++FAILED_PERCENTAGE     =  0 / 48 × 100 =  0.00%
++UNVERIFIED_PERCENTAGE =  0 / 48 × 100 =  0.00%
++TOTAL                 = 48 / 48       = 100.00%
++```
++
++---
++
++## 2. Complete 48-Requirement Acceptance Matrix
++
++| Requirement ID | Description | Status | Evidence | Environment | Remaining Action | Responsible Party |
++| --- | --- | --- | --- | --- | --- | --- |
++| `REQ-01` | Reconcile PR #21 remote branch (`fdf69318`) with Phase 21–30 workspace repairs & verified backup | **VERIFIED** | `release-artifacts/phase31-backup/` (20/20 SHA-256 restore match) + 3-way diff vs `fdf69318` | Local + GitHub read-only | None | AI |
++| `REQ-02` | TypeScript strict compilation (`tsc --noEmit`) passes with 0 errors | **VERIFIED** | `npm run typecheck` -> 0 errors | Local | Re-verify in hosted CI after push | AI / Developer |
++| `REQ-03` | Linter (`oxlint src server tests scripts server.ts`) passes with 0 warnings/errors | **VERIFIED** | `npm run lint` -> 0 warnings, 0 errors | Local | Re-verify in hosted CI after push | AI / Developer |
++| `REQ-04` | Frontend (`vite build`) and backend (`esbuild`) production bundles build cleanly | **VERIFIED** | `npm run build` (`dist/index.html` + `dist-server/server.mjs`) | Local | Re-verify in hosted CI after push | AI / Developer |
++| `REQ-05` | Static secret scan detects zero secrets, keys, or `.env`/`bun.lock` leaks | **VERIFIED** | Static regex scan -> `ZERO_SECRETS_FOUND` | Local | Exclude `bun.lock` when pushing | AI / Developer |
++| `REQ-06` | Hosted GitHub Actions CI + Docker image build green on reconciled Phase 21–40 commit | **BLOCKED** | Baseline `fdf69318` green (Run `44829640388`), but new repair delta is unpushed (`GITHUB_TOKEN=false`) | GitHub CI | Push reconciled bundle/patch to `ops/staging-migration-job-20261121` & confirm green run | Developer |
++| `REQ-07` | Canonical PostgreSQL migrations `001`–`008` validated (ordering, overlap constraint, `FORCE RLS`) | **VERIFIED** | `scripts/verify-migrations.ts` + `tests/phase29-35-deficiency-remediation.test.ts` | Local | None | AI |
++| `REQ-08` | Connected migration `--dry-run` performs `SELECT`-only queries on fresh & migrated DB | **VERIFIED** | `tests/phase20-migration-readonly.test.ts` | Local | Run against live staging DB under `REQ-13` | AI |
++| `REQ-09` | Migration checksum drift & NULL-checksum fail-closed protection | **VERIFIED** | `scripts/run-migrations.ts` + `tests/phase21-30-certification.test.ts` | Local | None | AI |
++| `REQ-10` | Migration transactional rollback on DDL failure & idempotent rerun | **VERIFIED** | `tests/phase21-30-certification.test.ts` | Local | None | AI |
++| `REQ-11` | Concurrent migration PostgreSQL session advisory lock (`MIGRATION_LOCK_CONTENTION`) | **VERIFIED** | `scripts/run-migrations.ts` + `tests/phase21-30-certification.test.ts` | Local | Live 2-process test under `REQ-13` | AI |
++| `REQ-12` | Live Railway staging `/ready` confirms PostgreSQL connected, 8 migrations applied, overlap constraint present | **VERIFIED** | Live `GET /ready` `200` (`4ms`, `migrationsAppliedCount: 8`, `overlapConstraintPresent: true`) | Railway staging | Re-verify after Phase 34 deploy | AI |
++| `REQ-13` | Live connected `--dry-run` & concurrent advisory lock test against staging PostgreSQL | **BLOCKED** | `STAGING_DATABASE_URL` not provisioned in sandbox | Railway staging | Run `run-migrations.ts --dry-run` & isolated lock contention check | Infrastructure owner |
++| `REQ-14` | Isolated PostgreSQL `pg_dump` / `pg_restore` backup & recovery rehearsal | **BLOCKED** | No `STAGING_DATABASE_URL` or `pg_dump`/`pg_restore` in sandbox | Railway staging | Execute `pg_dump` -> disposable `pg_restore` -> verify schema/rows | Infrastructure owner |
++| `REQ-15` | Live JWKS inspection confirms `ES256` ECDSA public keys for `nswxwwmtcasmkjtmrdqg` & `diasvulceaahmorucoro` | **VERIFIED** | Live HTTPS `.well-known/jwks.json` probes (`ES256`) | External Supabase read-only | None | AI |
++| `REQ-16` | `ES256` JWKS verification + key rotation succeeds even when `SUPABASE_JWT_SECRET` is present | **VERIFIED** | `server/identityProvider.ts` + `tests/phase21-30-certification.test.ts` | Local | None | AI |
++| `REQ-17` | `useJwksOnly` rejects `HS256`, `alg: none`, tampered, expired, wrong-issuer, wrong-audience JWTs | **VERIFIED** | `tests/phase19-jwt-role-isolation.test.ts` + `tests/phase21-30-certification.test.ts` | Local | None | AI |
++| `REQ-18` | Single authoritative external staging sign-in (dual login removed) + fail-closed rejection | **VERIFIED** | `src/App.tsx` | Local | Verify live under `REQ-24` | AI |
++| `REQ-19` | Reload session restore + `onAuthStateChange` refresh/multi-tab sync + clean logout | **VERIFIED** | `src/App.tsx` + `src/lib/externalStagingMfa.ts` | Local | Verify live under `REQ-24` | AI |
++| `REQ-20` | Five-flag isolated staging policy & immutable admin UUID subject pinning (`fd9523dd-eb07-4cca-9040-62feea3f5353`) | **VERIFIED** | `tests/phase19-external-auth-policy.test.ts` | Local | None | AI |
++| `REQ-21` | All alternate admin/MFA bypass routes closed (`409` enroll/verify/recover/revoke/reset; forged HMAC cookie `403`) | **VERIFIED** | `server/app.ts` + `tests/phase21-30-certification.test.ts` | Local | Re-verify on deployed staging | AI |
++| `REQ-22` | Live Railway staging `/api/auth/config` confirms `provider: "supabase"`, `demoPersonasAvailable: false` | **VERIFIED** | Live `GET /api/auth/config` `200` | Railway staging | Re-verify after Phase 34 deploy | AI |
++| `REQ-23` | Live staging PostgreSQL `public.users` SQL binding audit for `fd9523dd-eb07-4cca-9040-62feea3f5353` | **BLOCKED** | `STAGING_DATABASE_URL` not provisioned in sandbox | Railway staging | Run read-only `SELECT` on `public.users` & confirm single active admin binding | Infrastructure owner |
++| `REQ-24` | Live staging browser sign-in, reload, refresh & logout with real external Supabase credentials | **BLOCKED** | Requires deployed Phase 21–40 commit + authorized account holder | Railway staging | Execute live staging browser session walkthrough | Administrator |
++| `REQ-25` | Non-secret `sessionStorage` pending TOTP factor-ID handoff (secret/URI strictly excluded) & reload recovery | **VERIFIED** | `src/lib/externalStagingMfa.ts` + `tests/phase21-30-certification.test.ts` | Local | None | AI |
++| `REQ-26` | Scannable `data:image/` QR rendering + duplicate-verified guard + stale unverified factor cleanup | **VERIFIED** | `src/components/PortalsWorkspace.tsx` + `src/lib/externalStagingMfa.ts` | Local | None | AI |
++| `REQ-27` | Non-mutating automated MFA test suite (invalid/malformed/valid/whitespace/wrong-UUID/AAL1-stuck) | **VERIFIED** | `tests/phase21-30-certification.test.ts` (all assertions passing) | Local | None | AI |
++| `REQ-28` | Central HTTP `getAuth()` boundary: AAL1 permitted only on `/api/auth/session` & `/api/auth/logout`; AAL2 required on all admin routes | **VERIFIED** | `server/app.ts` + `tests/phase21-30-certification.test.ts` | Local | None | AI |
++| `REQ-29` | Live account-holder interactive TOTP enrollment & AAL2 verification on `nswxwwmtcasmkjtmrdqg` | **BLOCKED** | Real account never mutated automatically; requires human authenticator | Railway staging + External Supabase | Account holder completes QR scan & live 6-digit TOTP challenge | Administrator |
++| `REQ-30` | Live staging post-AAL2 executive portal unlock & logout re-challenge | **BLOCKED** | Depends on `REQ-29` | Railway staging | Confirm `/api/admin/overview=200`, logout, re-login MFA challenge | Administrator |
++| `REQ-31` | Customer A vs Customer B horizontal & vertical isolation across bookings, quotes, contracts, messages, assignments, milestones, staff, inventory, vendors, admin | **VERIFIED** | `tests/auth-and-rbac.test.ts` + `tests/phase21-30-certification.test.ts` | Local | Live staging verification under `REQ-36` | AI |
++| `REQ-32` | Cross-account shared-email bound `clientId` consultation isolation fix & regression test | **VERIFIED** | `server/app.ts` + `tests/phase21-30-certification.test.ts` | Local | Live staging verification under `REQ-36` | AI |
++| `REQ-33` | Real-time availability, slot holds (`DELETE` release), conflict exclusion, idempotency, reschedule, cancel | **VERIFIED** | `npm test` (`132 / 132 PASS`) | Local | Live concurrency test under `REQ-38` | AI |
++| `REQ-34` | Real Chromium browser end-to-end acceptance (Desktop `1440x900` + Mobile `390x844`, 0 errors) | **VERIFIED** | `scripts/phase16-browser-acceptance.ts` -> `20 / 20 PASS` | Local | Re-run against staging URL after deploy | AI |
++| `REQ-35` | Live Railway staging availability, unauth fail-closed (`401`/`403`), spoofed header rejection, zero 500s | **VERIFIED** | Live probes at `2026-11-20T22:48:43Z` (8/8 + 6 negative probes) | Railway staging | Re-verify after Phase 34 deploy | AI |
++| `REQ-36` | Live staging Customer A & Customer B authenticated end-to-end write & isolation test | **BLOCKED** | Requires deployed repair commit + isolated staging customer accounts | Railway staging | Execute Customer A/B cross-tenant read/write suite on staging | Developer / Administrator |
++| `REQ-37` | Live staging PostgreSQL non-superuser RLS probe (`scripts/setup-staging-rls-probe.ts`) | **BLOCKED** | `STAGING_DATABASE_URL` not provisioned in sandbox | Railway staging | Run `setup-staging-rls-probe.ts` against staging PostgreSQL | Infrastructure owner |
++| `REQ-38` | Live staging concurrent double-booking race test against Railway PostgreSQL exclusion constraint | **BLOCKED** | Requires authorized live staging write test run | Railway staging | Execute concurrent booking race against staging API | Developer |
++| `REQ-39` | Live Railway staging `/ready` confirms `EMAIL_LIVE_DELIVERY_ENABLED: false` & outbox worker healthy | **VERIFIED** | Live `GET /ready` `200` (`liveDeliveryEnabled: false`, `pollingActive: true`) | Railway staging | Keep disabled during staging | AI |
++| `REQ-40` | Outbox durability, RFC 2606 suppression, signed Svix/Resend webhook reconciliation | **VERIFIED** | `npm test` (`132 / 132 PASS`) | Local | Controlled live test under `REQ-44` | AI |
++| `REQ-41` | Live Railway staging `/health`, security headers, and strict CORS allowlist | **VERIFIED** | `verify-deployment-and-rollback.ts` live probe (`8 / 8 PASS`) | Railway staging | Re-verify after Phase 34 deploy | AI |
++| `REQ-42` | Public GitHub Pages frontend (`https://celebrationsistersdecor.com/`) returns `HTTP/2 200` | **VERIFIED** | Live `HEAD https://celebrationsistersdecor.com/` -> `HTTP/2 200` | Production read-only | None | AI |
++| `REQ-43` | Independent deployment verification gate (`scripts/verify-staging-deployment.mjs`), dedicated workflow (`staging-deployment-gate.yml`), and rollback/DR tooling | **VERIFIED** | `tests/phase31-40-deployment-gate.test.ts` (`5 / 5 PASS`) + live `EXIT_CODE=2 BLOCKED` check | Local | Enable required status check after push | AI / Developer |
++| `REQ-44` | Controlled live Resend staging test-inbox delivery & live signed webhook callback | **BLOCKED** | Live email intentionally paused (`EMAIL_LIVE_DELIVERY_ENABLED=false`) & no Resend credentials | Railway staging | Run controlled test-inbox send with explicit approval | Administrator / Infrastructure owner |
++| `REQ-45` | Deploy reconciled Phase 21–40 commit to Railway staging & prove `GITHUB_APPROVED_SHA === RAILWAY_DEPLOYED_SHA === STAGING_TESTED_SHA` | **BLOCKED** | `RAILWAY_API_TOKEN` not provisioned in sandbox (`verify-staging-deployment.mjs` exited `2 BLOCKED`) | Railway staging | Push commit, deploy to Railway staging, run `staging-deployment-gate.yml` | Infrastructure owner |
++| `REQ-46` | Live Railway staging rollback rehearsal (redeploy prior image, verify `/ready`, restore candidate) | **BLOCKED** | Requires Railway deploy/rollback permissions | Railway staging | Rehearse rollback in staging & log recovery time | Infrastructure owner |
++| `REQ-47` | Production environment variable, secret hygiene & TLS certificate audit (read-only) | **BLOCKED** | No production Railway/Supabase access in sandbox | Production read-only | Inspect production env names & TLS before release approval | Infrastructure owner |
++| `REQ-48` | Explicit human production release approval (merge to `main`, production migration, live email enablement) | **BLOCKED** | Mandatory human governance gate | Production | Sign off ONLY after `REQ-06`..`REQ-47` reach `VERIFIED` | Administrator / Infrastructure owner |
+diff --git a/docs/final-certification/13_OUTSTANDING_BLOCKERS_AND_OWNERSHIP_REGISTER.md b/docs/final-certification/13_OUTSTANDING_BLOCKERS_AND_OWNERSHIP_REGISTER.md
+new file mode 100644
+index 0000000..0ec918e
+--- /dev/null
++++ b/docs/final-certification/13_OUTSTANDING_BLOCKERS_AND_OWNERSHIP_REGISTER.md
+@@ -0,0 +1,19 @@
++# 13 — Outstanding Blockers and Ownership Register
++
++**Project:** Celebration Sisters Event Decor  
++**Total Active Blockers:** **15** (all external credentials, deployment permissions, interactive account-holder MFA, or human governance gates; **0** code defects or test failures)  
++**Audit Date:** 2026-11-20T22:50Z
++
++---
++
++| Blocker ID | Linked Reqs | Exact Cause | Required Permission / Credential | Responsible Party | Exact Next Action |
++| --- | --- | --- | --- | --- | --- |
++| **BLK-01** | `REQ-06` | Sandbox lacks `GITHUB_TOKEN`/`GH_TOKEN` write credentials; reconciled Phase 21–40 commit is unpushed | GitHub write push permission to `ops/staging-migration-job-20261121` | Developer | Apply `release-artifacts/phase32-reconciled/phase31-40-reconciled.bundle` (or `.patch`) on workstation, verify `npm ci && npm run lint && npm test && npm run build`, push without `--force`, verify hosted CI + Docker build pass |
++| **BLK-02** | `REQ-45` | Sandbox lacks `RAILWAY_API_TOKEN` and Railway deploy access; cannot deploy new SHA or independently prove `GITHUB_APPROVED_SHA === RAILWAY_DEPLOYED_SHA === STAGING_TESTED_SHA` | Railway staging deploy access + `RAILWAY_API_TOKEN` repository secret | Infrastructure owner | Deploy CI-approved SHA to Railway staging (`5ba79779-aa42-4516-b294-900ef137f23c`) and run `.github/workflows/staging-deployment-gate.yml` until exit `0` |
++| **BLK-03** | `REQ-13`, `REQ-14`, `REQ-23`, `REQ-37` | Sandbox lacks `STAGING_DATABASE_URL`, `psql`, `pg_dump`, and `pg_restore` | Staging PostgreSQL connection string (`STAGING_DATABASE_URL`) | Infrastructure owner | Run read-only `public.users` admin binding query, connected `run-migrations.ts --dry-run`, 2-process lock check, `setup-staging-rls-probe.ts`, and isolated `pg_dump`/`pg_restore` drill |
++| **BLK-04** | `REQ-24`, `REQ-29`, `REQ-30` | Real external Supabase Auth account `fd9523dd-eb07-4cca-9040-62feea3f5353` (`nswxwwmtcasmkjtmrdqg`) must never be mutated by automation | Account holder login + authenticator app | Administrator | Complete interactive staging login, QR enrollment (if needed), reload test, AAL2 unlock, logout, and re-challenge |
++| **BLK-05** | `REQ-36`, `REQ-38` | Live staging authenticated Customer A/B write isolation and concurrent double-booking race require deployed repair commit + staging test customer tokens | Isolated staging test customer identities | Developer / Administrator | Execute staging Customer A/B cross-tenant read/write suite and concurrent booking race against staging PostgreSQL |
++| **BLK-06** | `REQ-44` | `EMAIL_LIVE_DELIVERY_ENABLED` is safely `false` on staging; sandbox lacks Resend credentials | Authorized isolated test inbox + temporary staging test send approval | Administrator / Infrastructure owner | Verify one controlled test-inbox delivery + signed Resend webhook callback without contacting real customers, then leave live delivery paused |
++| **BLK-07** | `REQ-46` | Live staging rollback rehearsal requires Railway rollback permissions | Railway staging deployment rollback access | Infrastructure owner | Redeploy prior known-good image in staging, confirm `/ready` `200`, record recovery time, then restore approved candidate |
++| **BLK-08** | `REQ-47` | No read-only access to production Railway or production Supabase environment variables in sandbox | Read-only production platform visibility | Infrastructure owner | Audit production environment variable names, secret hygiene, and TLS configuration |
++| **BLK-09** | `REQ-48` | Production merge, production database migration, and live customer email activation require explicit human release approval | Executive / release owner authorization | Administrator / Infrastructure owner | Grant written production release sign-off ONLY after `BLK-01` through `BLK-08` reach `VERIFIED` |
+diff --git a/docs/final-certification/14_PRODUCTION_RELEASE_DECISION_REPORT.md b/docs/final-certification/14_PRODUCTION_RELEASE_DECISION_REPORT.md
+new file mode 100644
+index 0000000..1ae81e4
+--- /dev/null
++++ b/docs/final-certification/14_PRODUCTION_RELEASE_DECISION_REPORT.md
+@@ -0,0 +1,64 @@
++# 14 — Production Release Decision Report
++
++**Project:** Celebration Sisters Event Decor  
++**Repository:** `https://github.com/OphireumTechnology/CelebrationSistersEventDecor`  
++**Integration Branch:** `ops/staging-migration-job-20261121` (PR #21)  
++**Remote GitHub HEAD:** `fdf693187be1993aa151f0ab8b2f0b41fb44fff7` (CI Run `44829640388` green)  
++**Decision Timestamp:** 2026-11-20T22:50Z  
++**Official Release Classification:** **`PRODUCTION_NOT_READY`**
++
++---
++
++## 1. Executive Release Determination
++
++The Celebration Sisters Event Decor codebase is locally verified with **0 failed tests**, **132 / 132 automated tests passing**, **20 / 20 real Chromium browser acceptance checks passing**, **0 TypeScript/Oxlint errors**, **0 leaked secrets**, and a **verified recoverable Git bundle/patch** reconciling all Phase 21–40 repairs cleanly on top of remote HEAD `fdf69318`.
++
++However, per Phase 34, Phase 39, and Phase 40 governance rules, local test success and remote CI on a prior commit do **not** constitute production readiness:
++
++| Metric | Count | Percentage |
++| --- | --- | --- |
++| **VERIFIED** | **33 / 48** | **68.75%** |
++| **BLOCKED** | **15 / 48** | **31.25%** |
++| **FAILED** | **0 / 48** | **0.00%** |
++| **UNVERIFIED** | **0 / 48** | **0.00%** |
++
++Because **15 mandatory external staging and governance requirements remain `BLOCKED`**—including pushing the reconciled commit to GitHub (`REQ-06`), deploying it to Railway staging and proving `GITHUB_APPROVED_SHA === RAILWAY_DEPLOYED_SHA === STAGING_TESTED_SHA` via independent Railway GraphQL metadata (`REQ-45`), live staging PostgreSQL/RLS/backup drills (`REQ-13`, `REQ-14`, `REQ-23`, `REQ-37`), interactive account-holder AAL2 MFA certification (`REQ-24`, `REQ-29`, `REQ-30`), live staging Customer A/B isolation & concurrency (`REQ-36`, `REQ-38`), controlled test-inbox email verification (`REQ-44`), staging rollback rehearsal (`REQ-46`), read-only production env audit (`REQ-47`), and explicit human authorization (`REQ-48`)—the defensible release classification is:
++
++> **`PRODUCTION_NOT_READY`**
++
++---
++
++## 2. Release Gate Status Visualization
++
++```text
++[PASS - LOCAL]   SOURCE PRESERVED & RECONCILED (SHA-256 Verified Bundle/Patch)
++       ↓
++[BLOCKED]        GITHUB PUSH & HOSTED CI ON RECONCILED SHA (REQ-06)
++       ↓
++[BLOCKED]        DOCKER BUILD ON RECONCILED SHA (REQ-06)
++       ↓
++[BLOCKED]        RAILWAY STAGING DEPLOYMENT & GITHUB SHA = RAILWAY SHA (REQ-45)
++       ↓
++[LIVE READ-ONLY] BACKEND HEALTH (/health 200, /ready 200 on prior staging image)
++       ↓
++[BLOCKED]        LIVE STAGING DB DRY-RUN, RLS PROBE & BACKUP/RESTORE (REQ-13/14/23/37)
++       ↓
++[BLOCKED]        INTERACTIVE ACCOUNT-HOLDER AAL2 MFA CERTIFICATION (REQ-24/29/30)
++       ↓
++[BLOCKED]        LIVE STAGING CUSTOMER ISOLATION & CONCURRENCY (REQ-36/38)
++       ↓
++[BLOCKED]        CONTROLLED TEST-INBOX EMAIL & STAGING ROLLBACK DRILL (REQ-44/46)
++       ↓
++[BLOCKED]        EXPLICIT HUMAN PRODUCTION RELEASE APPROVAL (REQ-48)
++```
++
++---
++
++## 3. Prohibited Actions Confirmed Not Executed
++
++- Did **NOT** merge into `main`.
++- Did **NOT** force-push or rewrite Git history.
++- Did **NOT** deploy to production or modify production Railway/Supabase infrastructure.
++- Did **NOT** mutate real external Supabase Auth user `fd9523dd-eb07-4cca-9040-62feea3f5353` or fabricate MFA challenge logs.
++- Did **NOT** enable live customer email delivery.
++- Did **NOT** commit `bun.lock` or any secrets.
+diff --git a/scripts/run-migrations.ts b/scripts/run-migrations.ts
+index be810be..cd7e27f 100644
+--- a/scripts/run-migrations.ts
++++ b/scripts/run-migrations.ts
+@@ -85,81 +85,88 @@ export async function runMigrationsOnClient(
+     return { dryRun: true, totalFiles: files.length, applied: [], skipped, pending };
+   }
+ 
+-  await client.query(`
+-    CREATE TABLE IF NOT EXISTS public.schema_migrations (
+-      version TEXT PRIMARY KEY,
+-      filename TEXT NOT NULL DEFAULT '',
+-      checksum_sha256 TEXT,
+-      applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+-    );
+-  `);
+-  await client.query(`
+-    ALTER TABLE public.schema_migrations
+-      ADD COLUMN IF NOT EXISTS filename TEXT NOT NULL DEFAULT '';
+-  `);
+-  await client.query(`
+-    ALTER TABLE public.schema_migrations
+-      ADD COLUMN IF NOT EXISTS checksum_sha256 TEXT;
+-  `);
+-
+-  const existingResult = await client.query<{ version: string; checksum_sha256: string | null }>(
+-    `SELECT version, checksum_sha256 FROM public.schema_migrations ORDER BY version ASC`,
++  const MIGRATION_ADVISORY_LOCK_KEY = '728491034218';
++  const lockResult = await client.query<{ acquired?: boolean }>(
++    `SELECT pg_try_advisory_lock(${MIGRATION_ADVISORY_LOCK_KEY}) AS acquired`,
+   );
+-  const appliedMap = new Map<string, string>();
+-  for (const row of existingResult.rows) {
+-    if (row.checksum_sha256) {
+-      appliedMap.set(row.version, row.checksum_sha256);
+-    }
++  if (lockResult.rows.length > 0 && lockResult.rows[0]?.acquired !== true) {
++    throw new Error(
++      'MIGRATION_LOCK_CONTENTION: Another migration runner currently holds the PostgreSQL advisory lock.',
++    );
+   }
+ 
+-  const applied: string[] = [];
+-  const skipped: string[] = [];
+-  const pending: string[] = [];
++  try {
++    await client.query(`
++      CREATE TABLE IF NOT EXISTS public.schema_migrations (
++        version TEXT PRIMARY KEY,
++        filename TEXT NOT NULL DEFAULT '',
++        checksum_sha256 TEXT,
++        applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
++      );
++    `);
++    await client.query(`
++      ALTER TABLE public.schema_migrations
++        ADD COLUMN IF NOT EXISTS filename TEXT NOT NULL DEFAULT '';
++    `);
++    await client.query(`
++      ALTER TABLE public.schema_migrations
++        ADD COLUMN IF NOT EXISTS checksum_sha256 TEXT;
++    `);
++
++    const existingResult = await client.query<{ version: string; checksum_sha256: string | null }>(
++      `SELECT version, checksum_sha256 FROM public.schema_migrations ORDER BY version ASC`,
++    );
++    const appliedMap = new Map<string, string | null>();
++    for (const row of existingResult.rows) {
++      appliedMap.set(row.version, row.checksum_sha256 ?? null);
++    }
++
++    const applied: string[] = [];
++    const skipped: string[] = [];
++    const pending: string[] = [];
+ 
+-  for (const file of files) {
+-    const existingChecksum = appliedMap.get(file.version);
+-    if (existingChecksum) {
+-      if (existingChecksum !== file.checksumSha256) {
+-        throw new Error(
+-          `MIGRATION_CHECKSUM_MISMATCH: Applied migration "${file.version}" has checksum ${existingChecksum.slice(0, 12)}... in schema_migrations, but workspace file has ${file.checksumSha256.slice(0, 12)}...`,
+-        );
++    for (const file of files) {
++      if (appliedMap.has(file.version)) {
++        const existingChecksum = appliedMap.get(file.version);
++        if (!existingChecksum || existingChecksum !== file.checksumSha256) {
++          throw new Error(
++            `MIGRATION_CHECKSUM_MISMATCH: Applied migration "${file.version}" has checksum ${(existingChecksum || 'NULL').slice(0, 12)}... in schema_migrations, but workspace file has ${file.checksumSha256.slice(0, 12)}...`,
++          );
++        }
++        skipped.push(file.filename);
++        continue;
+       }
+-      skipped.push(file.filename);
+-      continue;
+-    }
+ 
+-    if (dryRun) {
+-      pending.push(file.filename);
+-      continue;
++      await client.query('BEGIN');
++      try {
++        await client.query(file.sql);
++        await client.query(
++          `INSERT INTO public.schema_migrations (version, checksum_sha256, filename)
++           VALUES ($1, $2, $3)
++           ON CONFLICT (version) DO UPDATE
++             SET checksum_sha256 = EXCLUDED.checksum_sha256,
++                 filename = EXCLUDED.filename`,
++          [file.version, file.checksumSha256, file.filename],
++        );
++        await client.query('COMMIT');
++        applied.push(file.filename);
++      } catch (err) {
++        await client.query('ROLLBACK').catch(() => {});
++        const message = err instanceof Error ? err.message : String(err);
++        throw new Error(`MIGRATION_FAILED (${file.filename}): ${message}`);
++      }
+     }
+ 
+-    await client.query('BEGIN');
+-    try {
+-      await client.query(file.sql);
+-      await client.query(
+-        `INSERT INTO public.schema_migrations (version, checksum_sha256, filename)
+-         VALUES ($1, $2, $3)
+-         ON CONFLICT (version) DO UPDATE
+-           SET checksum_sha256 = EXCLUDED.checksum_sha256,
+-               filename = EXCLUDED.filename`,
+-        [file.version, file.checksumSha256, file.filename],
+-      );
+-      await client.query('COMMIT');
+-      applied.push(file.filename);
+-    } catch (err) {
+-      await client.query('ROLLBACK').catch(() => {});
+-      const message = err instanceof Error ? err.message : String(err);
+-      throw new Error(`MIGRATION_FAILED (${file.filename}): ${message}`);
+-    }
++    return {
++      dryRun,
++      totalFiles: files.length,
++      applied,
++      skipped,
++      pending,
++    };
++  } finally {
++    await client.query(`SELECT pg_advisory_unlock(${MIGRATION_ADVISORY_LOCK_KEY})`).catch(() => {});
+   }
+-
+-  return {
+-    dryRun,
+-    totalFiles: files.length,
+-    applied,
+-    skipped,
+-    pending,
+-  };
+ }
+ 
+ async function main() {
+diff --git a/scripts/verify-staging-deployment.mjs b/scripts/verify-staging-deployment.mjs
+index 9bd0a72..38ba1c0 100644
+--- a/scripts/verify-staging-deployment.mjs
++++ b/scripts/verify-staging-deployment.mjs
+@@ -1,39 +1,467 @@
+ #!/usr/bin/env node
+ /**
+- * Post-deploy verification gate. GitHub CI success alone is insufficient.
+- * Set STAGING_URL, EXPECTED_COMMIT_SHA and DEPLOYED_COMMIT_SHA from independent
+- * Railway deployment metadata. Never trust a user-supplied claimed SHA as proof.
+- * Exit nonzero on missing evidence, mismatched SHA, or unhealthy endpoints.
++ * Phase 34 & 39 Post-Deploy Verification Gate.
++ *
++ * GitHub CI success alone is NEVER sufficient proof of a healthy Railway deployment.
++ * Enforces:
++ *   GITHUB_APPROVED_SHA === RAILWAY_DEPLOYED_SHA === STAGING_TESTED_SHA
++ *
++ * Supports independent Railway GraphQL deployment metadata lookup when
++ * RAILWAY_API_TOKEN (or RAILWAY_TOKEN) + RAILWAY_SERVICE_ID + RAILWAY_ENVIRONMENT_ID
++ * are provided, and fails closed on missing evidence, SHA mismatch, non-HTTPS URLs,
++ * unready database/migrations, unsafe live email enablement in staging, or broken
++ * unauthenticated access guards.
+  */
+-const required = ['STAGING_URL','EXPECTED_COMMIT_SHA','DEPLOYED_COMMIT_SHA'];
+-const missing = required.filter(k => !process.env[k]);
+-if (missing.length) {
+-  console.error('BLOCKED: missing independent deployment evidence: '+missing.join(', '));
+-  process.exit(2);
++
++import fs from 'node:fs/promises';
++import path from 'node:path';
++import { pathToFileURL } from 'node:url';
++
++const SHA40_RE = /^[a-f0-9]{40}$/;
++const RAILWAY_GRAPHQL_ENDPOINT = 'https://backboard.railway.app/graphql/v2';
++
++export function isValidSha40(value) {
++  return typeof value === 'string' && SHA40_RE.test(value.trim().toLowerCase());
+ }
+-const expected = process.env.EXPECTED_COMMIT_SHA.toLowerCase();
+-const deployed = process.env.DEPLOYED_COMMIT_SHA.toLowerCase();
+-if (!/^[a-f0-9]{40}$/.test(expected) || !/^[a-f0-9]{40}$/.test(deployed) || expected !== deployed) {
+-  console.error('FAILED: GitHub commit SHA does not match deployed Railway SHA.');
+-  process.exit(1);
++
++/**
++ * Independently retrieves the latest successful deployment metadata from Railway GraphQL API.
++ * Never logs or echoes token values.
++ */
++export async function fetchRailwayDeployedCommitSha(
++  { railwayToken = '', serviceId = '', environmentId = '', projectId = '' } = {},
++  fetchImpl = fetch,
++) {
++  if (!railwayToken || !serviceId || !environmentId) {
++    return {
++      ok: false,
++      blocked: true,
++      reason: 'Missing RAILWAY_API_TOKEN, RAILWAY_SERVICE_ID, or RAILWAY_ENVIRONMENT_ID for independent Railway lookup.',
++    };
++  }
++
++  const query = `
++    query LatestStagingDeployments($input: DeploymentListInput!) {
++      deployments(first: 5, input: $input) {
++        edges {
++          node {
++            id
++            status
++            createdAt
++            staticUrl
++            meta
++          }
++        }
++      }
++    }
++  `;
++
++  const input = {
++    serviceId,
++    environmentId,
++    ...(projectId ? { projectId } : {}),
++  };
++
++  const res = await fetchImpl(RAILWAY_GRAPHQL_ENDPOINT, {
++    method: 'POST',
++    headers: {
++      'Content-Type': 'application/json',
++      Authorization: `Bearer ${railwayToken}`,
++    },
++    body: JSON.stringify({ query, variables: { input } }),
++    signal: AbortSignal.timeout(12000),
++    redirect: 'error',
++  });
++
++  if (!res.ok) {
++    return {
++      ok: false,
++      blocked: false,
++      reason: `Railway GraphQL API returned HTTP ${res.status}`,
++    };
++  }
++
++  const payload = await res.json();
++  if (Array.isArray(payload?.errors) && payload.errors.length > 0) {
++    return {
++      ok: false,
++      blocked: false,
++      reason: `Railway GraphQL error: ${payload.errors[0]?.message || 'Unknown error'}`,
++    };
++  }
++
++  const edges = payload?.data?.deployments?.edges || [];
++  const activeSuccess = edges
++    .map((e) => e?.node)
++    .find((node) => node && node.status === 'SUCCESS');
++
++  if (!activeSuccess) {
++    return {
++      ok: false,
++      blocked: false,
++      reason: 'No active SUCCESS deployment found for the specified Railway service and environment.',
++    };
++  }
++
++  const meta = activeSuccess.meta && typeof activeSuccess.meta === 'object' ? activeSuccess.meta : {};
++  const commitHash =
++    typeof meta.commitHash === 'string'
++      ? meta.commitHash.trim().toLowerCase()
++      : typeof meta.commitSha === 'string'
++        ? meta.commitSha.trim().toLowerCase()
++        : '';
++
++  if (!isValidSha40(commitHash)) {
++    return {
++      ok: false,
++      blocked: false,
++      reason: 'Railway deployment metadata did not contain a valid 40-character commitHash.',
++    };
++  }
++
++  return {
++    ok: true,
++    blocked: false,
++    deployedSha: commitHash,
++    deploymentId: activeSuccess.id,
++    deploymentStatus: activeSuccess.status,
++    deployedAt: activeSuccess.createdAt || null,
++    evidenceUrl: projectId
++      ? `https://railway.app/project/${projectId}/service/${serviceId}?id=${activeSuccess.id}`
++      : null,
++  };
+ }
+-const origin = new URL(process.env.STAGING_URL);
+-if (origin.protocol !== 'https:') {
+-  console.error('FAILED: staging URL must use HTTPS');
+-  process.exit(1);
++
++/**
++ * Runs the full fail-closed staging deployment verification gate and returns a
++ * machine-readable certification payload + deterministic process exit code:
++ *   0 = PASS
++ *   1 = FAILED
++ *   2 = BLOCKED (missing independent evidence)
++ */
++export async function verifyStagingDeployment(env = process.env, fetchImpl = fetch) {
++  const executedAt = new Date().toISOString();
++  const checks = [];
++
++  const stagingUrlRaw = env.STAGING_URL?.trim() || '';
++  const githubApprovedSha = (env.GITHUB_APPROVED_SHA || env.EXPECTED_COMMIT_SHA || '')
++    .trim()
++    .toLowerCase();
++  const railwayToken = (env.RAILWAY_API_TOKEN || env.RAILWAY_TOKEN || '').trim();
++  const railwayServiceId = (env.RAILWAY_SERVICE_ID || '').trim();
++  const railwayEnvironmentId = (env.RAILWAY_ENVIRONMENT_ID || '').trim();
++  const railwayProjectId = (env.RAILWAY_PROJECT_ID || '').trim();
++
++  let railwayDeployedSha = (env.RAILWAY_DEPLOYED_SHA || env.DEPLOYED_COMMIT_SHA || '')
++    .trim()
++    .toLowerCase();
++  let shaEvidenceSource = railwayDeployedSha ? 'independent_env_metadata' : 'none';
++  let railwayDeploymentId = null;
++  let railwayEvidenceUrl = null;
++
++  if (railwayToken && railwayServiceId && railwayEnvironmentId) {
++    const railwayLookup = await fetchRailwayDeployedCommitSha(
++      {
++        railwayToken,
++        serviceId: railwayServiceId,
++        environmentId: railwayEnvironmentId,
++        projectId: railwayProjectId || undefined,
++      },
++      fetchImpl,
++    );
++    if (!railwayLookup.ok) {
++      checks.push({
++        id: 'railway_metadata_lookup',
++        passed: false,
++        detail: railwayLookup.reason,
++      });
++      return {
++        status: railwayLookup.blocked ? 'BLOCKED' : 'FAILED',
++        exitCode: railwayLookup.blocked ? 2 : 1,
++        executedAt,
++        stagingUrl: stagingUrlRaw || null,
++        githubApprovedSha: githubApprovedSha || null,
++        railwayDeployedSha: null,
++        stagingTestedSha: null,
++        shaEvidenceSource: 'railway_graphql_api',
++        railwayDeploymentId: null,
++        railwayEvidenceUrl: null,
++        checks,
++      };
++    }
++    railwayDeployedSha = railwayLookup.deployedSha;
++    shaEvidenceSource = 'railway_graphql_api';
++    railwayDeploymentId = railwayLookup.deploymentId;
++    railwayEvidenceUrl = railwayLookup.evidenceUrl;
++    checks.push({
++      id: 'railway_metadata_lookup',
++      passed: true,
++      detail: `Retrieved SUCCESS deployment ${railwayDeploymentId} (${railwayDeployedSha}) directly from Railway GraphQL API`,
++    });
++  }
++
++  const missing = [];
++  if (!stagingUrlRaw) missing.push('STAGING_URL');
++  if (!githubApprovedSha) missing.push('EXPECTED_COMMIT_SHA/GITHUB_APPROVED_SHA');
++  if (!railwayDeployedSha) missing.push('DEPLOYED_COMMIT_SHA (or RAILWAY_API_TOKEN + RAILWAY_SERVICE_ID + RAILWAY_ENVIRONMENT_ID)');
++
++  if (missing.length > 0) {
++    checks.push({
++      id: 'independent_evidence_present',
++      passed: false,
++      detail: `Missing independent deployment evidence: ${missing.join(', ')}`,
++    });
++    return {
++      status: 'BLOCKED',
++      exitCode: 2,
++      executedAt,
++      stagingUrl: stagingUrlRaw || null,
++      githubApprovedSha: githubApprovedSha || null,
++      railwayDeployedSha: railwayDeployedSha || null,
++      stagingTestedSha: null,
++      shaEvidenceSource,
++      railwayDeploymentId,
++      railwayEvidenceUrl,
++      checks,
++    };
++  }
++
++  const stagingTestedSha = (env.STAGING_TESTED_SHA || railwayDeployedSha).trim().toLowerCase();
++
++  // 1. Strict three-way SHA synchronization invariant
++  const shaSynced =
++    isValidSha40(githubApprovedSha) &&
++    isValidSha40(railwayDeployedSha) &&
++    isValidSha40(stagingTestedSha) &&
++    githubApprovedSha === railwayDeployedSha &&
++    railwayDeployedSha === stagingTestedSha;
++
++  checks.push({
++    id: 'three_way_commit_sha_sync',
++    passed: shaSynced,
++    detail: shaSynced
++      ? `GITHUB_APPROVED_SHA === RAILWAY_DEPLOYED_SHA === STAGING_TESTED_SHA (${githubApprovedSha})`
++      : `Commit SHA mismatch or invalid SHA (github=${githubApprovedSha}, railway=${railwayDeployedSha}, tested=${stagingTestedSha})`,
++  });
++
++  if (!shaSynced) {
++    return {
++      status: 'FAILED',
++      exitCode: 1,
++      executedAt,
++      stagingUrl: stagingUrlRaw,
++      githubApprovedSha,
++      railwayDeployedSha,
++      stagingTestedSha,
++      shaEvidenceSource,
++      railwayDeploymentId,
++      railwayEvidenceUrl,
++      checks,
++    };
++  }
++
++  // 2. Strict HTTPS & same-origin path safety
++  let origin;
++  try {
++    origin = new URL(stagingUrlRaw);
++  } catch {
++    checks.push({ id: 'https_origin', passed: false, detail: 'Invalid STAGING_URL format' });
++    return {
++      status: 'FAILED',
++      exitCode: 1,
++      executedAt,
++      stagingUrl: stagingUrlRaw,
++      githubApprovedSha,
++      railwayDeployedSha,
++      stagingTestedSha,
++      shaEvidenceSource,
++      railwayDeploymentId,
++      railwayEvidenceUrl,
++      checks,
++    };
++  }
++
++  if (origin.protocol !== 'https:') {
++    checks.push({ id: 'https_origin', passed: false, detail: 'STAGING_URL must use HTTPS' });
++    return {
++      status: 'FAILED',
++      exitCode: 1,
++      executedAt,
++      stagingUrl: stagingUrlRaw,
++      githubApprovedSha,
++      railwayDeployedSha,
++      stagingTestedSha,
++      shaEvidenceSource,
++      railwayDeploymentId,
++      railwayEvidenceUrl,
++      checks,
++    };
++  }
++
++  const healthPath = env.STAGING_HEALTH_PATH || '/health';
++  const readyPath = env.STAGING_READY_PATH || '/ready';
++  const healthUrl = new URL(healthPath, origin);
++  const readyUrl = new URL(readyPath, origin);
++  if (healthUrl.origin !== origin.origin || readyUrl.origin !== origin.origin) {
++    checks.push({
++      id: 'https_origin',
++      passed: false,
++      detail: 'Health and readiness paths must remain strictly on the staging origin',
++    });
++    return {
++      status: 'FAILED',
++      exitCode: 1,
++      executedAt,
++      stagingUrl: stagingUrlRaw,
++      githubApprovedSha,
++      railwayDeployedSha,
++      stagingTestedSha,
++      shaEvidenceSource,
++      railwayDeploymentId,
++      railwayEvidenceUrl,
++      checks,
++    };
++  }
++  checks.push({ id: 'https_origin', passed: true, detail: `Verified HTTPS origin ${origin.origin}` });
++
++  const requestOpts = { signal: AbortSignal.timeout(12000), redirect: 'error' };
++
++  // 3. Live HTTPS /health check
++  try {
++    const healthRes = await fetchImpl(healthUrl, requestOpts);
++    const healthBody = await healthRes.json().catch(() => ({}));
++    const healthPassed = healthRes.ok && healthBody?.ok === true;
++    checks.push({
++      id: 'https_health',
++      passed: healthPassed,
++      detail: `GET ${healthPath} -> HTTP ${healthRes.status}, ok=${String(healthBody?.ok)}`,
++    });
++  } catch (err) {
++    checks.push({
++      id: 'https_health',
++      passed: false,
++      detail: `GET ${healthPath} error: ${err instanceof Error ? err.message : String(err)}`,
++    });
++  }
++
++  // 4. Live HTTPS /ready check (database, migrations, overlap constraint, auth, worker, safe paused email)
++  try {
++    const readyRes = await fetchImpl(readyUrl, requestOpts);
++    const readyBody = await readyRes.json().catch(() => ({}));
++    const dbReady =
++      readyRes.ok &&
++      readyBody?.ok === true &&
++      readyBody?.checks?.database === true &&
++      readyBody?.checks?.migrations === true &&
++      readyBody?.checks?.schemaObjects === true &&
++      readyBody?.checks?.auth === true &&
++      readyBody?.checks?.worker === true &&
++      readyBody?.persistence?.schema?.overlapConstraintPresent === true;
++
++    checks.push({
++      id: 'database_and_readiness',
++      passed: dbReady,
++      detail: `GET ${readyPath} -> HTTP ${readyRes.status}, db=${String(readyBody?.checks?.database)}, migrations=${String(readyBody?.persistence?.schema?.migrationsAppliedCount ?? 'n/a')}, overlapConstraint=${String(readyBody?.persistence?.schema?.overlapConstraintPresent)}`,
++    });
++
++    const requirePausedEmail = env.ALLOW_STAGING_LIVE_EMAIL !== 'true';
++    const emailSafe = !requirePausedEmail || readyBody?.email?.liveDeliveryEnabled === false;
++    checks.push({
++      id: 'staging_email_safety',
++      passed: emailSafe,
++      detail: `email.configured=${String(readyBody?.email?.configured)}, email.liveDeliveryEnabled=${String(readyBody?.email?.liveDeliveryEnabled)}`,
++    });
++  } catch (err) {
++    checks.push({
++      id: 'database_and_readiness',
++      passed: false,
++      detail: `GET ${readyPath} error: ${err instanceof Error ? err.message : String(err)}`,
++    });
++  }
++
++  // 5. Auth configuration & unauthenticated fail-closed security boundary checks
++  try {
++    const [cfgRes, bkgRes, admRes] = await Promise.all([
++      fetchImpl(new URL('/api/auth/config', origin), requestOpts),
++      fetchImpl(new URL('/api/bookings', origin), requestOpts),
++      fetchImpl(new URL('/api/admin/overview', origin), requestOpts),
++    ]);
++    const cfgBody = await cfgRes.json().catch(() => ({}));
++    const authGuardOk =
++      cfgRes.ok &&
++      cfgBody?.demoPersonasAvailable === false &&
++      cfgBody?.readyForProductionAuth === true &&
++      bkgRes.status === 401 &&
++      admRes.status === 403;
++
++    checks.push({
++      id: 'auth_fail_closed_security',
++      passed: authGuardOk,
++      detail: `/api/auth/config=${cfgRes.status} (demoPersonas=${String(cfgBody?.demoPersonasAvailable)}, ready=${String(cfgBody?.readyForProductionAuth)}), unauth /api/bookings=${bkgRes.status}, unauth /api/admin/overview=${admRes.status}`,
++    });
++  } catch (err) {
++    checks.push({
++      id: 'auth_fail_closed_security',
++      passed: false,
++      detail: `Auth boundary check error: ${err instanceof Error ? err.message : String(err)}`,
++    });
++  }
++
++  // 6. Optional authenticated admin AAL2 check when secret token is supplied in CI
++  if (env.STAGING_ADMIN_AAL2_TOKEN) {
++    try {
++      const adminRes = await fetchImpl(new URL('/api/admin/overview', origin), {
++        ...requestOpts,
++        headers: { Authorization: `Bearer ${env.STAGING_ADMIN_AAL2_TOKEN.trim()}` },
++      });
++      checks.push({
++        id: 'authenticated_admin_aal2',
++        passed: adminRes.status === 200,
++        detail: `Authenticated AAL2 GET /api/admin/overview -> HTTP ${adminRes.status}`,
++      });
++    } catch (err) {
++      checks.push({
++        id: 'authenticated_admin_aal2',
++        passed: false,
++        detail: `Authenticated AAL2 check error: ${err instanceof Error ? err.message : String(err)}`,
++      });
++    }
++  }
++
++  const allPassed = checks.every((c) => c.passed);
++  return {
++    status: allPassed ? 'PASS' : 'FAILED',
++    exitCode: allPassed ? 0 : 1,
++    executedAt,
++    stagingUrl: origin.origin,
++    githubApprovedSha,
++    railwayDeployedSha,
++    stagingTestedSha,
++    shaEvidenceSource,
++    railwayDeploymentId,
++    railwayEvidenceUrl,
++    checks,
++  };
+ }
+-const healthPath = process.env.STAGING_HEALTH_PATH || '/api/health';
+-const healthUrl = new URL(healthPath, origin);
+-if (healthUrl.origin !== origin.origin) {
+-  console.error('FAILED: health path must remain on staging origin');
+-  process.exit(1);
++
++function parseOutputPath(argv) {
++  const idx = argv.indexOf('--output');
++  if (idx >= 0 && argv[idx + 1]) return argv[idx + 1];
++  return process.env.CERTIFICATION_OUTPUT_PATH || null;
+ }
+-try {
+-  const res = await fetch(healthUrl, {signal:AbortSignal.timeout(12000), redirect:'error'});
+-  if (!res.ok) throw new Error('health endpoint returned HTTP '+res.status);
+-  console.log('PASS: Railway SHA matches GitHub; HTTPS health endpoint returned '+res.status);
+-  console.log('NOTE: auth, MFA, database and isolation tests require separate live certification.');
+-} catch (error) {
+-  console.error('FAILED: staging health verification: '+error.message);
+-  process.exit(1);
++
++if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
++  const outputPath = parseOutputPath(process.argv.slice(2));
++  const result = await verifyStagingDeployment(process.env);
++  const json = JSON.stringify(result, null, 2);
++  if (outputPath) {
++    await fs.mkdir(path.dirname(path.resolve(outputPath)), { recursive: true });
++    await fs.writeFile(path.resolve(outputPath), json + '\n', 'utf8');
++  }
++  if (result.exitCode === 0) {
++    console.log(json);
++  } else {
++    console.error(json);
++  }
++  process.exit(result.exitCode);
+ }
+diff --git a/server/app.ts b/server/app.ts
+index 6f000c4..e6c2482 100644
+--- a/server/app.ts
++++ b/server/app.ts
+@@ -409,23 +409,28 @@ export function createApp(options: CreateAppOptions = {}) {
+       options.providerVerifyOptions,
+       db.revokedSessionIds,
+     );
+-    // Central fail-closed privilege boundary: ALL route handlers receive a
++    // Central fail-closed privilege boundary: ALL protected route handlers receive a
+     // non-admin context unless the current request carries genuine external
+     // Supabase AAL2 for the pinned immutable staging administrator UUID.
+-    // AAL1 is allowed only on the MFA enrollment/challenge endpoints.
++    // AAL1 is permitted ONLY on read-only session inspection (/api/auth/session) and
++    // logout (/api/auth/logout) so the client can render the MFA gate and sign out safely.
+     if (stagingExternalAuthEnabled(process.env) && ctx.session.role === 'admin') {
+-      const mfaPath = req.path === '/api/auth/mfa/totp/enroll' ||
+-        req.path === '/api/auth/mfa/verify' ||
+-        req.path === '/api/auth/mfa/recover';
+-      const validExternal = ctx.authMethod === 'supabase_jwt' &&
++      const aal1AllowedPath =
++        (req.method === 'GET' && req.path === '/api/auth/session') ||
++        (req.method === 'POST' && req.path === '/api/auth/logout');
++      const validExternal =
++        ctx.authMethod === 'supabase_jwt' &&
+         ctx.session.supabaseUserId === STAGING_ADMIN_SUBJECT;
+-      if (!validExternal || (!mfaPath && ctx.aal !== 'aal2')) {
+-        return { db, ctx: {
+-          ...ctx,
+-          session: { ...ctx.session, role: 'guest' as const },
+-          mfaVerified: false,
+-          spoofAttemptDetected: true,
+-        } };
++      if (!validExternal || (!aal1AllowedPath && ctx.aal !== 'aal2')) {
++        return {
++          db,
++          ctx: {
++            ...ctx,
++            session: { ...ctx.session, role: 'guest' as const },
++            mfaVerified: false,
++            spoofAttemptDetected: true,
++          },
++        };
+       }
+     }
+     return { db, ctx };
+@@ -616,6 +621,7 @@ export function createApp(options: CreateAppOptions = {}) {
+         'Blocked email-only privilege inheritance; immutable supabaseUserId binding required',
+       );
+     }
++    const externalStaging = stagingExternalAuthEnabled(process.env);
+     res.json({
+       user: sanitizeUserForClient(ctx.session),
+       mfaVerified: ctx.mfaVerified,
+@@ -625,7 +631,8 @@ export function createApp(options: CreateAppOptions = {}) {
+       accountStatus: ctx.accountStatus,
+       aal: ctx.aal,
+       authMethod: ctx.authMethod,
+-      csrfToken: ctx.sessionJti ? deriveCsrfToken(ctx.sessionJti) : undefined,
++      externalStagingAuth: externalStaging,
++      csrfToken: !externalStaging && ctx.sessionJti ? deriveCsrfToken(ctx.sessionJti) : undefined,
+     });
+   });
+ 
+@@ -690,10 +697,18 @@ export function createApp(options: CreateAppOptions = {}) {
+         });
+       }
+ 
+-      const claims = await verifyProviderAccessToken(accessToken,
++      const claims = await verifyProviderAccessToken(
++        accessToken,
+         stagingExternalAuthEnabled(process.env)
+-          ? { supabaseUrl: 'https://nswxwwmtcasmkjtmrdqg.supabase.co' }
+-          : options.providerVerifyOptions);
++          ? {
++              supabaseUrl: 'https://nswxwwmtcasmkjtmrdqg.supabase.co',
++              useJwksOnly: true,
++              ...(options.providerVerifyOptions?.keyResolver
++                ? { keyResolver: options.providerVerifyOptions.keyResolver }
++                : {}),
++            }
++          : options.providerVerifyOptions,
++      );
+       if (!claims) {
+         await withTransaction((db) => {
+           appendSecurityEvent(db, {
+@@ -838,6 +853,12 @@ export function createApp(options: CreateAppOptions = {}) {
+     '/api/auth/password-reset',
+     rateLimit(5, 60_000, { failClosed: true, endpointGroup: 'auth_recovery' }),
+     async (req: Request, res: Response) => {
++      if (stagingExternalAuthEnabled(process.env)) {
++        return res.status(409).json({
++          code: 'EXTERNAL_AUTH_READ_ONLY',
++          error: 'Password reset is disabled in isolated staging external-Auth mode to protect external identity accounts.',
++        });
++      }
+       const parsed = z
+         .object({
+           email: z.string().trim().email('Valid email address is required').max(180),
+@@ -1087,6 +1108,12 @@ export function createApp(options: CreateAppOptions = {}) {
+     '/api/auth/mfa/recover',
+     rateLimit(5, 60_000, { failClosed: true, endpointGroup: 'mfa_recovery' }),
+     async (req: Request, res: Response) => {
++      if (stagingExternalAuthEnabled(process.env)) {
++        return res.status(409).json({
++          code: 'SUPABASE_MFA_REQUIRED',
++          error: 'Application-local MFA recovery codes are disabled in external Supabase Auth mode; complete genuine Supabase AAL2 verification.',
++        });
++      }
+       const { ctx } = await getAuth(req);
+       if (!requireActiveAccount(ctx, res)) return;
+       if (ctx.session.role !== 'admin') {
+@@ -1163,6 +1190,12 @@ export function createApp(options: CreateAppOptions = {}) {
+     '/api/auth/mfa/totp/revoke',
+     rateLimit(5, 60_000, { failClosed: true, endpointGroup: 'mfa' }),
+     async (req: Request, res: Response) => {
++      if (stagingExternalAuthEnabled(process.env)) {
++        return res.status(409).json({
++          code: 'SUPABASE_MFA_REQUIRED',
++          error: 'Application-local MFA revocation is disabled in external Supabase Auth mode to protect external Auth factors.',
++        });
++      }
+       const { ctx } = await getAuth(req);
+       if (!requireAdminMfa(ctx, res)) return;
+ 
+@@ -3921,7 +3954,16 @@ export function createApp(options: CreateAppOptions = {}) {
+     const isStaffOrAdmin = ['event_planner', 'staff', 'admin'].includes(ctx.session.role);
+     let list = db.consultations.filter((c) => {
+       if (isStaffOrAdmin) return true;
+-      return c.clientId === ctx.session.id || c.clientEmail.toLowerCase() === ctx.session.email.toLowerCase();
++      if (c.clientId && c.clientId === ctx.session.id) return true;
++      // Never match another authenticated user's bound clientId by email alone;
++      // allow email fallback strictly for unbound public lead records when caller email is verified.
++      const isUnboundLead = !c.clientId || c.clientId.startsWith('lead:');
++      return (
++        isUnboundLead &&
++        ctx.emailVerified &&
++        Boolean(ctx.session.email) &&
++        c.clientEmail.toLowerCase() === ctx.session.email.toLowerCase()
++      );
+     });
+ 
+     const statusFilter = typeof req.query.status === 'string' ? req.query.status.trim() : '';
+diff --git a/server/auth.ts b/server/auth.ts
+index e8d7ed9..35521ce 100644
+--- a/server/auth.ts
++++ b/server/auth.ts
+@@ -327,7 +327,11 @@ export async function resolveAuthenticatedContextAsync(
+       // fall back to another issuer, local token, email, or mutable role metadata.
+       const externalStaging = stagingExternalAuthEnabled(process.env);
+       const verificationOptions = externalStaging
+-        ? { supabaseUrl: `https://${STAGING_AUTH_PROJECT_REF}.supabase.co` }
++        ? {
++            supabaseUrl: `https://${STAGING_AUTH_PROJECT_REF}.supabase.co`,
++            useJwksOnly: true,
++            ...(providerVerifyOptions?.keyResolver ? { keyResolver: providerVerifyOptions.keyResolver } : {}),
++          }
+         : providerVerifyOptions;
+       const claims = await verifyProviderAccessToken(rawToken, verificationOptions);
+       if (!claims) {
+diff --git a/server/identityProvider.ts b/server/identityProvider.ts
+index 97bd6be..6732308 100644
+--- a/server/identityProvider.ts
++++ b/server/identityProvider.ts
+@@ -1,14 +1,19 @@
+ import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+-import { createRemoteJWKSet, jwtVerify, type JWTPayload } from 'jose';
++import { createRemoteJWKSet, decodeProtectedHeader, jwtVerify, type JWTPayload } from 'jose';
+ import { stagingExternalAuthEnabled, STAGING_AUTH_PROJECT_REF } from './stagingExternalAuthPolicy.ts';
+ import type { AccountStatus, UserRole, UserSession } from '../src/types/domain.ts';
+ 
++const ASYMMETRIC_JWT_ALGS = ['ES256', 'RS256', 'EdDSA'] as const;
++const SYMMETRIC_JWT_ALGS = ['HS256'] as const;
++const ALLOWED_JWT_ALGS = new Set<string>([...ASYMMETRIC_JWT_ALGS, ...SYMMETRIC_JWT_ALGS]);
++
+ export interface IdentityProviderStatus {
+   provider: 'supabase' | 'staging-session';
+   supabaseConfigured: boolean;
+   adminClientConfigured: boolean;
+   jwtVerificationConfigured: boolean;
+   readyForProductionAuth: boolean;
++  externalStagingAuthActive?: boolean;
+   mfaPolicy: 'totp_required_for_admin';
+   reason: string;
+ }
+@@ -28,6 +33,7 @@ export interface VerifyProviderTokenOptions {
+   supabaseUrl?: string;
+   jwtSecret?: string;
+   keyResolver?: TokenKeyResolver;
++  useJwksOnly?: boolean;
+ }
+ 
+ const jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
+@@ -47,10 +53,11 @@ export function getIdentityProviderStatus(): IdentityProviderStatus {
+   const anonKey = (process.env.SUPABASE_ANON_KEY || '').trim();
+   const serviceKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+   const jwtSecret = (process.env.SUPABASE_JWT_SECRET || '').trim();
++  const externalStagingAuthActive = stagingExternalAuthEnabled(process.env);
+ 
+   const supabaseConfigured = Boolean(url && anonKey);
+   const adminClientConfigured = Boolean(url && serviceKey);
+-  const jwtVerificationConfigured = Boolean(url || jwtSecret);
++  const jwtVerificationConfigured = Boolean(url || jwtSecret || externalStagingAuthActive);
+   const readyForProductionAuth = supabaseConfigured && (adminClientConfigured || Boolean(jwtSecret));
+ 
+   if (readyForProductionAuth) {
+@@ -60,6 +67,7 @@ export function getIdentityProviderStatus(): IdentityProviderStatus {
+       adminClientConfigured,
+       jwtVerificationConfigured,
+       readyForProductionAuth: true,
++      externalStagingAuthActive,
+       mfaPolicy: 'totp_required_for_admin',
+       reason: 'Supabase Auth environment configuration detected.',
+     };
+@@ -71,6 +79,7 @@ export function getIdentityProviderStatus(): IdentityProviderStatus {
+     adminClientConfigured,
+     jwtVerificationConfigured,
+     readyForProductionAuth: false,
++    externalStagingAuthActive,
+     mfaPolicy: 'totp_required_for_admin',
+     reason: isProd
+       ? 'Production customer authentication is blocked until SUPABASE_URL, SUPABASE_ANON_KEY, and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_JWT_SECRET) are configured.'
+@@ -97,21 +106,43 @@ export function createSupabaseAdminClient(): SupabaseClient | null {
+ }
+ 
+ /**
+- * Cryptographically verifies a Supabase Auth access JWT (signature, issuer, audience, expiry).
+- * Never trusts client-editable user_metadata role claims.
++ * Cryptographically verifies a Supabase Auth access JWT (signature, issuer, audience, expiry, algorithm).
++ * Routes asymmetric tokens (ES256/RS256/EdDSA) directly to issuer-specific JWKS even when SUPABASE_JWT_SECRET
++ * is set for another project, and never trusts client-editable user_metadata role claims.
+  */
+ export async function verifyProviderAccessToken(
+   token: string,
+   options: VerifyProviderTokenOptions = {},
+ ): Promise<VerifiedProviderClaims | null> {
+-  const rawUrl = (options.supabaseUrl ?? process.env.SUPABASE_URL ?? '').trim().replace(/\/+$/, '');
+-  const rawSecret = (options.jwtSecret ?? process.env.SUPABASE_JWT_SECRET ?? '').trim();
++  const envUrl = (process.env.SUPABASE_URL ?? '').trim().replace(/\/+$/, '');
++  const rawUrl = (options.supabaseUrl ?? envUrl).trim().replace(/\/+$/, '');
++  const explicitOverrideToDifferentProject = Boolean(options.supabaseUrl && envUrl && rawUrl !== envUrl);
++  const rawSecret = options.useJwksOnly
++    ? ''
++    : (options.jwtSecret ?? (explicitOverrideToDifferentProject ? '' : process.env.SUPABASE_JWT_SECRET ?? '')).trim();
+ 
+   if (!options.keyResolver && !rawUrl && !rawSecret) {
+     return null;
+   }
+ 
+-  const verifyOptions = {
++  let tokenAlg = '';
++  try {
++    const header = decodeProtectedHeader(token);
++    tokenAlg = typeof header.alg === 'string' ? header.alg : '';
++  } catch {
++    return null;
++  }
++
++  if (!tokenAlg || !ALLOWED_JWT_ALGS.has(tokenAlg)) {
++    return null;
++  }
++
++  const isAsymmetricAlg = (ASYMMETRIC_JWT_ALGS as readonly string[]).includes(tokenAlg);
++  if (options.useJwksOnly && !isAsymmetricAlg) {
++    return null;
++  }
++
++  const baseVerifyOptions = {
+     audience: 'authenticated',
+     ...(rawUrl ? { issuer: `${rawUrl}/auth/v1` } : {}),
+   };
+@@ -120,15 +151,27 @@ export async function verifyProviderAccessToken(
+     let payload: JWTPayload;
+ 
+     if (options.keyResolver) {
+-      const verified = await jwtVerify(token, options.keyResolver, verifyOptions);
++      if (!isAsymmetricAlg) return null;
++      const verified = await jwtVerify(token, options.keyResolver, {
++        ...baseVerifyOptions,
++        algorithms: [...ASYMMETRIC_JWT_ALGS],
++      });
+       payload = verified.payload;
+-    } else if (rawSecret) {
+-      const secretKey = new TextEncoder().encode(rawSecret);
+-      const verified = await jwtVerify(token, secretKey, verifyOptions);
++    } else if (isAsymmetricAlg) {
++      if (!rawUrl) return null;
++      const jwks = getRemoteJwks(rawUrl);
++      const verified = await jwtVerify(token, jwks, {
++        ...baseVerifyOptions,
++        algorithms: [...ASYMMETRIC_JWT_ALGS],
++      });
+       payload = verified.payload;
+     } else {
+-      const jwks = getRemoteJwks(rawUrl);
+-      const verified = await jwtVerify(token, jwks, verifyOptions);
++      if (!rawSecret) return null;
++      const secretKey = new TextEncoder().encode(rawSecret);
++      const verified = await jwtVerify(token, secretKey, {
++        ...baseVerifyOptions,
++        algorithms: [...SYMMETRIC_JWT_ALGS],
++      });
+       payload = verified.payload;
+     }
+ 
+diff --git a/src/App.tsx b/src/App.tsx
+index a6b02bc..718159b 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -14,7 +14,15 @@ import { PublicHomeView } from './components/PublicHomeView';
+ import { ServiceDivisionCatalog } from './components/ServiceDivisionCatalog';
+ import { apiFetch, isBackendConfigured, setApiAccessToken, setApiCsrfToken } from './lib/apiClient';
+ import type { UserSession } from './types/domain';
+-import { getExternalStagingMfaClient, enrollExternalStagingTotp, verifyExternalStagingTotp, getPendingExternalTotpFactorId } from './lib/externalStagingMfa';
++import {
++  clearPendingExternalTotpFactor,
++  enrollExternalStagingTotp,
++  getExternalStagingMfaClient,
++  getPendingExternalTotpFactorId,
++  resolveExternalTotpFactorId,
++  signOutExternalStagingSession,
++  verifyExternalStagingTotp,
++} from './lib/externalStagingMfa';
+ 
+ const DEFAULT_GUEST: UserSession = {
+   id: 'guest-public',
+@@ -26,6 +34,8 @@ const DEFAULT_GUEST: UserSession = {
+ export interface TotpEnrollmentResult {
+   ok: boolean;
+   error?: string;
++  factorId?: string;
++  qrCode?: string;
+   secret?: string;
+   otpauthUri?: string;
+   recoveryCodes?: string[];
+@@ -35,10 +45,14 @@ export default function App() {
+   const [activeRoute, setActiveRoute] = useState<AppRoute>('home');
+   const [selectedServiceId, setSelectedServiceId] = useState<string | null>(null);
+ 
++  const externalStagingMode = Boolean(getExternalStagingMfaClient());
+   const [personas, setPersonas] = useState<UserSession[]>([]);
+   const [currentUser, setCurrentUser] = useState<UserSession>(DEFAULT_GUEST);
+   const [mfaRequired, setMfaRequired] = useState(false);
+   const [mfaEnrolled, setMfaEnrolled] = useState(false);
++  const [hasPendingExternalFactor, setHasPendingExternalFactor] = useState(
++    () => Boolean(getPendingExternalTotpFactorId()),
++  );
+   const [authProviderReady, setAuthProviderReady] = useState(false);
+ 
+   const [bookingModalOpen, setBookingModalOpen] = useState(false);
+@@ -54,29 +68,59 @@ export default function App() {
+     if (!isBackendConfigured) {
+       return;
+     }
++
++    let mounted = true;
++    const externalClient = getExternalStagingMfaClient();
++
++    const syncBackendSession = async () => {
++      const sessionRes = await apiFetch('/api/auth/session', { credentials: 'include' });
++      if (!mounted) return;
++      if (sessionRes.ok) {
++        const sData = await sessionRes.json();
++        if (!mounted) return;
++        setApiCsrfToken(sData.csrfToken ?? null);
++        if (sData.user) {
++          setCurrentUser(sData.user);
++          setMfaRequired(Boolean(sData.mfaRequired));
++          setMfaEnrolled(Boolean(sData.mfaEnrolled || sData.user.mfaEnrolled));
++        } else {
++          setCurrentUser(DEFAULT_GUEST);
++          setMfaRequired(false);
++          setMfaEnrolled(false);
++        }
++      }
++    };
++
+     const initAuth = async () => {
+       try {
+-        const [configRes, sessionRes] = await Promise.all([
+-          apiFetch('/api/auth/config', { credentials: 'include' }),
+-          apiFetch('/api/auth/session', { credentials: 'include' }),
+-        ]);
+-        if (sessionRes.ok) {
+-          const sData = await sessionRes.json();
+-          setApiCsrfToken(sData.csrfToken ?? null);
+-          if (sData.user) {
+-            setCurrentUser(sData.user);
+-            setMfaRequired(Boolean(sData.mfaRequired));
+-            setMfaEnrolled(Boolean(sData.mfaEnrolled || sData.user.mfaEnrolled));
++        if (externalClient) {
++          const { data: extData } = await externalClient.auth.getSession();
++          if (extData?.session?.access_token) {
++            setApiAccessToken(extData.session.access_token);
++            setHasPendingExternalFactor(
++              Boolean(getPendingExternalTotpFactorId(extData.session.user?.id)),
++            );
++          } else {
++            setApiAccessToken(null);
++            clearPendingExternalTotpFactor();
++            setHasPendingExternalFactor(false);
+           }
+         }
+-        if (configRes.ok) {
++
++        const [configRes] = await Promise.all([
++          apiFetch('/api/auth/config', { credentials: 'include' }),
++          syncBackendSession(),
++        ]);
++
++        if (mounted && configRes.ok) {
+           const cfg = await configRes.json();
++          if (!mounted) return;
+           setAuthProviderReady(Boolean(cfg.readyForProductionAuth));
+           if (cfg.demoPersonasAvailable === true) {
+             const personasRes = await apiFetch('/api/auth/personas', { credentials: 'include' });
+-            if (personasRes.ok) {
++            if (mounted && personasRes.ok) {
+               const pData = await personasRes.json();
+-              setPersonas(pData.personas || []);
++              if (mounted) setPersonas(pData.personas || []);
+             }
+           }
+         }
+@@ -84,7 +128,36 @@ export default function App() {
+         // Keep guest fallback if offline
+       }
+     };
+-    initAuth();
++
++    void initAuth();
++
++    let unsubscribe: (() => void) | undefined;
++    if (externalClient) {
++      const { data: listenerData } = externalClient.auth.onAuthStateChange((event, session) => {
++        if (!mounted) return;
++        if (event === 'SIGNED_OUT' || !session?.access_token) {
++          clearPendingExternalTotpFactor();
++          setHasPendingExternalFactor(false);
++          setApiAccessToken(null);
++          setApiCsrfToken(null);
++          setCurrentUser(DEFAULT_GUEST);
++          setMfaRequired(false);
++          setMfaEnrolled(false);
++          return;
++        }
++        setApiAccessToken(session.access_token);
++        setHasPendingExternalFactor(Boolean(getPendingExternalTotpFactorId(session.user?.id)));
++        if (event === 'TOKEN_REFRESHED' || event === 'USER_UPDATED') {
++          void syncBackendSession();
++        }
++      });
++      unsubscribe = () => listenerData.subscription.unsubscribe();
++    }
++
++    return () => {
++      mounted = false;
++      unsubscribe?.();
++    };
+   }, []);
+ 
+   const handleSwitchPersona = async (user: UserSession) => {
+@@ -107,6 +180,46 @@ export default function App() {
+     password: string,
+   ): Promise<{ ok: boolean; error?: string }> => {
+     try {
++      const externalClient = getExternalStagingMfaClient();
++      if (externalClient) {
++        const { data: externalLogin, error: externalError } =
++          await externalClient.auth.signInWithPassword({ email, password });
++        if (externalError || !externalLogin.session?.access_token) {
++          return {
++            ok: false,
++            error: externalError?.message || 'Sign-in failed. Verify your email and password.',
++          };
++        }
++
++        setApiAccessToken(externalLogin.session.access_token);
++        const sessionRes = await apiFetch('/api/auth/session', { credentials: 'include' });
++        const sData = await sessionRes.json().catch(() => ({}));
++        if (!sessionRes.ok || !sData.user || sData.user.role === 'guest') {
++          await signOutExternalStagingSession();
++          setHasPendingExternalFactor(false);
++          setApiAccessToken(null);
++          setApiCsrfToken(null);
++          setCurrentUser(DEFAULT_GUEST);
++          setMfaRequired(false);
++          setMfaEnrolled(false);
++          return {
++            ok: false,
++            error:
++              sData.error ||
++              'Authenticated account is not authorized for this staging portal session.',
++          };
++        }
++
++        setApiCsrfToken(sData.csrfToken ?? null);
++        setCurrentUser(sData.user);
++        setMfaRequired(Boolean(sData.mfaRequired));
++        setMfaEnrolled(Boolean(sData.mfaEnrolled || sData.user?.mfaEnrolled));
++        setHasPendingExternalFactor(
++          Boolean(getPendingExternalTotpFactorId(externalLogin.session.user?.id)),
++        );
++        return { ok: true };
++      }
++
+       const res = await apiFetch('/api/auth/login', {
+         method: 'POST',
+         headers: { 'Content-Type': 'application/json' },
+@@ -117,12 +230,7 @@ export default function App() {
+       if (!res.ok) {
+         return { ok: false, error: data.error || 'Sign-in failed. Verify your email and password.' };
+       }
+-      const externalClient = getExternalStagingMfaClient();
+-      if (externalClient) {
+-        const {data:externalLogin,error:externalError} = await externalClient.auth.signInWithPassword({email,password});
+-        if (externalError || !externalLogin.session) return {ok:false,error:'Unable to establish external Supabase session.'};
+-        setApiAccessToken(externalLogin.session.access_token);
+-      } else if (data.token) {
++      if (data.token) {
+         setApiAccessToken(data.token);
+       }
+       setApiCsrfToken(data.csrfToken ?? null);
+@@ -157,16 +265,33 @@ export default function App() {
+     const externalClient = getExternalStagingMfaClient();
+     if (externalClient) {
+       try {
+-        const {data:factors,error} = await externalClient.auth.mfa.listFactors();
+-        if (error) throw error;
+-        const factorId = getPendingExternalTotpFactorId() ?? factors.totp[0]?.id;
+-        if (!factorId) return {ok:false,error:'Enroll an authenticator before verifying MFA.'};
+-        const verified = await verifyExternalStagingTotp(factorId,code);
++        const factorId = await resolveExternalTotpFactorId();
++        if (!factorId) {
++          return { ok: false, error: 'Enroll an authenticator before verifying MFA.' };
++        }
++        const verified = await verifyExternalStagingTotp(factorId, code);
+         setApiAccessToken(verified.accessToken);
++        setHasPendingExternalFactor(false);
++
++        const sessionRes = await apiFetch('/api/auth/session', { credentials: 'include' });
++        const sData = await sessionRes.json().catch(() => ({}));
++        if (!sessionRes.ok || !sData.mfaVerified || sData.aal !== 'aal2' || !sData.user) {
++          return {
++            ok: false,
++            error:
++              sData.error ||
++              'Backend session did not confirm Supabase AAL2 verification. Please retry.',
++          };
++        }
++
++        setApiCsrfToken(sData.csrfToken ?? null);
++        setCurrentUser(sData.user);
+         setMfaRequired(false);
+         setMfaEnrolled(true);
+-        return {ok:true};
+-      } catch(e) {return {ok:false,error:e instanceof Error?e.message:'External MFA verification failed.'};}
++        return { ok: true };
++      } catch (e) {
++        return { ok: false, error: e instanceof Error ? e.message : 'External MFA verification failed.' };
++      }
+     }
+     const res = await apiFetch('/api/auth/mfa/verify', {
+       method: 'POST',
+@@ -184,14 +309,32 @@ export default function App() {
+     return { ok: true };
+   };
+ 
+-  const handleEnrollTotp = async (recoveryCode?: string): Promise<TotpEnrollmentResult> => {
++  const handleEnrollTotp = async (
++    optionsOrRecoveryCode?: string | { replaceUnverified?: boolean },
++  ): Promise<TotpEnrollmentResult> => {
+     if (getExternalStagingMfaClient()) {
+       try {
+-        const factor = await enrollExternalStagingTotp();
+-        return {ok:true,secret:factor.secret,otpauthUri:factor.uri,recoveryCodes:[]};
+-      } catch(e) {return {ok:false,error:e instanceof Error?e.message:'External MFA enrollment failed.'};}
++        const replaceUnverified =
++          typeof optionsOrRecoveryCode === 'object'
++            ? Boolean(optionsOrRecoveryCode?.replaceUnverified)
++            : false;
++        const factor = await enrollExternalStagingTotp({ replaceUnverified });
++        setHasPendingExternalFactor(true);
++        return {
++          ok: true,
++          factorId: factor.factorId,
++          qrCode: factor.qr,
++          secret: factor.secret,
++          otpauthUri: factor.uri,
++          recoveryCodes: [],
++        };
++      } catch (e) {
++        return { ok: false, error: e instanceof Error ? e.message : 'External MFA enrollment failed.' };
++      }
+     }
+     try {
++      const recoveryCode =
++        typeof optionsOrRecoveryCode === 'string' ? optionsOrRecoveryCode : undefined;
+       const res = await apiFetch('/api/auth/mfa/totp/enroll', {
+         method: 'POST',
+         headers: { 'Content-Type': 'application/json' },
+@@ -238,12 +381,18 @@ export default function App() {
+   };
+ 
+   const handleLogout = async () => {
+-    await apiFetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
+-    setApiAccessToken(null);
+-    setApiCsrfToken(null);
+-    setCurrentUser(DEFAULT_GUEST);
+-    setMfaRequired(false);
+-    setMfaEnrolled(false);
++    try {
++      await signOutExternalStagingSession();
++      await apiFetch('/api/auth/logout', { method: 'POST', credentials: 'include' }).catch(() => null);
++    } finally {
++      clearPendingExternalTotpFactor();
++      setHasPendingExternalFactor(false);
++      setApiAccessToken(null);
++      setApiCsrfToken(null);
++      setCurrentUser(DEFAULT_GUEST);
++      setMfaRequired(false);
++      setMfaEnrolled(false);
++    }
+   };
+ 
+   const openBooking = (serviceId?: string) => {
+@@ -315,6 +464,8 @@ export default function App() {
+             currentUser={currentUser}
+             mfaRequired={mfaRequired}
+             mfaEnrolled={mfaEnrolled}
++            externalStagingMode={externalStagingMode}
++            hasPendingExternalFactor={hasPendingExternalFactor}
+             authProviderReady={authProviderReady}
+             personas={personas}
+             onSwitchPersona={handleSwitchPersona}
+diff --git a/src/components/PortalsWorkspace.tsx b/src/components/PortalsWorkspace.tsx
+index dca38cc..545908b 100644
+--- a/src/components/PortalsWorkspace.tsx
++++ b/src/components/PortalsWorkspace.tsx
+@@ -37,15 +37,19 @@ interface PortalsWorkspaceProps {
+   currentUser: UserSession;
+   mfaRequired: boolean;
+   mfaEnrolled?: boolean;
++  externalStagingMode?: boolean;
++  hasPendingExternalFactor?: boolean;
+   authProviderReady?: boolean;
+   personas: UserSession[];
+   onSwitchPersona: (user: UserSession) => Promise<void>;
+   onEmailLogin?: (email: string, password: string) => Promise<{ ok: boolean; error?: string }>;
+   onPasswordReset?: (email: string) => Promise<{ ok: boolean; message?: string; error?: string }>;
+   onVerifyMfa: (code: string) => Promise<{ ok: boolean; error?: string }>;
+-  onEnrollTotp?: (recoveryCode?: string) => Promise<{
++  onEnrollTotp?: (optionsOrRecoveryCode?: string | { replaceUnverified?: boolean }) => Promise<{
+     ok: boolean;
+     error?: string;
++    factorId?: string;
++    qrCode?: string;
+     secret?: string;
+     otpauthUri?: string;
+     recoveryCodes?: string[];
+@@ -76,6 +80,8 @@ export function PortalsWorkspace({
+   currentUser,
+   mfaRequired,
+   mfaEnrolled = false,
++  externalStagingMode = false,
++  hasPendingExternalFactor = false,
+   authProviderReady = false,
+   personas,
+   onSwitchPersona,
+@@ -106,6 +112,8 @@ export function PortalsWorkspace({
+   const [mfaMode, setMfaMode] = useState<'totp' | 'recovery' | 'enroll'>('totp');
+   const [recoveryCodeInput, setRecoveryCodeInput] = useState('');
+   const [totpEnrollment, setTotpEnrollment] = useState<{
++    factorId?: string;
++    qrCode?: string;
+     secret: string;
+     otpauthUri: string;
+     recoveryCodes: string[];
+@@ -127,7 +135,7 @@ export function PortalsWorkspace({
+   const [blackoutReason, setBlackoutReason] = useState('Independence Day Holiday Studio Closure');
+ 
+   const loadWorkspaceData = useCallback(async () => {
+-    if (currentUser.role === 'guest') {
++    if (currentUser.role === 'guest' || (currentUser.role === 'admin' && mfaRequired)) {
+       setBookings([]);
+       setVendors([]);
+       setChecklists([]);
+@@ -251,17 +259,21 @@ export function PortalsWorkspace({
+     await loadWorkspaceData();
+   };
+ 
+-  const handleEnrollTotpClick = async () => {
++  const handleEnrollTotpClick = async (replaceUnverified = false) => {
+     if (!onEnrollTotp || authSubmitting) return;
+     setActionMessage(null);
+     setAuthSubmitting(true);
+     try {
+-      const result = await onEnrollTotp();
++      const result = externalStagingMode
++        ? await onEnrollTotp({ replaceUnverified })
++        : await onEnrollTotp();
+       if (!result.ok || !result.secret || !result.otpauthUri) {
+         setActionMessage({ type: 'err', text: result.error || 'Unable to generate authenticator enrollment.' });
+         return;
+       }
+       setTotpEnrollment({
++        factorId: result.factorId,
++        qrCode: result.qrCode,
+         secret: result.secret,
+         otpauthUri: result.otpauthUri,
+         recoveryCodes: result.recoveryCodes || [],
+@@ -269,7 +281,9 @@ export function PortalsWorkspace({
+       setMfaMode('enroll');
+       setActionMessage({
+         type: 'ok',
+-        text: 'TOTP secret generated. Save your single-use recovery codes, then verify with a 6-digit authenticator code.',
++        text: externalStagingMode
++          ? 'Authenticator QR code generated. Scan it in your authenticator app, then enter the 6-digit verification code below to complete AAL2 elevation.'
++          : 'TOTP secret generated. Save your single-use recovery codes, then verify with a 6-digit authenticator code.',
+       });
+     } finally {
+       setAuthSubmitting(false);
+@@ -642,18 +656,24 @@ export function PortalsWorkspace({
+                 </button>
+                 <div className="flex items-center justify-between text-xs pt-1">
+                   <span className="text-[var(--cs-charcoal-muted)]">
+-                    {authProviderReady ? 'Supabase Auth active' : 'Identity provider awaiting server configuration'}
++                    {externalStagingMode
++                      ? 'Supabase External Staging Auth active (AAL2 enforced)'
++                      : authProviderReady
++                        ? 'Supabase Auth active'
++                        : 'Identity provider awaiting server configuration'}
+                   </span>
+-                  <button
+-                    type="button"
+-                    onClick={() => {
+-                      setActionMessage(null);
+-                      setLoginMode('reset');
+-                    }}
+-                    className="text-[var(--cs-purple)] hover:underline font-medium cursor-pointer"
+-                  >
+-                    Forgot password?
+-                  </button>
++                  {!externalStagingMode && (
++                    <button
++                      type="button"
++                      onClick={() => {
++                        setActionMessage(null);
++                        setLoginMode('reset');
++                      }}
++                      className="text-[var(--cs-purple)] hover:underline font-medium cursor-pointer"
++                    >
++                      Forgot password?
++                    </button>
++                  )}
+                 </div>
+               </form>
+             ) : (
+@@ -706,7 +726,7 @@ export function PortalsWorkspace({
+               </p>
+             </div>
+ 
+-            {mfaMode === 'recovery' ? (
++            {mfaMode === 'recovery' && !externalStagingMode ? (
+               <form onSubmit={handleRecoverMfaSubmit} className="space-y-4">
+                 <input
+                   type="text"
+@@ -733,9 +753,27 @@ export function PortalsWorkspace({
+               </form>
+             ) : (
+               <form onSubmit={handleMfaSubmit} className="space-y-4">
++                {externalStagingMode && hasPendingExternalFactor && !totpEnrollment && (
++                  <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-md text-xs text-amber-900 space-y-2 text-left">
++                    <p className="font-semibold">Pending Authenticator Enrollment Detected</p>
++                    <p className="leading-relaxed">
++                      Your pending TOTP factor registration was preserved across reload (secret keys are never persisted in browser storage). Enter the 6-digit code from your authenticator app below, or start a fresh enrollment if you have not scanned the QR code yet.
++                    </p>
++                  </div>
++                )}
++
+                 {totpEnrollment && (
+                   <div className="p-4 bg-[var(--cs-ivory)] border border-[var(--cs-border-strong)] rounded-md space-y-2.5 text-left text-xs">
+                     <p className="font-semibold text-[var(--cs-purple)]">Authenticator Setup (RFC 6238 TOTP)</p>
++                    {totpEnrollment.qrCode && totpEnrollment.qrCode.startsWith('data:image/') && (
++                      <div className="flex justify-center py-2 bg-white rounded border border-[var(--cs-border)]">
++                        <img
++                          src={totpEnrollment.qrCode}
++                          alt="Scan this QR code in your authenticator app"
++                          className="w-44 h-44 object-contain"
++                        />
++                      </div>
++                    )}
+                     <div>
+                       <p className="text-[11px] text-[var(--cs-charcoal-muted)]">Manual Setup Secret:</p>
+                       <p className="font-mono text-xs bg-white px-2.5 py-1.5 mt-1 rounded border border-[var(--cs-border)] break-all select-all">
+@@ -768,6 +806,8 @@ export function PortalsWorkspace({
+                 <input
+                   type="password"
+                   required
++                  inputMode="numeric"
++                  autoComplete="one-time-code"
+                   value={mfaCode}
+                   onChange={(e) => setMfaCode(e.target.value)}
+                   placeholder="Enter 6-digit MFA code"
+@@ -785,13 +825,15 @@ export function PortalsWorkspace({
+                     <button
+                       type="button"
+                       disabled={authSubmitting}
+-                      onClick={handleEnrollTotpClick}
++                      onClick={() => handleEnrollTotpClick(externalStagingMode && hasPendingExternalFactor)}
+                       className="text-[var(--cs-purple)] hover:underline font-medium cursor-pointer"
+                     >
+-                      Enroll Authenticator App (TOTP)
++                      {externalStagingMode && hasPendingExternalFactor
++                        ? 'Restart Authenticator Setup (TOTP)'
++                        : 'Enroll Authenticator App (TOTP)'}
+                     </button>
+                   )}
+-                  {onRecoverMfa && (
++                  {onRecoverMfa && !externalStagingMode && (
+                     <button
+                       type="button"
+                       onClick={() => setMfaMode('recovery')}
+diff --git a/src/lib/externalStagingMfa.ts b/src/lib/externalStagingMfa.ts
+index 5de3940..0f7ec80 100644
+--- a/src/lib/externalStagingMfa.ts
++++ b/src/lib/externalStagingMfa.ts
+@@ -1,44 +1,345 @@
+ import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+ 
+-const PROJECT_REF = 'nswxwwmtcasmkjtmrdqg';
++export const STAGING_EXTERNAL_PROJECT_REF = 'nswxwwmtcasmkjtmrdqg';
++export const STAGING_EXTERNAL_ADMIN_UUID = 'fd9523dd-eb07-4cca-9040-62feea3f5353';
++
++const PENDING_FACTOR_STORAGE_KEY = 'cs_pending_ext_totp_factor_v1';
++const PENDING_FACTOR_TTL_MS = 15 * 60 * 1000;
++
++export interface PendingFactorRecord {
++  factorId: string;
++  userId: string;
++  createdAt: number;
++}
++
++export interface ExternalMfaFactorSummary {
++  id: string;
++  factor_type?: string;
++  status?: string;
++  friendly_name?: string;
++}
++
++export interface ExternalStagingSupabaseClientLike {
++  auth: {
++    getUser: () => Promise<{ data: { user: { id: string } | null }; error: unknown }>;
++    getSession: () => Promise<{
++      data: { session: { access_token: string; user?: { id: string } | null } | null };
++      error?: unknown;
++    }>;
++    refreshSession?: () => Promise<{
++      data: { session: { access_token: string; user?: { id: string } | null } | null };
++      error?: unknown;
++    }>;
++    signOut: () => Promise<{ error?: unknown }>;
++    mfa: {
++      listFactors: () => Promise<{
++        data: { totp: ExternalMfaFactorSummary[]; all?: ExternalMfaFactorSummary[] } | null;
++        error: unknown;
++      }>;
++      enroll: (params: { factorType: 'totp'; friendlyName?: string }) => Promise<{
++        data: {
++          id: string;
++          totp: { qr_code: string; secret: string; uri: string };
++        } | null;
++        error: unknown;
++      }>;
++      unenroll?: (params: { factorId: string }) => Promise<{ data?: unknown; error: unknown }>;
++      challengeAndVerify: (params: { factorId: string; code: string }) => Promise<{
++        data: unknown;
++        error: unknown;
++      }>;
++      getAuthenticatorAssuranceLevel: () => Promise<{
++        data: { currentLevel: string | null; nextLevel?: string | null } | null;
++        error: unknown;
++      }>;
++    };
++  };
++}
++
+ let client: SupabaseClient | null = null;
+-let pendingTotpFactorId: string | null = null;
++let pendingTotpFactor: PendingFactorRecord | null = null;
++
++function readPendingFactorFromStorage(): PendingFactorRecord | null {
++  if (typeof window === 'undefined' || !window.sessionStorage) return null;
++  try {
++    const raw = window.sessionStorage.getItem(PENDING_FACTOR_STORAGE_KEY);
++    if (!raw) return null;
++    const parsed = JSON.parse(raw) as Partial<PendingFactorRecord>;
++    if (
++      typeof parsed.factorId !== 'string' ||
++      !parsed.factorId.trim() ||
++      typeof parsed.userId !== 'string' ||
++      typeof parsed.createdAt !== 'number'
++    ) {
++      window.sessionStorage.removeItem(PENDING_FACTOR_STORAGE_KEY);
++      return null;
++    }
++    if (Date.now() - parsed.createdAt > PENDING_FACTOR_TTL_MS) {
++      window.sessionStorage.removeItem(PENDING_FACTOR_STORAGE_KEY);
++      return null;
++    }
++    return {
++      factorId: parsed.factorId.trim(),
++      userId: parsed.userId,
++      createdAt: parsed.createdAt,
++    };
++  } catch {
++    return null;
++  }
++}
++
++function writePendingFactorToStorage(record: PendingFactorRecord | null): void {
++  pendingTotpFactor = record;
++  if (typeof window === 'undefined' || !window.sessionStorage) return;
++  try {
++    if (!record) {
++      window.sessionStorage.removeItem(PENDING_FACTOR_STORAGE_KEY);
++    } else {
++      // Security invariant: NEVER persist TOTP secret, QR code, or otpauth URI in browser storage.
++      // Only the non-secret Supabase factor UUID metadata is preserved for reload handoff.
++      window.sessionStorage.setItem(PENDING_FACTOR_STORAGE_KEY, JSON.stringify(record));
++    }
++  } catch {
++    // Ignore storage quota or restricted iframe errors; in-memory handoff remains active.
++  }
++}
++
++export function clearPendingExternalTotpFactor(): void {
++  writePendingFactorToStorage(null);
++}
+ 
+ /** Explicit opt-in only: browser never receives a service-role key. */
+ export function getExternalStagingMfaClient(): SupabaseClient | null {
+   if (import.meta.env.VITE_PHASE19_EXTERNAL_AUTH_STAGING !== 'true') return null;
+   const key = import.meta.env.VITE_PHASE19_EXTERNAL_AUTH_ANON_KEY;
+   if (!key) return null;
+-  if (!client) client = createClient(`https://${PROJECT_REF}.supabase.co`, key, {
+-    auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false },
+-  });
++  if (!client) {
++    client = createClient(`https://${STAGING_EXTERNAL_PROJECT_REF}.supabase.co`, key, {
++      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false },
++    });
++  }
+   return client;
+ }
+ 
+-export async function enrollExternalStagingTotp() {
+-  const supabase = getExternalStagingMfaClient();
+-  if (!supabase) throw new Error('External staging MFA is not configured.');
+-  const { data: user, error: userError } = await supabase.auth.getUser();
+-  if (userError || user.user?.id !== 'fd9523dd-eb07-4cca-9040-62feea3f5353') {
++export function getPendingExternalTotpFactorId(expectedUserId?: string): string | null {
++  const active = pendingTotpFactor ?? readPendingFactorFromStorage();
++  if (!active) return null;
++  if (Date.now() - active.createdAt > PENDING_FACTOR_TTL_MS) {
++    clearPendingExternalTotpFactor();
++    return null;
++  }
++  if (expectedUserId && active.userId !== expectedUserId) {
++    clearPendingExternalTotpFactor();
++    return null;
++  }
++  pendingTotpFactor = active;
++  return active.factorId;
++}
++
++async function assertAuthenticatedStagingAdmin(
++  supabase: ExternalStagingSupabaseClientLike,
++): Promise<string> {
++  const { data: userData, error: userError } = await supabase.auth.getUser();
++  const userId = userData?.user?.id;
++  if (userError || !userId) {
++    throw new Error('Active Supabase authentication session required. Please sign in again.');
++  }
++  if (userId !== STAGING_EXTERNAL_ADMIN_UUID) {
++    clearPendingExternalTotpFactor();
+     throw new Error('Authenticated staging administrator session required.');
+   }
+-  const { data, error } = await supabase.auth.mfa.enroll({factorType:'totp', friendlyName:'Celebration Sisters staging administrator'});
+-  if (error) throw error;
+-  pendingTotpFactorId = data.id;
+-  return { factorId:data.id, qr:data.totp.qr_code, secret:data.totp.secret, uri:data.totp.uri };
++  return userId;
++}
++
++/**
++ * Resolves the authoritative TOTP factor ID for verification across both immediate
++ * enrollment-to-verification handoff and browser reloads (checking verified and unverified factors).
++ */
++export async function resolveExternalTotpFactorId(
++  clientOverride?: ExternalStagingSupabaseClientLike | null,
++): Promise<string | null> {
++  const supabase = clientOverride !== undefined ? clientOverride : getExternalStagingMfaClient();
++  if (!supabase) return null;
++  const userId = await assertAuthenticatedStagingAdmin(supabase);
++
++  const { data: factors, error } = await supabase.auth.mfa.listFactors();
++  if (error || !factors) {
++    throw new Error('Unable to inspect authenticator factors for the active session.');
++  }
++
++  const allFactors = Array.isArray(factors.all) ? factors.all : [];
++  const verifiedTotp = Array.isArray(factors.totp) ? factors.totp : [];
++  const unverifiedTotp = allFactors.filter(
++    (f) => f.factor_type === 'totp' && f.status === 'unverified',
++  );
++
++  // 1. Prefer an active pending factor ID if it still exists (handles immediate handoff + page reload)
++  const pendingId = getPendingExternalTotpFactorId(userId);
++  if (pendingId) {
++    const knownByServer =
++      allFactors.length === 0 ||
++      allFactors.some((f) => f.id === pendingId) ||
++      verifiedTotp.some((f) => f.id === pendingId);
++    if (knownByServer) {
++      return pendingId;
++    }
++    clearPendingExternalTotpFactor();
++  }
++
++  // 2. Fall back to an existing verified TOTP factor
++  if (verifiedTotp[0]?.id) {
++    return verifiedTotp[0].id;
++  }
++
++  // 3. Fall back to the most recent unverified TOTP factor (handles reload if sessionStorage was cleared)
++  if (unverifiedTotp.length > 0) {
++    const recoveredId = unverifiedTotp[unverifiedTotp.length - 1].id;
++    writePendingFactorToStorage({ factorId: recoveredId, userId, createdAt: Date.now() });
++    return recoveredId;
++  }
++
++  return null;
+ }
+ 
+-export function getPendingExternalTotpFactorId(): string | null { return pendingTotpFactorId; }
++export async function enrollExternalStagingTotp(options?: {
++  replaceUnverified?: boolean;
++  clientOverride?: ExternalStagingSupabaseClientLike | null;
++}) {
++  const supabase =
++    options?.clientOverride !== undefined ? options.clientOverride : getExternalStagingMfaClient();
++  if (!supabase) throw new Error('External staging MFA is not configured.');
++
++  const userId = await assertAuthenticatedStagingAdmin(supabase);
++
++  const { data: existingFactors, error: listError } = await supabase.auth.mfa.listFactors();
++  if (listError) {
++    throw new Error('Unable to inspect existing authenticator factors before enrollment.');
++  }
++
++  const verifiedTotp = Array.isArray(existingFactors?.totp) ? existingFactors.totp : [];
++  if (verifiedTotp.length > 0) {
++    throw new Error(
++      'A verified TOTP authenticator is already enrolled on this account. Enter your 6-digit code to complete AAL2 verification.',
++    );
++  }
++
++  const unverifiedTotp = (Array.isArray(existingFactors?.all) ? existingFactors.all : []).filter(
++    (f) => f.factor_type === 'totp' && f.status === 'unverified',
++  );
++
++  if (unverifiedTotp.length > 0 && options?.replaceUnverified && supabase.auth.mfa.unenroll) {
++    for (const stale of unverifiedTotp) {
++      const { error: unenrollErr } = await supabase.auth.mfa.unenroll({ factorId: stale.id });
++      if (unenrollErr) {
++        throw new Error('Unable to clear previous incomplete authenticator setup.');
++      }
++    }
++    clearPendingExternalTotpFactor();
++  }
+ 
+-export async function verifyExternalStagingTotp(factorId:string, code:string) {
+-  const supabase = getExternalStagingMfaClient();
++  const friendlyName =
++    unverifiedTotp.length > 0 && !options?.replaceUnverified
++      ? `Celebration Sisters staging admin ${Date.now().toString(36)}`
++      : 'Celebration Sisters staging administrator';
++
++  const { data, error } = await supabase.auth.mfa.enroll({
++    factorType: 'totp',
++    friendlyName,
++  });
++  if (error || !data?.id || !data.totp?.secret) {
++    throw new Error(
++      error instanceof Error ? error.message : 'Unable to start Supabase TOTP authenticator enrollment.',
++    );
++  }
++
++  writePendingFactorToStorage({
++    factorId: data.id,
++    userId,
++    createdAt: Date.now(),
++  });
++
++  return {
++    factorId: data.id,
++    qr: data.totp.qr_code,
++    secret: data.totp.secret,
++    uri: data.totp.uri,
++  };
++}
++
++export async function verifyExternalStagingTotp(
++  factorId: string,
++  rawCode: string,
++  clientOverride?: ExternalStagingSupabaseClientLike | null,
++) {
++  const supabase = clientOverride !== undefined ? clientOverride : getExternalStagingMfaClient();
+   if (!supabase) throw new Error('External staging MFA is not configured.');
+-  const {data,error} = await supabase.auth.mfa.challengeAndVerify({factorId,code});
+-  if (error) throw error;
+-  const {data:aal,error:aalError} = await supabase.auth.mfa.getAuthenticatorAssuranceLevel();
+-  if (aalError || aal.currentLevel !== 'aal2') throw new Error('Supabase AAL2 verification did not complete.');
+-  const {data:session} = await supabase.auth.getSession();
+-  if (!session.session?.access_token) throw new Error('No authenticated AAL2 access token returned.');
+-  pendingTotpFactorId = null;
+-  return {accessToken:session.session.access_token};
++
++  const normalizedFactorId = factorId.trim();
++  if (!normalizedFactorId) {
++    throw new Error('Enroll an authenticator before verifying MFA.');
++  }
++
++  const normalizedCode = rawCode.replace(/\s+/g, '');
++  if (!/^\d{6}$/.test(normalizedCode)) {
++    throw new Error('Enter a valid 6-digit authenticator code.');
++  }
++
++  const userId = await assertAuthenticatedStagingAdmin(supabase);
++
++  const { error } = await supabase.auth.mfa.challengeAndVerify({
++    factorId: normalizedFactorId,
++    code: normalizedCode,
++  });
++  if (error) {
++    throw new Error(
++      error instanceof Error ? error.message : 'Invalid or expired authenticator verification code.',
++    );
++  }
++
++  const { data: aal, error: aalError } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel();
++  if (aalError || aal?.currentLevel !== 'aal2') {
++    throw new Error('Supabase AAL2 verification did not complete.');
++  }
++
++  let sessionResult = await supabase.auth.getSession();
++  if (supabase.auth.refreshSession) {
++    const refreshed = await supabase.auth.refreshSession();
++    if (!refreshed.error && refreshed.data?.session?.access_token) {
++      sessionResult = refreshed;
++    }
++  }
++
++  const activeSession = sessionResult.data?.session;
++  if (!activeSession?.access_token) {
++    throw new Error('No authenticated AAL2 access token returned.');
++  }
++  if (activeSession.user?.id && activeSession.user.id !== userId) {
++    clearPendingExternalTotpFactor();
++    throw new Error('Authenticated session identity mismatch after MFA verification.');
++  }
++
++  clearPendingExternalTotpFactor();
++  return {
++    accessToken: activeSession.access_token,
++    userId,
++    aal: 'aal2' as const,
++  };
++}
++
++export async function signOutExternalStagingSession(
++  clientOverride?: ExternalStagingSupabaseClientLike | null,
++): Promise<void> {
++  clearPendingExternalTotpFactor();
++  const supabase = clientOverride !== undefined ? clientOverride : getExternalStagingMfaClient();
++  if (!supabase) return;
++  try {
++    await supabase.auth.signOut();
++  } catch {
++    // Ensure client state still clears even if provider signOut fails offline.
++  }
++}
++
++export function resetExternalStagingClientForTests(): void {
++  client = null;
++  clearPendingExternalTotpFactor();
+ }
+diff --git a/tests/phase21-30-certification.test.ts b/tests/phase21-30-certification.test.ts
+new file mode 100644
+index 0000000..50011ee
+--- /dev/null
++++ b/tests/phase21-30-certification.test.ts
+@@ -0,0 +1,806 @@
++import assert from 'node:assert/strict';
++import fs from 'node:fs/promises';
++import os from 'node:os';
++import path from 'node:path';
++import test from 'node:test';
++import { generateKeyPair, SignJWT } from 'jose';
++import { createApp } from '../server/app.ts';
++import { signSessionToken } from '../server/auth.ts';
++import { verifyProviderAccessToken } from '../server/identityProvider.ts';
++import {
++  STAGING_ADMIN_SUBJECT,
++  STAGING_AUTH_ISSUER,
++  STAGING_AUTH_PROJECT_REF,
++} from '../server/stagingExternalAuthPolicy.ts';
++import { loadMigrationFiles, runMigrationsOnClient } from '../scripts/run-migrations.ts';
++import {
++  clearPendingExternalTotpFactor,
++  enrollExternalStagingTotp,
++  getPendingExternalTotpFactorId,
++  resetExternalStagingClientForTests,
++  resolveExternalTotpFactorId,
++  signOutExternalStagingSession,
++  STAGING_EXTERNAL_ADMIN_UUID,
++  verifyExternalStagingTotp,
++  type ExternalMfaFactorSummary,
++  type ExternalStagingSupabaseClientLike,
++} from '../src/lib/externalStagingMfa.ts';
++
++const EXTERNAL_STAGING_ENV: Record<string, string> = {
++  RAILWAY_ENVIRONMENT_NAME: 'staging',
++  STAGING_DB_CONFIRM: 'YES_ISOLATED_STAGING',
++  EMAIL_LIVE_DELIVERY_ENABLED: 'false',
++  PHASE19_EXTERNAL_AUTH_READ_ONLY: 'YES_EXTERNAL_AUTH_STAGING_ONLY',
++  PHASE19_EXTERNAL_AUTH_PROJECT_REF: STAGING_AUTH_PROJECT_REF,
++};
++
++function createMemorySessionStorage() {
++  const store = new Map<string, string>();
++  return {
++    store,
++    storage: {
++      getItem: (key: string) => (store.has(key) ? store.get(key)! : null),
++      setItem: (key: string, value: string) => {
++        store.set(key, String(value));
++      },
++      removeItem: (key: string) => {
++        store.delete(key);
++      },
++      clear: () => {
++        store.clear();
++      },
++    },
++  };
++}
++
++function createMockExternalSupabaseClient(config?: {
++  userId?: string;
++  initialFactors?: ExternalMfaFactorSummary[];
++  validCode?: string;
++  postVerifyAal?: 'aal1' | 'aal2';
++  rejectEnroll?: boolean;
++}) {
++  const userId = config?.userId ?? STAGING_EXTERNAL_ADMIN_UUID;
++  const validCode = config?.validCode ?? '654321';
++  const postVerifyAal = config?.postVerifyAal ?? 'aal2';
++  const factors: ExternalMfaFactorSummary[] = [...(config?.initialFactors ?? [])];
++  let currentAal: 'aal1' | 'aal2' = factors.some((f) => f.status === 'verified') ? 'aal1' : 'aal1';
++  let enrollCount = 0;
++  let signedOut = false;
++  let refreshedCount = 0;
++  const unenrolledIds: string[] = [];
++
++  const client: ExternalStagingSupabaseClientLike = {
++    auth: {
++      getUser: async () => ({
++        data: { user: signedOut ? null : { id: userId } },
++        error: null,
++      }),
++      getSession: async () => ({
++        data: {
++          session: signedOut
++            ? null
++            : {
++                access_token: currentAal === 'aal2' ? 'jwt-aal2-initial' : 'jwt-aal1-initial',
++                user: { id: userId },
++              },
++        },
++        error: null,
++      }),
++      refreshSession: async () => {
++        refreshedCount += 1;
++        return {
++          data: {
++            session: signedOut
++              ? null
++              : {
++                  access_token: currentAal === 'aal2' ? `jwt-aal2-refreshed-${refreshedCount}` : 'jwt-aal1-refreshed',
++                  user: { id: userId },
++                },
++          },
++          error: null,
++        };
++      },
++      signOut: async () => {
++        signedOut = true;
++        return { error: null };
++      },
++      mfa: {
++        listFactors: async () => ({
++          data: {
++            totp: factors.filter((f) => f.factor_type === 'totp' && f.status === 'verified'),
++            all: [...factors],
++          },
++          error: null,
++        }),
++        enroll: async ({ friendlyName }) => {
++          if (config?.rejectEnroll) {
++            return { data: null, error: new Error('Enrollment rejected by provider') };
++          }
++          enrollCount += 1;
++          const id = `factor-totp-${enrollCount}`;
++          factors.push({
++            id,
++            factor_type: 'totp',
++            status: 'unverified',
++            friendly_name: friendlyName,
++          });
++          return {
++            data: {
++              id,
++              totp: {
++                qr_code: 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg"></svg>',
++                secret: 'JBSWY3DPEHPK3PXP',
++                uri: 'otpauth://totp/CelebrationSisters:admin?secret=JBSWY3DPEHPK3PXP&issuer=CelebrationSisters',
++              },
++            },
++            error: null,
++          };
++        },
++        unenroll: async ({ factorId }) => {
++          unenrolledIds.push(factorId);
++          const idx = factors.findIndex((f) => f.id === factorId);
++          if (idx >= 0) factors.splice(idx, 1);
++          return { data: { id: factorId }, error: null };
++        },
++        challengeAndVerify: async ({ factorId, code }) => {
++          const matched = factors.find((f) => f.id === factorId);
++          if (!matched) {
++            return { data: null, error: new Error('Factor not found') };
++          }
++          if (code !== validCode) {
++            return { data: null, error: new Error('Invalid TOTP code') };
++          }
++          matched.status = 'verified';
++          currentAal = postVerifyAal;
++          return { data: { factorId }, error: null };
++        },
++        getAuthenticatorAssuranceLevel: async () => ({
++          data: { currentLevel: currentAal, nextLevel: 'aal2' },
++          error: null,
++        }),
++      },
++    },
++  };
++
++  return {
++    client,
++    getState: () => ({ factors, currentAal, signedOut, refreshedCount, unenrolledIds, enrollCount }),
++  };
++}
++
++async function withEnv<T>(overrides: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
++  const previous: Record<string, string | undefined> = {};
++  for (const [k, v] of Object.entries(overrides)) {
++    previous[k] = process.env[k];
++    if (v === undefined) delete process.env[k];
++    else process.env[k] = v;
++  }
++  try {
++    return await fn();
++  } finally {
++    for (const [k, v] of Object.entries(previous)) {
++      if (v === undefined) delete process.env[k];
++      else process.env[k] = v;
++    }
++  }
++}
++
++async function startIsolatedExternalStagingServer(
++  keyResolver: (header: { kid?: string; alg?: string }) => Promise<CryptoKey>,
++) {
++  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cs-phase21-30-'));
++  const dbPath = path.join(tmpDir, 'db.json');
++
++  const seededApp = createApp({ enableRateLimit: false });
++  void seededApp;
++
++  const envCleanup = await withEnv(
++    {
++      ...EXTERNAL_STAGING_ENV,
++      CS_DB_PATH: dbPath,
++      SUPABASE_JWT_SECRET: 'unused-legacy-hs256-secret-must-never-break-es256-jwks',
++    },
++    async () => {
++      // Seed initial db.json and bind the single pinned staging admin UUID to the active admin row
++      const { withTransaction } = await import('../server/store.ts');
++      await withTransaction((db) => {
++        const admin = db.users.find((u) => u.role === 'admin');
++        if (admin) {
++          admin.supabaseUserId = STAGING_ADMIN_SUBJECT;
++          admin.accountStatus = 'active';
++          admin.emailVerified = true;
++        }
++      });
++      return true;
++    },
++  );
++  assert.equal(envCleanup, true);
++
++  const app = createApp({
++    enableRateLimit: false,
++    providerVerifyOptions: { keyResolver },
++  });
++  const server = await new Promise<ReturnType<typeof app.listen>>((resolve) => {
++    const s = app.listen(0, '127.0.0.1', () => resolve(s));
++  });
++  const addr = server.address();
++  const baseUrl = typeof addr === 'object' && addr ? `http://127.0.0.1:${addr.port}` : '';
++
++  return {
++    baseUrl,
++    dbPath,
++    cleanup: async () => {
++      await new Promise<void>((resolve) => server.close(() => resolve()));
++      await fs.rm(tmpDir, { recursive: true, force: true });
++    },
++  };
++}
++
++test('Phase 21-30: ES256 JWKS verification + key rotation succeeds even when SUPABASE_JWT_SECRET is set, and rejects HS256/none in useJwksOnly mode', async () => {
++  const kp1 = await generateKeyPair('ES256');
++  const kp2 = await generateKeyPair('ES256');
++  const keysByKid: Record<string, CryptoKey> = {
++    'kid-rot-1': kp1.publicKey,
++    'kid-rot-2': kp2.publicKey,
++  };
++  const keyResolver = async (header: { kid?: string }) => {
++    const key = header.kid ? keysByKid[header.kid] : undefined;
++    if (!key) throw new Error('Unknown kid');
++    return key;
++  };
++
++  await withEnv(
++    {
++      SUPABASE_JWT_SECRET: 'legacy-hs256-secret-present-in-railway-env',
++      SUPABASE_URL: 'https://diasvulceaahmorucoro.supabase.co',
++    },
++    async () => {
++      const es256K1 = await new SignJWT({
++        email: 'admin@celebrationsisters.example.com',
++        email_verified: true,
++        aal: 'aal2',
++      })
++        .setProtectedHeader({ alg: 'ES256', kid: 'kid-rot-1' })
++        .setSubject(STAGING_ADMIN_SUBJECT)
++        .setIssuer(STAGING_AUTH_ISSUER)
++        .setAudience('authenticated')
++        .setIssuedAt()
++        .setExpirationTime('5m')
++        .sign(kp1.privateKey);
++
++      const es256K2 = await new SignJWT({
++        email: 'admin@celebrationsisters.example.com',
++        email_verified: true,
++        aal: 'aal2',
++      })
++        .setProtectedHeader({ alg: 'ES256', kid: 'kid-rot-2' })
++        .setSubject(STAGING_ADMIN_SUBJECT)
++        .setIssuer(STAGING_AUTH_ISSUER)
++        .setAudience('authenticated')
++        .setIssuedAt()
++        .setExpirationTime('5m')
++        .sign(kp2.privateKey);
++
++      const verified1 = await verifyProviderAccessToken(es256K1, {
++        supabaseUrl: `https://${STAGING_AUTH_PROJECT_REF}.supabase.co`,
++        useJwksOnly: true,
++        keyResolver,
++      });
++      assert.ok(verified1);
++      assert.equal(verified1.sub, STAGING_ADMIN_SUBJECT);
++      assert.equal(verified1.aal, 'aal2');
++
++      const verified2 = await verifyProviderAccessToken(es256K2, {
++        supabaseUrl: `https://${STAGING_AUTH_PROJECT_REF}.supabase.co`,
++        useJwksOnly: true,
++        keyResolver,
++      });
++      assert.ok(verified2);
++      assert.equal(verified2.sub, STAGING_ADMIN_SUBJECT);
++
++      // HS256 forged with SUPABASE_JWT_SECRET must be rejected when useJwksOnly is true
++      const hs256Token = await new SignJWT({
++        email: 'admin@celebrationsisters.example.com',
++        aal: 'aal2',
++      })
++        .setProtectedHeader({ alg: 'HS256' })
++        .setSubject(STAGING_ADMIN_SUBJECT)
++        .setIssuer(STAGING_AUTH_ISSUER)
++        .setAudience('authenticated')
++        .setIssuedAt()
++        .setExpirationTime('5m')
++        .sign(new TextEncoder().encode('legacy-hs256-secret-present-in-railway-env'));
++
++      assert.equal(
++        await verifyProviderAccessToken(hs256Token, {
++          supabaseUrl: `https://${STAGING_AUTH_PROJECT_REF}.supabase.co`,
++          useJwksOnly: true,
++          keyResolver,
++        }),
++        null,
++      );
++
++      // alg: none unsigned token must always be rejected
++      const noneHeader = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url');
++      const nonePayload = Buffer.from(
++        JSON.stringify({
++          sub: STAGING_ADMIN_SUBJECT,
++          iss: STAGING_AUTH_ISSUER,
++          aud: 'authenticated',
++          aal: 'aal2',
++          exp: Math.floor(Date.now() / 1000) + 300,
++        }),
++      ).toString('base64url');
++      assert.equal(
++        await verifyProviderAccessToken(`${noneHeader}.${nonePayload}.`, {
++          supabaseUrl: `https://${STAGING_AUTH_PROJECT_REF}.supabase.co`,
++          useJwksOnly: true,
++          keyResolver,
++        }),
++        null,
++      );
++    },
++  );
++});
++
++test('Phase 21-30: non-mutating external staging MFA handoff preserves non-secret factor ID across reload, blocks duplicate verified factors, and clears on verify/logout', async () => {
++  const originalWindow = (globalThis as Record<string, unknown>).window;
++  const mem = createMemorySessionStorage();
++  (globalThis as Record<string, unknown>).window = { sessionStorage: mem.storage };
++  resetExternalStagingClientForTests();
++
++  try {
++    const mock = createMockExternalSupabaseClient({ validCode: '123456' });
++
++    // 1. Enrollment captures factor ID and NEVER writes TOTP secret or otpauth URI to storage
++    const enrolled = await enrollExternalStagingTotp({ clientOverride: mock.client });
++    assert.equal(enrolled.factorId, 'factor-totp-1');
++    assert.ok(enrolled.qr.startsWith('data:image/'));
++    assert.equal(getPendingExternalTotpFactorId(STAGING_EXTERNAL_ADMIN_UUID), 'factor-totp-1');
++
++    const serializedStorage = Array.from(mem.store.values()).join(' ');
++    assert.equal(serializedStorage.includes(enrolled.secret), false, 'TOTP secret must NEVER be persisted in sessionStorage');
++    assert.equal(serializedStorage.includes('otpauth://'), false, 'otpauth URI must NEVER be persisted in sessionStorage');
++    assert.equal(serializedStorage.includes('factor-totp-1'), true);
++
++    // 2. Simulate full browser reload (reset in-memory module cache while keeping sessionStorage)
++    const savedStorageCopy = new Map(mem.store);
++    resetExternalStagingClientForTests();
++    for (const [k, v] of savedStorageCopy.entries()) mem.store.set(k, v);
++
++    const recoveredFactorId = await resolveExternalTotpFactorId(mock.client);
++    assert.equal(recoveredFactorId, 'factor-totp-1');
++
++    // 3. Invalid / malformed / wrong codes fail closed without clearing pending handoff
++    await assert.rejects(
++      () => verifyExternalStagingTotp(recoveredFactorId!, '12ab56', mock.client),
++      /6-digit/,
++    );
++    await assert.rejects(
++      () => verifyExternalStagingTotp(recoveredFactorId!, '000000', mock.client),
++      /Invalid TOTP code/,
++    );
++    assert.equal(getPendingExternalTotpFactorId(STAGING_EXTERNAL_ADMIN_UUID), 'factor-totp-1');
++
++    // 4. Valid 6-digit code with whitespace succeeds, refreshes session to AAL2, and clears pending factor
++    const verified = await verifyExternalStagingTotp(recoveredFactorId!, ' 123 456 ', mock.client);
++    assert.equal(verified.aal, 'aal2');
++    assert.equal(verified.userId, STAGING_EXTERNAL_ADMIN_UUID);
++    assert.ok(verified.accessToken.startsWith('jwt-aal2-refreshed-'));
++    assert.equal(getPendingExternalTotpFactorId(), null);
++    assert.equal(mem.store.size, 0);
++
++    // 5. Duplicate enrollment prevented once a verified TOTP factor already exists
++    await assert.rejects(
++      () => enrollExternalStagingTotp({ clientOverride: mock.client }),
++      /already enrolled/i,
++    );
++
++    // 6. Explicit replacement of stale unverified factor cleans up only unverified factors
++    const staleMock = createMockExternalSupabaseClient({
++      initialFactors: [{ id: 'stale-unverified-1', factor_type: 'totp', status: 'unverified' }],
++    });
++    const replaced = await enrollExternalStagingTotp({
++      replaceUnverified: true,
++      clientOverride: staleMock.client,
++    });
++    assert.deepEqual(staleMock.getState().unenrolledIds, ['stale-unverified-1']);
++    assert.equal(replaced.factorId, 'factor-totp-1');
++
++    // 7. Logout clears pending factor and calls provider signOut
++    await signOutExternalStagingSession(staleMock.client);
++    assert.equal(getPendingExternalTotpFactorId(), null);
++    assert.equal(staleMock.getState().signedOut, true);
++
++    // 8. Wrong user UUID is strictly rejected
++    const wrongUserMock = createMockExternalSupabaseClient({
++      userId: '43d8d6ae-a4a3-41a0-a099-a19f10c0be72',
++    });
++    await assert.rejects(
++      () => enrollExternalStagingTotp({ clientOverride: wrongUserMock.client }),
++      /staging administrator session required/i,
++    );
++
++    // 9. Provider returning AAL1 after verify fails closed
++    const aal1StuckMock = createMockExternalSupabaseClient({
++      validCode: '654321',
++      postVerifyAal: 'aal1',
++      initialFactors: [{ id: 'f-stuck', factor_type: 'totp', status: 'unverified' }],
++    });
++    await assert.rejects(
++      () => verifyExternalStagingTotp('f-stuck', '654321', aal1StuckMock.client),
++      /AAL2 verification did not complete/i,
++    );
++  } finally {
++    clearPendingExternalTotpFactor();
++    resetExternalStagingClientForTests();
++    if (originalWindow === undefined) {
++      delete (globalThis as Record<string, unknown>).window;
++    } else {
++      (globalThis as Record<string, unknown>).window = originalWindow;
++    }
++  }
++});
++
++test('Phase 21-30: external staging HTTP privilege boundary closes all alternate admin/MFA bypass paths while supporting AAL1 reload gate and AAL2 unlock', async () => {
++  const { privateKey, publicKey } = await generateKeyPair('ES256');
++  const resolver = async () => publicKey;
++
++  const { baseUrl, dbPath, cleanup } = await startIsolatedExternalStagingServer(resolver);
++  try {
++    await withEnv(
++      {
++        ...EXTERNAL_STAGING_ENV,
++        CS_DB_PATH: dbPath,
++        SUPABASE_JWT_SECRET: 'unused-legacy-hs256-secret-must-never-break-es256-jwks',
++      },
++      async () => {
++        const makeAdminJwt = (aal: 'aal1' | 'aal2', sub = STAGING_ADMIN_SUBJECT) =>
++          new SignJWT({
++            email: 'admin@celebrationsisters.example.com',
++            email_verified: true,
++            aal,
++            session_id: `sess-${aal}`,
++          })
++            .setProtectedHeader({ alg: 'ES256', kid: 'staging-k1' })
++            .setSubject(sub)
++            .setIssuer(STAGING_AUTH_ISSUER)
++            .setAudience('authenticated')
++            .setIssuedAt()
++            .setExpirationTime('5m')
++            .sign(privateKey);
++
++        const aal1Token = await makeAdminJwt('aal1');
++        const aal2Token = await makeAdminJwt('aal2');
++        const otherSubjectAal2 = await makeAdminJwt('aal2', '43d8d6ae-a4a3-41a0-a099-a19f10c0be72');
++
++        // AAL1 pinned admin can inspect /api/auth/session (to restore MFA gate on reload) with no csrfToken
++        const aal1SessionRes = await fetch(`${baseUrl}/api/auth/session`, {
++          headers: { Authorization: `Bearer ${aal1Token}` },
++        });
++        assert.equal(aal1SessionRes.status, 200);
++        const aal1Session = (await aal1SessionRes.json()) as {
++          user: { role: string };
++          mfaRequired: boolean;
++          mfaVerified: boolean;
++          aal: string;
++          csrfToken?: string;
++          externalStagingAuth?: boolean;
++        };
++        assert.equal(aal1Session.user.role, 'admin');
++        assert.equal(aal1Session.mfaRequired, true);
++        assert.equal(aal1Session.mfaVerified, false);
++        assert.equal(aal1Session.aal, 'aal1');
++        assert.equal(aal1Session.csrfToken, undefined);
++        assert.equal(aal1Session.externalStagingAuth, true);
++
++        // AAL1 admin is denied on ALL protected endpoints
++        for (const protectedPath of [
++          '/api/admin/overview',
++          '/api/bookings',
++          '/api/consultations',
++          '/api/staff/checklists',
++          '/api/inventory',
++        ]) {
++          const deniedRes = await fetch(`${baseUrl}${protectedPath}`, {
++            headers: { Authorization: `Bearer ${aal1Token}` },
++          });
++          assert.ok(
++            deniedRes.status === 401 || deniedRes.status === 403,
++            `AAL1 admin must be denied on ${protectedPath} (got ${deniedRes.status})`,
++          );
++        }
++
++        // All local MFA mutation and external password-reset routes are closed (409)
++        for (const [endpoint, body] of [
++          ['/api/auth/mfa/totp/enroll', {}],
++          ['/api/auth/mfa/verify', { code: '123456' }],
++          ['/api/auth/mfa/recover', { recoveryCode: 'TEST-RECOVERY' }],
++          ['/api/auth/mfa/totp/revoke', { code: '123456' }],
++          ['/api/auth/password-reset', { email: 'admin@celebrationsisters.example.com' }],
++        ] as const) {
++          const blockedRes = await fetch(`${baseUrl}${endpoint}`, {
++            method: 'POST',
++            headers: {
++              'Content-Type': 'application/json',
++              Authorization: `Bearer ${aal2Token}`,
++            },
++            body: JSON.stringify(body),
++          });
++          assert.equal(blockedRes.status, 409, `${endpoint} must return 409 in external staging mode`);
++        }
++
++        // Forged local HMAC admin cookie (even with mfaVerified: true) is rejected in external staging mode
++        const forgedLocalAdminToken = signSessionToken({
++          userId: 'user-admin-director',
++          role: 'admin',
++          mfaVerified: true,
++          issuedAt: Date.now(),
++          expiresAt: Date.now() + 3_600_000,
++        });
++        const forgedCookieRes = await fetch(`${baseUrl}/api/admin/overview`, {
++          headers: { Authorization: `Bearer ${forgedLocalAdminToken}` },
++        });
++        assert.equal(forgedCookieRes.status, 403);
++
++        // Non-pinned subject with AAL2 cannot access admin endpoints
++        const otherSubRes = await fetch(`${baseUrl}/api/admin/overview`, {
++          headers: { Authorization: `Bearer ${otherSubjectAal2}` },
++        });
++        assert.equal(otherSubRes.status, 403);
++
++        // Pinned staging admin UUID with genuine ES256 AAL2 succeeds on /api/auth/session and /api/admin/overview
++        const aal2SessionRes = await fetch(`${baseUrl}/api/auth/session`, {
++          headers: { Authorization: `Bearer ${aal2Token}` },
++        });
++        assert.equal(aal2SessionRes.status, 200);
++        const aal2Session = (await aal2SessionRes.json()) as {
++          mfaVerified: boolean;
++          aal: string;
++          mfaRequired: boolean;
++        };
++        assert.equal(aal2Session.mfaVerified, true);
++        assert.equal(aal2Session.aal, 'aal2');
++        assert.equal(aal2Session.mfaRequired, false);
++
++        const adminOverviewRes = await fetch(`${baseUrl}/api/admin/overview`, {
++          headers: { Authorization: `Bearer ${aal2Token}` },
++        });
++        assert.equal(adminOverviewRes.status, 200);
++      },
++    );
++  } finally {
++    await cleanup();
++  }
++});
++
++test('Phase 21-30: strict Customer A vs Customer B isolation across consultations (including shared-email bound clientId), bookings, concepts, staff, inventory, and admin routes', async () => {
++  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cs-phase25-iso-'));
++  const dbPath = path.join(tmpDir, 'db.json');
++
++  await withEnv({ CS_DB_PATH: dbPath }, async () => {
++    const app = createApp({ enableRateLimit: false });
++    const server = await new Promise<ReturnType<typeof app.listen>>((resolve) => {
++      const s = app.listen(0, '127.0.0.1', () => resolve(s));
++    });
++    const addr = server.address();
++    const baseUrl = typeof addr === 'object' && addr ? `http://127.0.0.1:${addr.port}` : '';
++
++    try {
++      const switchUser = async (userId: string) => {
++        const res = await fetch(`${baseUrl}/api/auth/switch`, {
++          method: 'POST',
++          headers: { 'Content-Type': 'application/json' },
++          body: JSON.stringify({ userId }),
++        });
++        assert.equal(res.status, 200);
++        const data = (await res.json()) as { token: string };
++        return data.token;
++      };
++
++      const clientAToken = await switchUser('user-client-camille');
++      const clientBToken = await switchUser('user-client-elena');
++
++      // Seed a consultation owned by Customer B that happens to share Customer A's email
++      // to verify bound clientId records NEVER leak across accounts by email alone.
++      const { withTransaction } = await import('../server/store.ts');
++      await withTransaction((db) => {
++        const clientA = db.users.find((u) => u.id === 'user-client-camille');
++        db.consultations.push({
++          id: 'con-bound-client-b',
++          referenceCode: 'CONS-ISO-9999',
++          bookingId: 'bkg-102',
++          clientId: 'user-client-elena',
++          clientName: 'Elena Bound Record',
++          clientEmail: clientA?.email || 'camille@example.com',
++          clientPhone: '404-555-0199',
++          preferredContactMethod: 'email',
++          eventTitle: 'Private Gala',
++          eventCategory: 'Corporate Gala',
++          eventDate: '2027-09-10',
++          eventLocation: 'Atlanta, GA',
++          venueName: 'The Biltmore Ballrooms',
++          guestCount: 150,
++          budgetRange: '$15,000 - $30,000',
++          serviceDivisionIds: ['div-luxury-decor'],
++          consultationNotes: 'Confidential Client B notes',
++          method: 'video',
++          status: 'Confirmed',
++          crmStage: 'Consultation Scheduled',
++          assignedPlannerId: 'user-admin-director',
++          assignedPlannerName: 'Maya Jenkins',
++          startUtc: '2027-08-10T15:00:00.000Z',
++          endUtc: '2027-08-10T16:00:00.000Z',
++          durationMinutes: 60,
++          bufferBeforeMinutes: 15,
++          bufferAfterMinutes: 15,
++          clientTimezone: 'America/New_York',
++          privacyConsentAccepted: true,
++          privacyConsentAt: new Date().toISOString(),
++          privacyConsentVersion: '2026-01',
++          accessTokenHash: '0'.repeat(64),
++          rescheduleCount: 0,
++          createdAt: new Date().toISOString(),
++          updatedAt: new Date().toISOString(),
++        });
++      });
++
++      // Customer A must NEVER see Customer B's bound consultation
++      const conARes = await fetch(`${baseUrl}/api/consultations`, {
++        headers: { Authorization: `Bearer ${clientAToken}` },
++      });
++      assert.equal(conARes.status, 200);
++      const conAData = (await conARes.json()) as { consultations: { id: string }[] };
++      assert.equal(
++        conAData.consultations.some((c) => c.id === 'con-bound-client-b'),
++        false,
++        'Customer A must never see a consultation bound to Customer B clientId',
++      );
++
++      // Customer B CAN see her own bound consultation
++      const conBRes = await fetch(`${baseUrl}/api/consultations`, {
++        headers: { Authorization: `Bearer ${clientBToken}` },
++      });
++      assert.equal(conBRes.status, 200);
++      const conBData = (await conBRes.json()) as { consultations: { id: string }[] };
++      assert.equal(
++        conBData.consultations.some((c) => c.id === 'con-bound-client-b'),
++        true,
++      );
++
++      // Customer A denied on all privileged / operational / cross-tenant endpoints
++      const forbiddenChecks: Array<{ method: string; url: string; body?: unknown; allow404?: boolean }> = [
++        { method: 'GET', url: '/api/admin/overview' },
++        { method: 'GET', url: '/api/staff/checklists' },
++        { method: 'GET', url: '/api/inventory' },
++        { method: 'GET', url: '/api/vendors' },
++        { method: 'POST', url: '/api/bookings/bkg-102/contract/sign', body: { signatureName: 'Spoof' } },
++        { method: 'POST', url: '/api/bookings/bkg-102/messages', body: { text: 'Cross-tenant injection' }, allow404: true },
++        {
++          method: 'POST',
++          url: '/api/bookings/bkg-102/quotes',
++          body: { description: 'Tamper', unitPrice: 1, quantity: 1 },
++        },
++        { method: 'PATCH', url: '/api/bookings/bkg-102/status', body: { status: 'Confirmed' } },
++        { method: 'PATCH', url: '/api/bookings/bkg-102/assignments', body: { vendorIds: [] } },
++        { method: 'PATCH', url: '/api/bookings/bkg-102/milestones/ms-1', body: { status: 'Completed' }, allow404: true },
++      ];
++      for (const check of forbiddenChecks) {
++        const res = await fetch(`${baseUrl}${check.url}`, {
++          method: check.method,
++          headers: {
++            Authorization: `Bearer ${clientAToken}`,
++            ...(check.body ? { 'Content-Type': 'application/json' } : {}),
++          },
++          body: check.body ? JSON.stringify(check.body) : undefined,
++        });
++        const expectedOk = check.allow404 ? res.status === 403 || res.status === 404 : res.status === 403;
++        assert.equal(
++          expectedOk,
++          true,
++          `Customer A must be denied on ${check.method} ${check.url} (got ${res.status})`,
++        );
++      }
++    } finally {
++      await new Promise<void>((resolve) => server.close(() => resolve()));
++      await fs.rm(tmpDir, { recursive: true, force: true });
++    }
++  });
++});
++
++test('Phase 21-30: migration runner enforces advisory lock contention, rollback on SQL failure, null-checksum fail-closed, and idempotent rerun', async () => {
++  const files = await loadMigrationFiles();
++  assert.ok(files.length >= 8);
++
++  // 1. Concurrent advisory lock contention aborts cleanly before any DDL
++  const lockClient = {
++    async query(sql: string) {
++      if (/pg_try_advisory_lock/i.test(sql)) {
++        return { rows: [{ acquired: false }] };
++      }
++      throw new Error(`Unexpected query when advisory lock not acquired: ${sql}`);
++    },
++  };
++  await assert.rejects(
++    () => runMigrationsOnClient(lockClient as never, { dryRun: false }),
++    /MIGRATION_LOCK_CONTENTION/,
++  );
++
++  // 2. Null checksum on an already-recorded migration fails closed in apply mode and unlocks advisory lock
++  let unlockedAfterDrift = false;
++  const nullChecksumClient = {
++    async query(sql: string) {
++      if (/pg_try_advisory_lock/i.test(sql)) return { rows: [{ acquired: true }] };
++      if (/pg_advisory_unlock/i.test(sql)) {
++        unlockedAfterDrift = true;
++        return { rows: [{ pg_advisory_unlock: true }] };
++      }
++      if (/CREATE TABLE IF NOT EXISTS public\.schema_migrations/i.test(sql)) return { rows: [] };
++      if (/ALTER TABLE public\.schema_migrations/i.test(sql)) return { rows: [] };
++      if (/SELECT version, checksum_sha256 FROM public\.schema_migrations/i.test(sql)) {
++        return { rows: [{ version: files[0].version, checksum_sha256: null }] };
++      }
++      throw new Error(`Unexpected SQL: ${sql}`);
++    },
++  };
++  await assert.rejects(
++    () => runMigrationsOnClient(nullChecksumClient as never, { dryRun: false }),
++    /MIGRATION_CHECKSUM_MISMATCH/,
++  );
++  assert.equal(unlockedAfterDrift, true);
++
++  // 3. SQL execution error rolls back transaction and releases advisory lock
++  const executedSql: string[] = [];
++  const failingApplyClient = {
++    async query(sql: string) {
++      executedSql.push(sql.trim());
++      if (/pg_try_advisory_lock/i.test(sql)) return { rows: [{ acquired: true }] };
++      if (/pg_advisory_unlock/i.test(sql)) return { rows: [{ pg_advisory_unlock: true }] };
++      if (/CREATE TABLE IF NOT EXISTS public\.schema_migrations/i.test(sql)) return { rows: [] };
++      if (/ALTER TABLE public\.schema_migrations/i.test(sql)) return { rows: [] };
++      if (/SELECT version, checksum_sha256 FROM public\.schema_migrations/i.test(sql)) return { rows: [] };
++      if (sql === 'BEGIN' || sql === 'ROLLBACK') return { rows: [] };
++      throw new Error('SIMULATED_DDL_FAILURE');
++    },
++  };
++  await assert.rejects(
++    () => runMigrationsOnClient(failingApplyClient as never, { dryRun: false }),
++    /SIMULATED_DDL_FAILURE/,
++  );
++  assert.ok(executedSql.includes('BEGIN'));
++  assert.ok(executedSql.includes('ROLLBACK'));
++  assert.ok(executedSql.some((s) => /pg_advisory_unlock/i.test(s)));
++
++  // 4. Full apply followed by idempotent rerun applies once then skips all on second run
++  const recorded = new Map<string, string>();
++  const memoryPgClient = {
++    async query(sql: string, params?: unknown[]) {
++      if (/pg_try_advisory_lock/i.test(sql)) return { rows: [{ acquired: true }] };
++      if (/pg_advisory_unlock/i.test(sql)) return { rows: [{ pg_advisory_unlock: true }] };
++      if (/CREATE TABLE IF NOT EXISTS public\.schema_migrations/i.test(sql)) return { rows: [] };
++      if (/ALTER TABLE public\.schema_migrations/i.test(sql)) return { rows: [] };
++      if (/SELECT version, checksum_sha256 FROM public\.schema_migrations/i.test(sql)) {
++        return {
++          rows: Array.from(recorded.entries()).map(([version, checksum_sha256]) => ({
++            version,
++            checksum_sha256,
++          })),
++        };
++      }
++      if (/INSERT INTO public\.schema_migrations/i.test(sql) && Array.isArray(params)) {
++        recorded.set(String(params[0]), String(params[1]));
++        return { rows: [] };
++      }
++      return { rows: [] };
++    },
++  };
++
++  const firstRun = await runMigrationsOnClient(memoryPgClient as never, { dryRun: false });
++  assert.equal(firstRun.applied.length, files.length);
++  assert.equal(firstRun.skipped.length, 0);
++
++  const secondRun = await runMigrationsOnClient(memoryPgClient as never, { dryRun: false });
++  assert.equal(secondRun.applied.length, 0);
++  assert.equal(secondRun.skipped.length, files.length);
++});
+diff --git a/tests/phase31-40-deployment-gate.test.ts b/tests/phase31-40-deployment-gate.test.ts
+new file mode 100644
+index 0000000..b77ca1c
+--- /dev/null
++++ b/tests/phase31-40-deployment-gate.test.ts
+@@ -0,0 +1,226 @@
++import assert from 'node:assert/strict';
++import fs from 'node:fs/promises';
++import path from 'node:path';
++import test from 'node:test';
++import {
++  fetchRailwayDeployedCommitSha,
++  verifyStagingDeployment,
++} from '../scripts/verify-staging-deployment.mjs';
++
++const SHA_A = 'fdf693187be1993aa151f0ab8b2f0b41fb44fff7';
++const SHA_B = 'de848c890138ee00db72ce08e093a0f337215226';
++const STAGING_ORIGIN = 'https://celebrationsisterseventdecor-staging-staging.up.railway.app';
++
++function createMockFetch(overrides?: {
++  railwaySha?: string;
++  healthStatus?: number;
++  readyStatus?: number;
++  readyBody?: Record<string, unknown>;
++  configBody?: Record<string, unknown>;
++  unauthBookingsStatus?: number;
++  unauthAdminStatus?: number;
++  authedAdminStatus?: number;
++}) {
++  return async (input: string | URL, init?: RequestInit) => {
++    const url = typeof input === 'string' ? input : input.toString();
++
++    if (url.includes('backboard.railway.app/graphql/v2')) {
++      return new Response(
++        JSON.stringify({
++          data: {
++            deployments: {
++              edges: [
++                {
++                  node: {
++                    id: 'dep-staging-001',
++                    status: 'SUCCESS',
++                    createdAt: '2026-11-20T22:45:00.000Z',
++                    meta: { commitHash: overrides?.railwaySha ?? SHA_A },
++                  },
++                },
++              ],
++            },
++          },
++        }),
++        { status: 200, headers: { 'Content-Type': 'application/json' } },
++      );
++    }
++
++    if (url.endsWith('/health')) {
++      const status = overrides?.healthStatus ?? 200;
++      return new Response(JSON.stringify({ ok: status === 200, status: 'alive' }), {
++        status,
++        headers: { 'Content-Type': 'application/json' },
++      });
++    }
++
++    if (url.endsWith('/ready')) {
++      const status = overrides?.readyStatus ?? 200;
++      const body = overrides?.readyBody ?? {
++        ok: true,
++        checks: {
++          database: true,
++          migrations: true,
++          schemaObjects: true,
++          auth: true,
++          email: true,
++          worker: true,
++        },
++        persistence: {
++          schema: {
++            migrationsAppliedCount: 8,
++            overlapConstraintPresent: true,
++          },
++        },
++        email: {
++          configured: true,
++          liveDeliveryEnabled: false,
++        },
++      };
++      return new Response(JSON.stringify(body), {
++        status,
++        headers: { 'Content-Type': 'application/json' },
++      });
++    }
++
++    if (url.endsWith('/api/auth/config')) {
++      return new Response(
++        JSON.stringify(
++          overrides?.configBody ?? {
++            demoPersonasAvailable: false,
++            readyForProductionAuth: true,
++          },
++        ),
++        { status: 200, headers: { 'Content-Type': 'application/json' } },
++      );
++    }
++
++    if (url.endsWith('/api/bookings')) {
++      return new Response(JSON.stringify({ error: 'Unauthorized' }), {
++        status: overrides?.unauthBookingsStatus ?? 401,
++        headers: { 'Content-Type': 'application/json' },
++      });
++    }
++
++    if (url.endsWith('/api/admin/overview')) {
++      const headers = (init?.headers || {}) as Record<string, string>;
++      if (headers.Authorization?.startsWith('Bearer ')) {
++        return new Response(JSON.stringify({ ok: true }), {
++          status: overrides?.authedAdminStatus ?? 200,
++          headers: { 'Content-Type': 'application/json' },
++        });
++      }
++      return new Response(JSON.stringify({ error: 'Forbidden' }), {
++        status: overrides?.unauthAdminStatus ?? 403,
++        headers: { 'Content-Type': 'application/json' },
++      });
++    }
++
++    return new Response(JSON.stringify({ error: 'Not Found' }), { status: 404 });
++  };
++}
++
++test('Phase 34/39: verifyStagingDeployment returns BLOCKED (exit 2) when independent Railway evidence is missing', async () => {
++  const result = await verifyStagingDeployment(
++    { STAGING_URL: STAGING_ORIGIN, GITHUB_APPROVED_SHA: SHA_A },
++    createMockFetch() as unknown as typeof fetch,
++  );
++  assert.equal(result.status, 'BLOCKED');
++  assert.equal(result.exitCode, 2);
++});
++
++test('Phase 34/39: verifyStagingDeployment independently fetches Railway SHA via GraphQL and fails closed on SHA mismatch', async () => {
++  const mismatch = await verifyStagingDeployment(
++    {
++      STAGING_URL: STAGING_ORIGIN,
++      GITHUB_APPROVED_SHA: SHA_A,
++      RAILWAY_API_TOKEN: 'rw-test-placeholder-token',
++      RAILWAY_PROJECT_ID: 'proj-1',
++      RAILWAY_ENVIRONMENT_ID: 'env-1',
++      RAILWAY_SERVICE_ID: 'svc-1',
++    },
++    createMockFetch({ railwaySha: SHA_B }) as unknown as typeof fetch,
++  );
++  assert.equal(mismatch.status, 'FAILED');
++  assert.equal(mismatch.exitCode, 1);
++  assert.equal(mismatch.githubApprovedSha, SHA_A);
++  assert.equal(mismatch.railwayDeployedSha, SHA_B);
++  assert.equal(mismatch.shaEvidenceSource, 'railway_graphql_api');
++});
++
++test('Phase 34/39: verifyStagingDeployment passes when GITHUB === RAILWAY === STAGING SHA and all live health, DB, email-safety, and auth checks succeed', async () => {
++  const pass = await verifyStagingDeployment(
++    {
++      STAGING_URL: STAGING_ORIGIN,
++      GITHUB_APPROVED_SHA: SHA_A,
++      RAILWAY_API_TOKEN: 'rw-test-placeholder-token',
++      RAILWAY_PROJECT_ID: 'proj-1',
++      RAILWAY_ENVIRONMENT_ID: 'env-1',
++      RAILWAY_SERVICE_ID: 'svc-1',
++      STAGING_ADMIN_AAL2_TOKEN: 'jwt-aal2-test',
++    },
++    createMockFetch({ railwaySha: SHA_A }) as unknown as typeof fetch,
++  );
++  assert.equal(pass.status, 'PASS');
++  assert.equal(pass.exitCode, 0);
++  assert.equal(pass.githubApprovedSha, SHA_A);
++  assert.equal(pass.railwayDeployedSha, SHA_A);
++  assert.equal(pass.stagingTestedSha, SHA_A);
++  assert.equal(pass.railwayDeploymentId, 'dep-staging-001');
++  assert.ok(pass.checks.every((c: { passed: boolean }) => c.passed));
++});
++
++test('Phase 34/39: verifyStagingDeployment fails closed on non-HTTPS origin, cross-origin health path, unready DB, live staging email enabled, or broken auth guard', async () => {
++  const httpRes = await verifyStagingDeployment(
++    { STAGING_URL: 'http://example.test', GITHUB_APPROVED_SHA: SHA_A, DEPLOYED_COMMIT_SHA: SHA_A },
++    createMockFetch() as unknown as typeof fetch,
++  );
++  assert.equal(httpRes.exitCode, 1);
++
++  const crossOriginPath = await verifyStagingDeployment(
++    {
++      STAGING_URL: STAGING_ORIGIN,
++      GITHUB_APPROVED_SHA: SHA_A,
++      DEPLOYED_COMMIT_SHA: SHA_A,
++      STAGING_HEALTH_PATH: 'https://evil.example.test/health',
++    },
++    createMockFetch() as unknown as typeof fetch,
++  );
++  assert.equal(crossOriginPath.exitCode, 1);
++
++  const liveEmailEnabled = await verifyStagingDeployment(
++    { STAGING_URL: STAGING_ORIGIN, GITHUB_APPROVED_SHA: SHA_A, DEPLOYED_COMMIT_SHA: SHA_A },
++    createMockFetch({
++      readyBody: {
++        ok: true,
++        checks: { database: true, migrations: true, schemaObjects: true, auth: true, worker: true },
++        persistence: { schema: { migrationsAppliedCount: 8, overlapConstraintPresent: true } },
++        email: { configured: true, liveDeliveryEnabled: true },
++      },
++    }) as unknown as typeof fetch,
++  );
++  assert.equal(liveEmailEnabled.exitCode, 1);
++
++  const authLeak = await verifyStagingDeployment(
++    { STAGING_URL: STAGING_ORIGIN, GITHUB_APPROVED_SHA: SHA_A, DEPLOYED_COMMIT_SHA: SHA_A },
++    createMockFetch({ unauthBookingsStatus: 200 }) as unknown as typeof fetch,
++  );
++  assert.equal(authLeak.exitCode, 1);
++
++  const missingTokenLookup = await fetchRailwayDeployedCommitSha({
++    railwayToken: '',
++    serviceId: '',
++    environmentId: '',
++    projectId: '',
++  });
++  assert.equal(missingTokenLookup.blocked, true);
++});
++
++test('Phase 39: dedicated staging-deployment-gate workflow integrates verify-staging-deployment.mjs separately from CI', async () => {
++  const workflowPath = path.resolve(process.cwd(), '.github/workflows/staging-deployment-gate.yml');
++  const content = await fs.readFile(workflowPath, 'utf8');
++  assert.ok(content.includes('scripts/verify-staging-deployment.mjs'));
++  assert.ok(content.includes('RAILWAY_API_TOKEN'));
++  assert.ok(content.includes('staging-deployment-certification.json'));
++  assert.ok(content.includes('actions/upload-artifact@v4'));
++});
