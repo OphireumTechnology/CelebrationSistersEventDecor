@@ -499,6 +499,12 @@ export async function runPostgresTransaction<T>(
   buildSeed: () => DatabaseSchema,
   normalize: (raw: DatabaseSchema) => DatabaseSchema,
   fn: (db: DatabaseSchema) => Promise<T> | T,
+  options?: {
+    useDatabaseClock?: boolean;
+    receiveTransactionClock?: (
+      clock: () => Promise<number>
+    ) => void;
+  },
 ): Promise<T> {
   const pool = getPgPool();
   const client = await pool.connect();
@@ -521,6 +527,23 @@ export async function runPostgresTransaction<T>(
     );
 
     const db = normalize(locked.rows[0]?.payload ?? buildSeed());
+
+    if (options?.useDatabaseClock) {
+      options.receiveTransactionClock?.(async () => {
+        const result = await client.query<{ now_ms: number | string }>(
+          'SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint AS now_ms',
+        );
+
+        const now = Number(result.rows[0]?.now_ms);
+
+        if (!Number.isSafeInteger(now) || now <= 0) {
+          throw new Error('DATABASE_CLOCK_UNAVAILABLE');
+        }
+
+        return now;
+      });
+    }
+
     const result = await fn(db);
 
     await client.query(
