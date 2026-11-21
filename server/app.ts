@@ -1,3 +1,12 @@
+import {
+  acquireConceptLease,
+  assertConceptLeaseOwnership,
+  completeConceptLease,
+  releaseConceptLease,
+  type ConceptLease,
+} from './repositories/conceptLeaseRepository.ts';
+import { withClockedTransaction } from './store.ts';
+
 import crypto from 'node:crypto';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { z } from 'zod';
@@ -274,6 +283,24 @@ export function createApp(options: CreateAppOptions = {}) {
   const enableRateLimit = options.enableRateLimit ?? true;
   const app = express();
 
+  // Phase 46F: per-application single-flight coordination.
+  // This registry is not a substitute for database idempotency.
+  type ConceptGenerationFlight = {
+    durableLease?: ConceptLease;
+    fingerprint: string;
+    proposal: Promise<
+      Awaited<ReturnType<typeof generateConceptProposal>> | undefined
+    >;
+    participants: number;
+  };
+
+  const conceptGenerationFlights =
+    new Map<string, ConceptGenerationFlight>();
+
+  const MAX_CONCEPT_GENERATION_FLIGHTS = 256;
+  const MAX_CONCEPT_FLIGHT_PARTICIPANTS = 16;
+
+
   // Express 4 does not catch rejected promises from async route handlers automatically.
   // Wrap route registration methods so any async DB/runtime rejection routes cleanly to the global error handler.
   const wrapAsyncArgs = (args: unknown[]) =>
@@ -406,8 +433,11 @@ export function createApp(options: CreateAppOptions = {}) {
     return candidate;
   }
 
-  async function getAuth(req: Request) {
-    const db = await readDb();
+  async function getAuth(
+    req: Request,
+    transactionDb?: Awaited<ReturnType<typeof readDb>>,
+  ) {
+    const db = transactionDb ?? await readDb();
     const ctx = await resolveAuthenticatedContextAsync(
       req,
       db.users,
@@ -550,6 +580,8 @@ export function createApp(options: CreateAppOptions = {}) {
         model: ai.model,
         configured: ai.configured,
         modelSource: ai.modelSource,
+        thinkingLevel: ai.thinkingLevel,
+        abortSignalSupported: ai.abortSignalSupported,
         timeoutMs: ai.timeoutMs,
         maxRetries: ai.maxRetries,
         ...(ai.modelWarning ? { modelWarning: ai.modelWarning } : {}),
@@ -594,6 +626,8 @@ export function createApp(options: CreateAppOptions = {}) {
         model: ai.model,
         configured: ai.configured,
         modelSource: ai.modelSource,
+        thinkingLevel: ai.thinkingLevel,
+        abortSignalSupported: ai.abortSignalSupported,
         timeoutMs: ai.timeoutMs,
         conciergeTimeoutMs: ai.conciergeTimeoutMs,
         conceptTimeoutMs: ai.conceptTimeoutMs,
@@ -2433,104 +2467,646 @@ export function createApp(options: CreateAppOptions = {}) {
     }
 
     const { db: preflightDb, ctx } = await getAuth(req);
-    const callerScope = ctx.session.role === 'guest' ? 'guest' : ctx.session.id;
+    // Reject invalid or inactive authenticated contexts before
+    // joining an existing operation or invoking the AI provider.
+    if (ctx.spoofAttemptDetected || ctx.accountStatus !== 'active') {
+      const message = 'Your session is not authorized to generate a concept.';
+      return res.status(403).json({
+        success: false,
+        error: message,
+        code: 'FORBIDDEN',
+        retryable: false,
+        requestId,
+        errorDetail: {
+          code: 'FORBIDDEN',
+          message,
+          retryable: false,
+        },
+      });
+    }
+
+    // Prevent shared anonymous proposal retrieval.
+    const callerScope =
+      ctx.session.role === 'guest' ? undefined : ctx.session.id;
 
     const rawIdemKey = (req.header('idempotency-key') || '').trim();
     const scopedIdempotencyKey =
-      rawIdemKey && /^[a-zA-Z0-9_:-]{8,128}$/.test(rawIdemKey)
+      callerScope && rawIdemKey && /^[a-zA-Z0-9_:-]{8,128}$/.test(rawIdemKey)
         ? `${callerScope}:${rawIdemKey}`
         : undefined;
 
-    // Fast-path idempotency deduplication before invoking Gemini
-    if (scopedIdempotencyKey && preflightDb.conceptIdempotencyKeys?.[scopedIdempotencyKey]) {
-      const existingId = preflightDb.conceptIdempotencyKeys[scopedIdempotencyKey];
-      const existingConcept = preflightDb.concepts.find((c) => c.id === existingId);
-      if (existingConcept) {
-        logStructured('info', 'ai_concept_idempotency_hit', {
-          requestId,
-          conceptId: existingConcept.id,
-          currentVersion: existingConcept.currentVersion,
-        });
-        return res.json({
-          success: true,
-          persisted: true,
-          deduplicated: true,
-          requestId,
-          concept: existingConcept,
-        });
-      }
-    }
 
-    // Pre-check concept revision & booking authorization BEFORE calling Gemini API
-    if (parsed.data.conceptId) {
-      const existingCheck = preflightDb.concepts.find((c) => c.id === parsed.data.conceptId);
-      if (!existingCheck) {
-        return res.status(404).json({
-          success: false,
-          error: 'The selected concept proposal could not be found. Create a new concept proposal instead.',
-          code: 'CONCEPT_NOT_FOUND',
-          retryable: false,
-          requestId,
-          errorDetail: {
-            code: 'CONCEPT_NOT_FOUND',
-            message: 'The selected concept proposal could not be found.',
-            retryable: false,
-          },
-        });
+    const { createHash } = await import('node:crypto');
+
+    const requestFingerprint = createHash('sha256')
+      .update(JSON.stringify(parsed.data))
+      .digest('hex');
+
+    const encodeIdempotencyRecord = (conceptId: string) =>
+      `v2:${requestFingerprint}:${conceptId}`;
+
+    const canAccessAttachedBooking = (
+      db: typeof preflightDb,
+      bookingId: string
+    ): boolean => {
+      if (
+        bookingId === 'unassigned-client-concept' ||
+        bookingId === 'public-concierge-preview'
+      ) {
+        return true;
       }
-      const canRevise =
+
+      const booking = db.bookings.find(
+        (b) => b.id === bookingId
+      );
+
+      return Boolean(
+        booking &&
+        isAuthorizedForBooking(
+          booking, ctx.session, db.vendors
+        )
+      );
+    };
+
+    const resolveCachedConcept = (
+      db: typeof preflightDb,
+      record: string
+    ) => {
+      const prefix = `v2:${requestFingerprint}:`;
+
+      if (!record.startsWith(prefix)) {
+        throw new Error('IDEMPOTENCY_CONFLICT');
+      }
+
+      const existing = db.concepts.find(
+        (c) => c.id === record.slice(prefix.length)
+      );
+
+      if (!existing) {
+        throw new Error('IDEMPOTENCY_CONFLICT');
+      }
+
+      const authorized =
         hasPlanningClearance(ctx.session) ||
-        (ctx.session.role === 'client' && existingCheck.clientId === ctx.session.id);
-      if (!canRevise) {
-        return res.status(403).json({
-          success: false,
-          error: 'Cannot revise another client concept.',
-          code: 'FORBIDDEN',
-          retryable: false,
-          requestId,
-          errorDetail: { code: 'FORBIDDEN', message: 'Cannot revise another client concept.', retryable: false },
-        });
+        (ctx.session.role === 'client' &&
+          existing.clientId === ctx.session.id);
+
+      if (!authorized) {
+        throw new Error('IDEMPOTENCY_FORBIDDEN');
       }
-      if (existingCheck.clientApproved && existingCheck.staffApproved && !hasPlanningClearance(ctx.session)) {
-        return res.status(409).json({
-          success: false,
-          error: 'This concept proposal has already received dual approval. Create a new concept proposal for a fresh direction.',
-          code: 'CONCEPT_ALREADY_APPROVED',
-          retryable: false,
-          requestId,
-          errorDetail: {
-            code: 'CONCEPT_ALREADY_APPROVED',
-            message: 'This concept proposal has already received dual approval.',
+
+      if (!canAccessAttachedBooking(
+        db, existing.bookingId
+      )) {
+        throw new Error('IDEMPOTENCY_FORBIDDEN');
+      }
+
+      return existing;
+    };
+
+    const sendIdempotencyError = (err: unknown) => {
+      const forbidden =
+        err instanceof Error &&
+        err.message === 'IDEMPOTENCY_FORBIDDEN';
+
+      const code = forbidden
+        ? 'FORBIDDEN'
+        : 'IDEMPOTENCY_CONFLICT';
+
+      const message = forbidden
+        ? 'Not authorized to access this concept.'
+        : 'This request key cannot be reused. Start a new request.';
+
+      return res.status(forbidden ? 403 : 409).json({
+        success: false,
+        error: message,
+        code,
+        retryable: false,
+        requestId,
+        errorDetail: { code, message, retryable: false },
+      });
+    };
+
+    // Cached results must cross the same fresh authorization
+    // and transaction boundary as newly generated proposals.
+    const cacheOnlyRequest = Boolean(
+      scopedIdempotencyKey &&
+      preflightDb.conceptIdempotencyKeys?.[scopedIdempotencyKey]
+    );
+
+    if (!cacheOnlyRequest) {
+      // Pre-check concept revision & booking authorization BEFORE calling Gemini API
+      if (parsed.data.conceptId) {
+        const existingCheck = preflightDb.concepts.find((c) => c.id === parsed.data.conceptId);
+        if (!existingCheck) {
+          return res.status(404).json({
+            success: false,
+            error: 'The selected concept proposal could not be found. Create a new concept proposal instead.',
+            code: 'CONCEPT_NOT_FOUND',
             retryable: false,
-          },
-        });
-      }
-    }
-    if (parsed.data.bookingId) {
-      const bookingCheck = preflightDb.bookings.find((b) => b.id === parsed.data.bookingId);
-      if (!bookingCheck || !isAuthorizedForBooking(bookingCheck, ctx.session, preflightDb.vendors)) {
-        return res.status(403).json({
-          success: false,
-          error: 'Not authorized to attach a concept to this booking.',
-          code: 'FORBIDDEN',
-          retryable: false,
-          requestId,
-          errorDetail: {
+            requestId,
+            errorDetail: {
+              code: 'CONCEPT_NOT_FOUND',
+              message: 'The selected concept proposal could not be found.',
+              retryable: false,
+            },
+          });
+        }
+        const canRevise =
+          hasPlanningClearance(ctx.session) ||
+          (ctx.session.role === 'client' && existingCheck.clientId === ctx.session.id);
+        if (!canRevise) {
+          return res.status(403).json({
+            success: false,
+            error: 'Cannot revise another client concept.',
             code: 'FORBIDDEN',
-            message: 'Not authorized to attach a concept to this booking.',
             retryable: false,
-          },
-        });
+            requestId,
+            errorDetail: { code: 'FORBIDDEN', message: 'Cannot revise another client concept.', retryable: false },
+          });
+        }
+        if (!canAccessAttachedBooking(
+          preflightDb, existingCheck.bookingId
+        )) {
+          return sendIdempotencyError(
+            new Error('IDEMPOTENCY_FORBIDDEN')
+          );
+        }
+
+        if (
+          parsed.data.bookingId &&
+          parsed.data.bookingId !== existingCheck.bookingId
+        ) {
+          return res.status(409).json({
+            success: false,
+            code: 'CONCEPT_BOOKING_CONFLICT',
+            error: 'An existing concept cannot be reassigned by generating a revision.',
+            retryable: false,
+            requestId,
+          });
+        }
+
+        if (existingCheck.clientApproved && existingCheck.staffApproved && !hasPlanningClearance(ctx.session)) {
+          return res.status(409).json({
+            success: false,
+            error: 'This concept proposal has already received dual approval. Create a new concept proposal for a fresh direction.',
+            code: 'CONCEPT_ALREADY_APPROVED',
+            retryable: false,
+            requestId,
+            errorDetail: {
+              code: 'CONCEPT_ALREADY_APPROVED',
+              message: 'This concept proposal has already received dual approval.',
+              retryable: false,
+            },
+          });
+        }
+      }
+      if (parsed.data.bookingId) {
+        const bookingCheck = preflightDb.bookings.find((b) => b.id === parsed.data.bookingId);
+        if (!bookingCheck || !isAuthorizedForBooking(bookingCheck, ctx.session, preflightDb.vendors)) {
+          return res.status(403).json({
+            success: false,
+            error: 'Not authorized to attach a concept to this booking.',
+            code: 'FORBIDDEN',
+            retryable: false,
+            requestId,
+            errorDetail: {
+              code: 'FORBIDDEN',
+              message: 'Not authorized to attach a concept to this booking.',
+              retryable: false,
+            },
+          });
+        }
       }
     }
 
-    let proposal: Awaited<ReturnType<typeof generateConceptProposal>>;
+    const flightKey = scopedIdempotencyKey
+      ? JSON.stringify([callerScope, rawIdemKey])
+      : undefined;
+
+    let flight: ConceptGenerationFlight | undefined;
+
+    const releaseFlight = async () => {
+      if (!flightKey || !flight) return;
+      const completed = flight;
+      flight = undefined;
+      completed.participants -= 1;
+
+      if (
+        completed.participants === 0 &&
+        conceptGenerationFlights.get(flightKey) === completed
+      ) {
+        conceptGenerationFlights.delete(flightKey);
+        if (completed.durableLease) {
+          try {
+            await releaseConceptLease(completed.durableLease);
+          } catch {
+            logStructured('error',
+              'ai_concept_lease_cleanup_failed', { requestId });
+          }
+        }
+      }
+    };
+
+    let proposal:
+      Awaited<ReturnType<typeof generateConceptProposal>> | undefined;
+
     try {
-      proposal = await generateConceptProposal(parsed.data, {
-        requestId,
-        endpoint: '/api/ai/concept-studio',
-      });
+      if (cacheOnlyRequest) {
+        // Never invoke the provider for a known cached request.
+        // A missing or unauthorized durable result fails closed
+        // inside the final transaction.
+        proposal = undefined;
+      } else if (flightKey) {
+        const existingFlight =
+          conceptGenerationFlights.get(flightKey);
+
+        if (
+          existingFlight &&
+          existingFlight.fingerprint !== requestFingerprint
+        ) {
+          return sendIdempotencyError(
+            new Error('IDEMPOTENCY_CONFLICT'),
+          );
+        }
+
+        if (existingFlight) {
+          if (
+            existingFlight.participants >=
+            MAX_CONCEPT_FLIGHT_PARTICIPANTS
+          ) {
+            const message =
+              'Too many requests are waiting for this proposal. Please retry shortly.';
+
+            return res.status(503).json({
+              success: false,
+              error: message,
+              code: 'AI_SERVICE_BUSY',
+              retryable: true,
+              requestId,
+              errorDetail: {
+                code: 'AI_SERVICE_BUSY',
+                message,
+                retryable: true,
+              },
+            });
+          }
+
+          flight = existingFlight;
+          flight.participants += 1;
+
+          logStructured('info', 'ai_concept_singleflight_joined', {
+            requestId,
+          });
+        } else {
+          if (
+            conceptGenerationFlights.size >=
+            MAX_CONCEPT_GENERATION_FLIGHTS
+          ) {
+            const message =
+              'Concept Studio is busy. Please retry shortly.';
+
+            return res.status(503).json({
+              success: false,
+              error: message,
+              code: 'AI_SERVICE_BUSY',
+              retryable: true,
+              requestId,
+              errorDetail: {
+                code: 'AI_SERVICE_BUSY',
+                message,
+                retryable: true,
+              },
+            });
+          }
+
+          // Defer execution until the coordination entry is registered.
+          // This closes the local stale-preflight snapshot window.
+          const sharedProposal = Promise.resolve().then(async () => {
+            const {
+              db: latestDb,
+              ctx: latestCtx,
+            } = await getAuth(req);
+
+            if (
+              latestCtx.spoofAttemptDetected ||
+              latestCtx.accountStatus !== 'active' ||
+              latestCtx.session.id !== ctx.session.id ||
+              latestCtx.session.role !== ctx.session.role ||
+              latestCtx.authMethod !== ctx.authMethod ||
+              latestCtx.sessionJti !== ctx.sessionJti ||
+              latestCtx.mfaVerified !== ctx.mfaVerified ||
+              latestCtx.aal !== ctx.aal ||
+              JSON.stringify(latestCtx.session) !==
+                JSON.stringify(ctx.session)
+            ) {
+              throw new Error('AI_AUTHORIZATION_CHANGED');
+            }
+
+            // A previous operation may have committed after the
+            // original preflight snapshot was collected.
+            const durableRecord = scopedIdempotencyKey
+              ? latestDb.conceptIdempotencyKeys?.[
+                  scopedIdempotencyKey
+                ]
+              : undefined;
+
+            if (durableRecord) {
+              resolveCachedConcept(latestDb, durableRecord);
+
+              logStructured(
+                'info',
+                'ai_concept_fresh_snapshot_deduplicated',
+                { requestId },
+              );
+
+              // The final transaction independently resolves
+              // the durable result for every participant.
+              return undefined;
+            }
+
+            if (!scopedIdempotencyKey) {
+              throw new Error('AI_LEASE_ACQUISITION_FAILED');
+            }
+
+            const acquisition = await acquireConceptLease(
+  scopedIdempotencyKey,
+  requestFingerprint,
+
+async (db) => {
+const { ctx: freshCtx } = await getAuth(req, db);
+
+        if (
+          freshCtx.spoofAttemptDetected ||
+          freshCtx.session.id !== ctx.session.id ||
+          freshCtx.session.role !== ctx.session.role ||
+          freshCtx.accountStatus !== ctx.accountStatus ||
+          freshCtx.accountStatus !== 'active' ||
+          freshCtx.authMethod !== ctx.authMethod ||
+          freshCtx.sessionJti !== ctx.sessionJti ||
+          freshCtx.mfaVerified !== ctx.mfaVerified ||
+          freshCtx.aal !== ctx.aal ||
+          JSON.stringify(freshCtx.session) !==
+            JSON.stringify(ctx.session)
+        ) {
+          throw new Error('AI_AUTHORIZATION_CHANGED');
+        }
+
+  // Validate explicit booking access.
+  if (parsed.data.bookingId) {
+    const booking = db.bookings.find(
+      (b) => b.id === parsed.data.bookingId,
+    );
+
+    if (!booking || !isAuthorizedForBooking(
+      booking, ctx.session, db.vendors,
+    )) {
+      throw new Error('IDEMPOTENCY_FORBIDDEN');
+    }
+  }
+
+  // Preserve durable replay semantics.
+  const cachedRecord = scopedIdempotencyKey
+    ? db.conceptIdempotencyKeys?.[scopedIdempotencyKey]
+    : undefined;
+
+  if (cachedRecord) {
+    resolveCachedConcept(db, cachedRecord);
+    return;
+  }
+
+  // Revalidate revision permissions before generation.
+  if (parsed.data.conceptId) {
+    const existing = db.concepts.find(
+      (c) => c.id === parsed.data.conceptId,
+    );
+
+    if (!existing) {
+      throw new Error('CONCEPT_REVISION_MISSING');
+    }
+
+    const canRevise =
+      hasPlanningClearance(ctx.session) ||
+      (
+        ctx.session.role === 'client' &&
+        existing.clientId === ctx.session.id
+      );
+
+    if (!canRevise) {
+      throw new Error(
+        'FORBIDDEN:Cannot revise another client concept.',
+      );
+    }
+
+    if (
+      existing.clientApproved &&
+      existing.staffApproved &&
+      !hasPlanningClearance(ctx.session)
+    ) {
+      throw new Error(
+        'CONCEPT_LOCKED:This concept proposal has already received dual approval.',
+      );
+    }
+
+    if (!canAccessAttachedBooking(
+      db, existing.bookingId,
+    )) {
+      throw new Error('IDEMPOTENCY_FORBIDDEN');
+    }
+
+    if (
+      parsed.data.bookingId &&
+      parsed.data.bookingId !== existing.bookingId
+    ) {
+      throw new Error('CONCEPT_BOOKING_CONFLICT');
+    }
+  } else {
+    const safeBookingId = parsed.data.bookingId
+      ? parsed.data.bookingId
+      : ctx.session.role === 'client'
+        ? db.bookings.find(
+            (b) => b.clientId === ctx.session.id,
+          )?.id || 'unassigned-client-concept'
+        : 'public-concierge-preview';
+
+    if (!canAccessAttachedBooking(db, safeBookingId)) {
+      throw new Error('IDEMPOTENCY_FORBIDDEN');
+    }
+  }
+}
+,
+).catch((error: unknown) => {
+  if (error instanceof Error && (
+    [
+      'AI_AUTHORIZATION_CHANGED',
+      'IDEMPOTENCY_CONFLICT',
+      'IDEMPOTENCY_FORBIDDEN',
+      'CONCEPT_REVISION_MISSING',
+      'CONCEPT_BOOKING_CONFLICT',
+    ].includes(error.message) ||
+    error.message.startsWith('FORBIDDEN:') ||
+    error.message.startsWith('CONCEPT_LOCKED:')
+  )) {
+    throw error;
+  }
+  throw new Error('AI_LEASE_ACQUISITION_FAILED');
+});
+
+            if (acquisition.status === 'conflict') {
+              throw new Error('IDEMPOTENCY_CONFLICT');
+            }
+
+            if (acquisition.status === 'completed') {
+              return undefined;
+            }
+
+            if (acquisition.status !== 'acquired') {
+              throw new Error('AI_DURABLE_LEASE_BUSY');
+            }
+
+            const activeFlight =
+              conceptGenerationFlights.get(flightKey);
+
+            if (!activeFlight) {
+              await releaseConceptLease(acquisition.lease);
+              throw new Error('AI_LEASE_ACQUISITION_FAILED');
+            }
+
+            activeFlight.durableLease = acquisition.lease;
+
+            logStructured('info',
+              'ai_concept_durable_lease_acquired', { requestId });
+
+            return generateConceptProposal(parsed.data, {
+              requestId,
+              endpoint: '/api/ai/concept-studio',
+            });
+          });
+
+          flight = {
+            fingerprint: requestFingerprint,
+            proposal: sharedProposal,
+            participants: 1,
+          };
+
+          conceptGenerationFlights.set(flightKey, flight);
+        }
+
+        proposal = await flight.proposal;
+      } else {
+        // Anonymous or unkeyed requests remain independent.
+        proposal = await generateConceptProposal(parsed.data, {
+          requestId,
+          endpoint: '/api/ai/concept-studio',
+        });
+      }
     } catch (err) {
+      // A provider timeout does not prove that upstream
+      // generation has stopped. Retain durable ownership
+      // until its database-clock expiry to prevent immediate
+      // duplicate generation across backend replicas.
+      if (
+        flight?.durableLease &&
+        err instanceof Error &&
+        (
+          ('code' in err && err.code === 'AI_TIMEOUT') ||
+          err.message.startsWith('AI_TIMEOUT:')
+        )
+      ) {
+        flight.durableLease = undefined;
+
+        logStructured(
+          'warn',
+          'ai_concept_timeout_lease_retained',
+          { requestId },
+        );
+      }
+
+      await releaseFlight();
+
+      if (err instanceof Error) {
+        if (err.message === 'CONCEPT_REVISION_MISSING') {
+          return res.status(404).json({
+            success: false,
+            code: 'CONCEPT_NOT_FOUND',
+            error: 'The selected concept no longer exists.',
+            retryable: false,
+            requestId,
+          });
+        }
+
+        if (err.message === 'CONCEPT_BOOKING_CONFLICT') {
+          return res.status(409).json({
+            success: false,
+            code: 'CONCEPT_BOOKING_CONFLICT',
+            error: 'The concept booking association has changed.',
+            retryable: false,
+            requestId,
+          });
+        }
+
+        if (
+          err.message.startsWith('FORBIDDEN:') ||
+          err.message.startsWith('CONCEPT_LOCKED:')
+        ) {
+          return sendAiErrorResponse(
+            res, requestId, err,
+            'Unable to update concept proposal.',
+          );
+        }
+      }
+
+
+      if (err instanceof Error &&
+          ['AI_DURABLE_LEASE_BUSY',
+           'AI_LEASE_ACQUISITION_FAILED'].includes(err.message)) {
+        const busy = err.message === 'AI_DURABLE_LEASE_BUSY';
+        const code = busy ? 'AI_SERVICE_BUSY' : 'AI_PERSISTENCE_FAILED';
+        const message = busy
+          ? 'A matching proposal is being processed. Please retry shortly.'
+          : 'Proposal coordination is unavailable. Please retry.';
+
+        if (busy) res.setHeader('Retry-After', '3');
+
+        return res.status(busy ? 503 : 500).json({
+          success: false, code, error: message,
+          retryable: true, requestId,
+          errorDetail: { code, message, retryable: true },
+        });
+      }
+
+      if (
+        err instanceof Error &&
+        (
+          err.message === 'IDEMPOTENCY_CONFLICT' ||
+          err.message === 'IDEMPOTENCY_FORBIDDEN'
+        )
+      ) {
+        return sendIdempotencyError(err);
+      }
+
+      if (
+        err instanceof Error &&
+        err.message === 'AI_AUTHORIZATION_CHANGED'
+      ) {
+        const code = 'AI_AUTHORIZATION_CHANGED';
+        const message =
+          'Authorization changed. Sign in again before retrying.';
+
+        return res.status(403).json({
+          success: false,
+          error: message,
+          code,
+          retryable: false,
+          requestId,
+          errorDetail: {
+            code,
+            message,
+            retryable: false,
+          },
+        });
+      }
+
       return sendAiErrorResponse(
         res,
         requestId,
@@ -2540,19 +3116,86 @@ export function createApp(options: CreateAppOptions = {}) {
     }
 
     try {
-      const outcome = await withTransaction(async (db) => {
+      const outcome = await withClockedTransaction(async (db, clock) => {
+        // Revalidate the original credential against the locked
+        // database state before saving any generated concept.
+        const { ctx: freshCtx } = await getAuth(req, db);
+
+        if (
+          freshCtx.spoofAttemptDetected ||
+          freshCtx.session.id !== ctx.session.id ||
+          freshCtx.session.role !== ctx.session.role ||
+          freshCtx.accountStatus !== ctx.accountStatus ||
+          freshCtx.accountStatus !== 'active' ||
+          freshCtx.authMethod !== ctx.authMethod ||
+          freshCtx.sessionJti !== ctx.sessionJti ||
+          freshCtx.mfaVerified !== ctx.mfaVerified ||
+          freshCtx.aal !== ctx.aal ||
+          JSON.stringify(freshCtx.session) !==
+            JSON.stringify(ctx.session)
+        ) {
+          throw new Error('AI_AUTHORIZATION_CHANGED');
+        }
+
+
+        if (parsed.data.bookingId) {
+          const booking = db.bookings.find(
+            (b) => b.id === parsed.data.bookingId
+          );
+
+          if (!booking || !isAuthorizedForBooking(
+            booking, ctx.session, db.vendors
+          )) {
+            throw new Error('IDEMPOTENCY_FORBIDDEN');
+          }
+        }
+
         db.conceptIdempotencyKeys = db.conceptIdempotencyKeys || {};
         if (scopedIdempotencyKey && db.conceptIdempotencyKeys[scopedIdempotencyKey]) {
-          const existingId = db.conceptIdempotencyKeys[scopedIdempotencyKey];
-          const existingConcept = db.concepts.find((c) => c.id === existingId);
+          const existingConcept = resolveCachedConcept(
+            db,
+            db.conceptIdempotencyKeys[scopedIdempotencyKey]
+          );
           if (existingConcept) {
             return { concept: existingConcept, deduplicated: true };
           }
         }
 
+        // A cache-only operation may never create a new concept
+        // if its durable record disappears before finalization.
+        if (!proposal) {
+          throw new Error('IDEMPOTENCY_CONFLICT');
+        }
+
+        const ownedLease = flight?.durableLease;
+
+        if (scopedIdempotencyKey) {
+          if (!ownedLease) {
+            throw new Error('AI_CONCEPT_LEASE_LOST');
+          }
+
+          assertConceptLeaseOwnership(
+            db, ownedLease, scopedIdempotencyKey,
+            requestFingerprint, await clock(),
+          );
+        }
+
+        const completeOwnedLease = async () => {
+          if (scopedIdempotencyKey && ownedLease) {
+            completeConceptLease(
+              db, ownedLease, scopedIdempotencyKey,
+              requestFingerprint, await clock(),
+            );
+          }
+        };
+
         const existing = parsed.data.conceptId
           ? db.concepts.find((c) => c.id === parsed.data.conceptId)
           : undefined;
+
+        if (parsed.data.conceptId && !existing) {
+          throw new Error('CONCEPT_REVISION_MISSING');
+        }
 
         if (existing) {
           const canRevise =
@@ -2566,6 +3209,19 @@ export function createApp(options: CreateAppOptions = {}) {
               'CONCEPT_LOCKED:This concept proposal has already received dual approval. Create a new concept proposal instead.',
             );
           }
+          if (!canAccessAttachedBooking(
+            db, existing.bookingId
+          )) {
+            throw new Error('IDEMPOTENCY_FORBIDDEN');
+          }
+
+          if (
+            parsed.data.bookingId &&
+            parsed.data.bookingId !== existing.bookingId
+          ) {
+            throw new Error('CONCEPT_BOOKING_CONFLICT');
+          }
+
           const nextVer = existing.currentVersion + 1;
           existing.currentVersion = nextVer;
           existing.eventType = parsed.data.eventType;
@@ -2578,9 +3234,10 @@ export function createApp(options: CreateAppOptions = {}) {
             ...proposal,
           });
           if (scopedIdempotencyKey) {
-            db.conceptIdempotencyKeys[scopedIdempotencyKey] = existing.id;
+            db.conceptIdempotencyKeys[scopedIdempotencyKey] = encodeIdempotencyRecord(existing.id);
           }
           appendAudit(db, ctx.session, 'CONCEPT_REVISED', 'DesignConcept', existing.id, `Created revision v${nextVer}`);
+          await completeOwnedLease();
           return { concept: existing, deduplicated: false };
         }
 
@@ -2589,6 +3246,12 @@ export function createApp(options: CreateAppOptions = {}) {
           : ctx.session.role === 'client'
             ? db.bookings.find((b) => b.clientId === ctx.session.id)?.id || 'unassigned-client-concept'
             : 'public-concierge-preview';
+
+        if (!canAccessAttachedBooking(
+          db, safeBookingId
+        )) {
+          throw new Error('IDEMPOTENCY_FORBIDDEN');
+        }
 
         const nowIso = new Date().toISOString();
         const newConcept = {
@@ -2617,11 +3280,21 @@ export function createApp(options: CreateAppOptions = {}) {
         };
         db.concepts.unshift(newConcept);
         if (scopedIdempotencyKey) {
-          db.conceptIdempotencyKeys[scopedIdempotencyKey] = newConcept.id;
+          db.conceptIdempotencyKeys[scopedIdempotencyKey] = encodeIdempotencyRecord(newConcept.id);
         }
         appendAudit(db, ctx.session, 'CONCEPT_GENERATED', 'DesignConcept', newConcept.id, `Generated conceptual visualization (${proposal.themeName})`);
+        await completeOwnedLease();
         return { concept: newConcept, deduplicated: false };
       });
+
+      // A successful non-deduplicated transaction has
+      // atomically persisted the proposal and completed its lease.
+      // Never issue a redundant lease-release transaction.
+      if (!outcome.deduplicated && flight?.durableLease) {
+        flight.durableLease = undefined;
+      }
+
+      await releaseFlight();
 
       logStructured('info', 'ai_concept_persisted', {
         requestId,
@@ -2641,9 +3314,77 @@ export function createApp(options: CreateAppOptions = {}) {
         concept: outcome.concept,
       });
     } catch (err) {
+      await releaseFlight();
+
+      if (
+        err instanceof Error &&
+        err.message === 'AI_AUTHORIZATION_CHANGED'
+      ) {
+        const message =
+          'Your session or authorization changed during generation. Sign in again before continuing.';
+
+        return res.status(403).json({
+          success: false,
+          error: message,
+          code: 'AI_AUTHORIZATION_CHANGED',
+          retryable: false,
+          requestId,
+          errorDetail: {
+            code: 'AI_AUTHORIZATION_CHANGED',
+            message,
+            retryable: false,
+          },
+        });
+      }
+
+
+      if (err instanceof Error &&
+          ['IDEMPOTENCY_CONFLICT', 'IDEMPOTENCY_FORBIDDEN'].includes(err.message)) {
+        return sendIdempotencyError(err);
+      }
+
+      if (err instanceof Error &&
+          err.message === 'CONCEPT_BOOKING_CONFLICT') {
+        return res.status(409).json({
+          success: false,
+          code: 'CONCEPT_BOOKING_CONFLICT',
+          error: 'The concept booking association has changed.',
+          retryable: false,
+          requestId,
+        });
+      }
+
+      if (err instanceof Error &&
+          err.message === 'CONCEPT_REVISION_MISSING') {
+        const code = 'CONCEPT_NOT_FOUND';
+        const message = 'The selected concept no longer exists.';
+
+        return res.status(404).json({
+          success: false,
+          error: message,
+          code,
+          retryable: false,
+          requestId,
+          errorDetail: { code, message, retryable: false },
+        });
+      }
+
       if (err instanceof Error && (err.message.startsWith('FORBIDDEN:') || err.message.startsWith('CONCEPT_LOCKED:'))) {
         return sendAiErrorResponse(res, requestId, err, 'Unable to update concept proposal.');
       }
+      if (err instanceof Error &&
+          err.message === 'AI_CONCEPT_LEASE_LOST') {
+        const code = 'AI_SERVICE_BUSY';
+        const message = 'Proposal ownership changed. Please retry.';
+        res.setHeader('Retry-After', '3');
+
+        return res.status(503).json({
+          success: false, code, error: message,
+          retryable: true, requestId,
+          errorDetail: { code, message, retryable: true },
+        });
+      }
+
       observability.recordAiEvent('persistenceError');
       const dbErr = classifyDatabaseError(err);
       logStructured('error', 'ai_concept_persistence_failed', {
@@ -2661,6 +3402,8 @@ export function createApp(options: CreateAppOptions = {}) {
         requestId,
         errorDetail: { code: 'AI_PERSISTENCE_FAILED', message: safeMsg, retryable: true },
       });
+    } finally {
+      await releaseFlight();
     }
   });
 

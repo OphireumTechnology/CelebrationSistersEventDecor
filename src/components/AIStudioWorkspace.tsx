@@ -96,7 +96,16 @@ function formatRevisionTimestamp(iso?: string): string {
   });
 }
 
-export function AIStudioWorkspace({
+export function AIStudioWorkspace(props: AIStudioWorkspaceProps) {
+  return (
+    <IdentityScopedAIStudioWorkspace
+      key={JSON.stringify([props.currentUser.id, props.currentUser.role])}
+      {...props}
+    />
+  );
+}
+
+function IdentityScopedAIStudioWorkspace({
   currentUser,
   onOpenBookingPrefilled,
 }: AIStudioWorkspaceProps) {
@@ -127,7 +136,11 @@ export function AIStudioWorkspace({
     message: '',
   });
   const [lastFailedReviseFlag, setLastFailedReviseFlag] = useState<boolean>(false);
-  const [pendingIdempotencyKey, setPendingIdempotencyKey] = useState<string | null>(null);
+  const [pendingIdempotencyKey, setPendingIdempotencyKey] =
+    useState<{
+      key: string;
+      fingerprint: string;
+    } | null>(null);
   const [approvalSaving, setApprovalSaving] = useState(false);
 
   const [conceptForm, setConceptForm] = useState({
@@ -142,6 +155,8 @@ export function AIStudioWorkspace({
   const moodBoardRef = useRef<HTMLDivElement | null>(null);
   const conceptSubmitInFlightRef = useRef(false);
   const conciergeSubmitInFlightRef = useRef(false);
+  const conceptRequestSeqRef = useRef(0);
+  const conciergeRequestSeqRef = useRef(0);
 
   // Load persisted concepts ONLY when authenticated user identity changes (never on selectedConceptId change!)
   useEffect(() => {
@@ -173,11 +188,13 @@ export function AIStudioWorkspace({
         });
         if (!active) return;
 
-        if (res.status === 401) {
+        if (res.status === 401 || res.status === 403) {
+          setPendingIdempotencyKey(null);
+          setActiveRevisionIndex(0);
           setConceptFeedback({
             status: 'session_error',
-            code: 'AUTH_REQUIRED',
-            message: 'Your saved concepts require an active sign-in session. Please sign in again to access saved boards.',
+            code: res.status === 401 ? 'AUTH_REQUIRED' : 'FORBIDDEN',
+            message: 'Your saved concepts require an authorized sign-in session. Please sign in again to access saved boards.',
             retryable: false,
           });
           setConcepts([]);
@@ -187,6 +204,7 @@ export function AIStudioWorkspace({
 
         if (res.ok) {
           const data = (await res.json()) as { concepts?: DesignConceptRecord[] };
+          if (!active) return;
           const list = Array.isArray(data.concepts) ? data.concepts : [];
           setConcepts(list);
           setSelectedConceptId((prevSelected) => {
@@ -224,6 +242,7 @@ export function AIStudioWorkspace({
     if (!trimmed || conciergeLoading || conciergeSubmitInFlightRef.current) return;
 
     conciergeSubmitInFlightRef.current = true;
+    const requestSeq = ++conciergeRequestSeqRef.current;
     const isRetry = messageOverride !== undefined;
     const priorHistory = messages;
     const optimisticMessages: ConciergeMsg[] = isRetry
@@ -243,7 +262,7 @@ export function AIStudioWorkspace({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        timeoutMs: 65_000,
+        timeoutMs: 70_000,
         body: JSON.stringify({
           sessionId,
           clientName: currentUser.role !== 'guest' ? currentUser.name : undefined,
@@ -251,6 +270,8 @@ export function AIStudioWorkspace({
           history: priorHistory,
         }),
       });
+
+      if (requestSeq !== conciergeRequestSeqRef.current) return;
 
       if (!res.ok) {
         const parsedErr = await parseApiErrorResponse(
@@ -336,6 +357,20 @@ export function AIStudioWorkspace({
   const handleGenerateConcept = async (reviseExisting: boolean, isRetry = false) => {
     if (conceptLoading || conceptSubmitInFlightRef.current) return;
 
+    if (
+      reviseExisting &&
+      (!selectedConcept || currentUser.role === 'guest')
+    ) {
+      setPendingIdempotencyKey(null);
+      setConceptFeedback({
+        status: 'validation_error',
+        code: 'CONCEPT_REQUIRED',
+        message: 'Select an authorized concept before creating a revision.',
+        retryable: false,
+      });
+      return;
+    }
+
     // Client-side pre-validation so invalid entries produce crisp, immediate feedback without losing inputs
     const trimmedVenue = conceptForm.venueStyle.trim();
     const trimmedPalette = conceptForm.preferredPalette.trim();
@@ -370,11 +405,36 @@ export function AIStudioWorkspace({
         : 'Composing your custom luxury concept mood board...',
     });
 
+    const requestBody = JSON.stringify({
+      conceptId: reviseExisting && selectedConcept
+        ? selectedConcept.id
+        : undefined,
+      eventType: conceptForm.eventType,
+      guestCount: guestCountNum,
+      venueStyle: trimmedVenue,
+      preferredPalette: trimmedPalette,
+      visionDescription: trimmedVision,
+    });
+
+    const fingerprint = JSON.stringify([
+      currentUser.id,
+      currentUser.role,
+      reviseExisting,
+      requestBody,
+    ]);
+
+    const requestSeq = ++conceptRequestSeqRef.current;
+
     const idempotencyKey =
-      isRetry && pendingIdempotencyKey
-        ? pendingIdempotencyKey
+      isRetry &&
+      pendingIdempotencyKey?.fingerprint === fingerprint
+        ? pendingIdempotencyKey.key
         : generateIdempotencyKey(reviseExisting ? 'cnc-rev' : 'cnc-new');
-    setPendingIdempotencyKey(idempotencyKey);
+
+    setPendingIdempotencyKey({
+      key: idempotencyKey,
+      fingerprint,
+    });
 
     try {
       const res = await apiFetch('/api/ai/concept-studio', {
@@ -384,22 +444,52 @@ export function AIStudioWorkspace({
           'Idempotency-Key': idempotencyKey,
         },
         credentials: 'include',
-        timeoutMs: 70_000,
-        body: JSON.stringify({
-          conceptId: reviseExisting && selectedConcept ? selectedConcept.id : undefined,
-          eventType: conceptForm.eventType,
-          guestCount: guestCountNum,
-          venueStyle: trimmedVenue,
-          preferredPalette: trimmedPalette,
-          visionDescription: trimmedVision,
-        }),
+        timeoutMs: 75_000,
+        body: requestBody,
       });
+
+      if (requestSeq !== conceptRequestSeqRef.current) return;
 
       if (!res.ok) {
         const parsedErr = await parseApiErrorResponse(
           res,
           'Unable to generate concept proposal right now. Your inputs are preserved — please try again.',
         );
+        if (requestSeq !== conceptRequestSeqRef.current) return;
+        if (parsedErr.status === 401 || parsedErr.status === 403) {
+          setConcepts([]);
+          setSelectedConceptId('');
+          setActiveRevisionIndex(0);
+          setPendingIdempotencyKey(null);
+          setConceptFeedback({
+            status: 'session_error',
+            code: parsedErr.code,
+            message: parsedErr.message,
+            retryable: false,
+            requestId: parsedErr.requestId,
+          });
+          return;
+        }
+        if (parsedErr.code === 'IDEMPOTENCY_CONFLICT') {
+          setPendingIdempotencyKey(null);
+          setConceptFeedback({
+            status: 'validation_error',
+            code: parsedErr.code,
+            message:
+              'The previous request key is no longer valid. Your inputs are preserved. Generate a new proposal or revision to continue.',
+            retryable: false,
+            requestId: parsedErr.requestId,
+          });
+          return;
+        }
+        // On provider/request timeout, the backend intentionally retains the timed-out
+        // idempotency lease to block automatic duplicate replays across replicas.
+        // Clearing pendingIdempotencyKey allows an explicit manual Retry click to issue
+        // a fresh Idempotency-Key instead of looping on 503 AI_SERVICE_BUSY.
+        if (parsedErr.code === 'AI_TIMEOUT' || parsedErr.code === 'REQUEST_TIMEOUT') {
+          setPendingIdempotencyKey(null);
+        }
+
         const status: StudioStatus =
           parsedErr.status === 400
             ? 'validation_error'
@@ -1213,6 +1303,19 @@ export function AIStudioWorkspace({
                           {activeRevision.floralConcept}
                         </p>
                       </div>
+                      {activeRevision.centerpieceDesign && (
+                        <div className="p-4 rounded-xl border border-[var(--cs-border)]">
+                          <p className="text-xs font-semibold uppercase tracking-wider text-[var(--cs-purple)] mb-1.5">
+                            Centerpiece Design
+                          </p>
+                          <p
+                            data-testid="concept-centerpiece-design"
+                            className="text-sm text-[var(--cs-charcoal-light)] leading-relaxed"
+                          >
+                            {activeRevision.centerpieceDesign}
+                          </p>
+                        </div>
+                      )}
                       <div className="p-4 rounded-xl border border-[var(--cs-border)]">
                         <p className="text-xs font-semibold uppercase tracking-wider text-[var(--cs-purple)] mb-1.5">
                           Table Arrangement
@@ -1246,6 +1349,32 @@ export function AIStudioWorkspace({
                           {activeRevision.lightingPlan}
                         </p>
                       </div>
+                      {activeRevision.venueStyling && (
+                        <div className="p-4 rounded-xl border border-[var(--cs-border)]">
+                          <p className="text-xs font-semibold uppercase tracking-wider text-[var(--cs-purple)] mb-1.5">
+                            Venue Styling
+                          </p>
+                          <p
+                            data-testid="concept-venue-styling"
+                            className="text-sm text-[var(--cs-charcoal-light)] leading-relaxed"
+                          >
+                            {activeRevision.venueStyling}
+                          </p>
+                        </div>
+                      )}
+                      {activeRevision.guestExperience && (
+                        <div className="p-4 rounded-xl border border-[var(--cs-border)] sm:col-span-2">
+                          <p className="text-xs font-semibold uppercase tracking-wider text-[var(--cs-purple)] mb-1.5">
+                            Proposed Guest Experience
+                          </p>
+                          <p
+                            data-testid="concept-guest-experience"
+                            className="text-sm text-[var(--cs-charcoal-light)] leading-relaxed"
+                          >
+                            {activeRevision.guestExperience}
+                          </p>
+                        </div>
+                      )}
                     </div>
 
                     {/* Recommended Service Divisions */}

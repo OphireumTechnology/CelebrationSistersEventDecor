@@ -42,12 +42,18 @@ const WEDDING_PROPOSAL = {
   ],
   floralConcept:
     'Asymmetrical clouds of ivory garden roses, white hydrangeas, and trailing greenery elevated on 36-inch brushed gold risers paired with glowing glass hurricane lanterns.',
+  centerpieceDesign:
+    'Elevated gold candelabras alternating with low crystal compote bowls of ivory garden roses and floating taper candles for clear guest conversation.',
   tableArrangement:
     'Alternating 72-inch ivory silk rounds and grand estate tables dressed with pleated royal purple silk runners, champagne chargers, and layered taper candles.',
   stageBackdrop:
     'Curved ivory architectural plaster installation framed in champagne gold with lush ground-level floral meadows anchoring the sweetheart table.',
   lightingPlan:
     'Warm 2700K amber pin-spots focused on every centerpiece paired with romantic royal-purple architectural wall grazing after dinner service.',
+  venueStyling:
+    'Floor-to-ceiling sheer ivory column drapery paired with royal-purple velvet cocktail lounges and monogrammed mirrored welcome signage.',
+  guestExperience:
+    'Live string quartet champagne terrace welcome, tactile wax-sealed seating cards, and an interactive late-evening espresso and portrait lounge.',
   recommendedDivisions: [
     'Wedding Planning and Design',
     'Luxury Event Decoration and Styling',
@@ -67,12 +73,18 @@ const BABY_SHOWER_PROPOSAL = {
   ],
   floralConcept:
     'Clustered ceramic bud vases filled with white ranunculus, garden chamomile, and olive sprigs running down each conservatory table.',
+  centerpieceDesign:
+    'Low botanical bud vase clusters interspersed with woven rattan trays and petite ceramic vessels keeping brunch tables airy and conversational.',
   tableArrangement:
     'Three intimate rectangular garden tables seating 15 guests each with scalloped porcelain plates, sage gauze runners, and woven rattan chargers.',
   stageBackdrop:
     'Arched cream welcome wall wrapped in an organic matte-cream and sage balloon sculpture framing the pastry display and portrait corner.',
   lightingPlan:
     'Filtered natural greenhouse daylight complemented by soft warm-white bistro accents and gentle floral uplighting.',
+  venueStyling:
+    'Organic balloon garland framing the conservatory entrance, linen-draped gift display alcove, and soft cream lounge seating for expectant parents.',
+  guestExperience:
+    'Custom herbal tea and mocktail bar, keepsake floral bouquet wrapping station, and handwritten nursery wish cards at every place setting.',
   recommendedDivisions: [
     'Baby Showers and Gender Reveals',
     'Balloon Garlands and Custom Installations',
@@ -91,12 +103,18 @@ const CORPORATE_PROPOSAL = {
   ],
   floralConcept:
     'Structured white phalaenopsis orchids arranged in brushed brass low architectural vessels preserving uninterrupted stage sightlines.',
+  centerpieceDesign:
+    'Low geometric brushed-brass troughs filled with white phalaenopsis orchids and frosted LED votives engineered to stay below keynote sightlines.',
   tableArrangement:
     'Thirty 72-inch executive banquet rounds seating 10 guests each with pressed alabaster linens, plum satin napkins, and illuminated table numbers.',
   stageBackdrop:
     'Modular fluted plum and brass awards stage flanked by twin sponsor projection screens and an illuminated central keynote lectern.',
   lightingPlan:
     'Broadcast-ready 3200K keynote front wash paired with DMX-programmed award reveal cues and subtle perimeter wall grazing.',
+  venueStyling:
+    'Tailored charcoal and plum architectural entry tunnel with illuminated sponsor step-and-repeat branding and velvet executive networking lounges.',
+  guestExperience:
+    'Seamless digital badge hospitality welcome, curated craft cocktail networking reception, and an editorial 360-degree awards portrait studio.',
   recommendedDivisions: [
     'Corporate Events',
     'Event Lighting and Production',
@@ -145,7 +163,7 @@ async function main() {
   process.env.ALLOW_DEMO_AUTH = 'true';
   process.env.EMAIL_LIVE_DELIVERY_ENABLED = 'false';
 
-  let forcedErrorMode: 'none' | '503' = 'none';
+  let forcedErrorMode: 'none' | '503' | 'timeout' = 'none';
   let forcedDelayMs = 150;
 
   setGeminiSleepForTests(async () => {});
@@ -157,6 +175,9 @@ async function main() {
       throw Object.assign(new Error('503 UNAVAILABLE: This model is currently experiencing high demand.'), {
         status: 503,
       });
+    }
+    if (forcedErrorMode === 'timeout') {
+      throw new Error('AI_TIMEOUT:Concept Studio proposal exceeded 45000ms limit.');
     }
     const rawContents = JSON.stringify(params.contents || '');
     if (Array.isArray(params.contents)) {
@@ -220,7 +241,7 @@ async function main() {
     page.on('console', (msg) => {
       if (msg.type() === 'error') {
         const text = msg.text();
-        if (!/Failed to load resource: the server responded with a status of (401|403|503)/.test(text)) {
+        if (!/Failed to load resource: the server responded with a status of (401|403|503|504)/.test(text)) {
           consoleErrors.push(text);
         }
       }
@@ -264,9 +285,12 @@ async function main() {
     assert.match((await page.getByTestId('concept-vision-summary').textContent()) || '', /150 guests/i);
     assert.match((await page.getByTestId('concept-color-palette').textContent()) || '', /#4B2087/);
     assert.match((await page.getByTestId('concept-floral-concept').textContent()) || '', /ivory garden roses/i);
+    assert.match((await page.getByTestId('concept-centerpiece-design').textContent()) || '', /gold candelabras/i);
     assert.match((await page.getByTestId('concept-table-arrangement').textContent()) || '', /72-inch ivory silk/i);
     assert.match((await page.getByTestId('concept-stage-backdrop').textContent()) || '', /plaster installation/i);
     assert.match((await page.getByTestId('concept-lighting-plan').textContent()) || '', /2700K amber pin-spots/i);
+    assert.match((await page.getByTestId('concept-venue-styling').textContent()) || '', /sheer ivory column drapery/i);
+    assert.match((await page.getByTestId('concept-guest-experience').textContent()) || '', /string quartet/i);
     assert.match(
       (await page.getByTestId('concept-recommended-divisions').textContent()) || '',
       /Wedding Planning and Design/,
@@ -390,7 +414,12 @@ async function main() {
 
     // Restore provider & click Retry
     forcedErrorMode = 'none';
+    const retry503RespPromise = page.waitForResponse(
+      (r) => r.url().includes('/api/ai/concept-studio') && r.request().method() === 'POST',
+    );
     await retryBtn.click();
+    const retry503Resp = await retry503RespPromise;
+    assert.equal(retry503Resp.status(), 200);
     await page.getByText(CORPORATE_PROPOSAL.themeName).first().waitFor({ state: 'visible', timeout: 8000 });
     record(
       'AI-BA-05',
@@ -398,6 +427,36 @@ async function main() {
       '503 provider overload shows actionable Retry alert, preserves user inputs, and recovers on Retry click',
       'Alert displayed with correlation Ref + Retry button; inputs preserved and retry succeeded',
       shot4,
+    );
+
+    // AI-BA-05B: Authenticated 504 AI_TIMEOUT clears retained-lease key on manual Retry and recovers cleanly
+    forcedErrorMode = 'timeout';
+    const timeoutPreservedVision =
+      'Timeout recovery check with luminous brass sculptural centerpieces and dramatic drapery.';
+    await page.locator('#concept-vision-description').fill(timeoutPreservedVision);
+    await page.getByRole('button', { name: /Create New Concept Proposal/i }).click();
+    await page.getByRole('alert').waitFor({ state: 'visible', timeout: 8000 });
+    assert.match((await page.getByRole('alert').textContent()) || '', /AI_TIMEOUT|longer than expected|response window/i);
+    assert.equal(await page.locator('#concept-vision-description').inputValue(), timeoutPreservedVision);
+    const timeoutRetryBtn = page.getByRole('button', { name: /Retry Proposal Generation/i });
+    assert.equal(await timeoutRetryBtn.isVisible(), true);
+
+    forcedErrorMode = 'none';
+    const timeoutRetryResponsePromise = page.waitForResponse(
+      (r) => r.url().includes('/api/ai/concept-studio') && r.request().method() === 'POST',
+    );
+    await timeoutRetryBtn.click();
+    const timeoutRetryResp = await timeoutRetryResponsePromise;
+    assert.equal(
+      timeoutRetryResp.status(),
+      200,
+      'Authenticated manual Retry after AI_TIMEOUT must recover with HTTP 200 instead of 503 AI_SERVICE_BUSY',
+    );
+    record(
+      'AI-BA-05B',
+      'Desktop 1440x900',
+      'Authenticated 504 AI_TIMEOUT preserves inputs and recovers with HTTP 200 on manual Retry (no lease self-lockout)',
+      'AI_TIMEOUT alert shown; fresh Idempotency-Key issued on Retry; HTTP 200 proposal rendered',
     );
 
     // AI-BA-06: Customer B (Elena) isolation check in real browser
@@ -479,6 +538,9 @@ async function main() {
     );
     assert.ok(overflowMobileConcept <= 2, `Mobile Concept Studio overflow: ${overflowMobileConcept}px`);
     assert.equal(await mPage.getByTestId('concept-theme-name').textContent(), WEDDING_PROPOSAL.themeName);
+    assert.equal(await mPage.getByTestId('concept-centerpiece-design').isVisible(), true);
+    assert.equal(await mPage.getByTestId('concept-venue-styling').isVisible(), true);
+    assert.equal(await mPage.getByTestId('concept-guest-experience').isVisible(), true);
     assert.equal(await mPage.getByTestId('concept-recommended-divisions').isVisible(), true);
 
     const shot6 = path.join(screenshotDir, 'mobile-wedding-moodboard.png');

@@ -60,6 +60,12 @@ export interface DatabaseSchema {
   bookingIdempotencyKeys: Record<string, string>;
   consultationIdempotencyKeys: Record<string, string>;
   conceptIdempotencyKeys?: Record<string, string>;
+  conceptGenerationLeases?: Record<string, {
+    fingerprint: string;
+    ownerToken: string;
+    acquiredAt: number;
+    expiresAt: number;
+  }>;
 }
 
 function getDbPath(): string {
@@ -334,9 +340,12 @@ function buildInitialSeed(): DatabaseSchema {
               { name: 'Warm Charcoal', hex: '#292929', usage: 'Calligraphy typography & architectural framing' },
             ],
             floralConcept: 'Asymmetric cloud-like compositions of white hydrangeas, Sahara ivory roses, and silver-dollar eucalyptus elevated on 36-inch brushed gold plinths.',
+            centerpieceDesign: 'Tiered brushed-gold candelabras paired with low compote bowls of ivory garden roses and floating taper candles in hurricane cylinders to preserve unobstructed guest sightlines.',
             tableArrangement: 'Alternating 72-inch ivory silk rounds and long estate banquet tables dressed with pleated purple silk runners and crystal stemware.',
             stageBackdrop: 'Custom ivory curved plaster wall with gold framing flanking the sweetheart table and subtle floral meadow ground clusters.',
             lightingPlan: 'Warm 2700K amber pin-spots focused on every floral tower paired with soft royal-purple architectural wall grazing after dinner.',
+            venueStyling: 'Floor-to-ceiling sheer ivory estate drapery framing the ballroom columns, royal-purple velvet cocktail vignettes, and a custom monogrammed welcome gallery.',
+            guestExperience: 'Champagne greeting on the terrace accompanied by live strings, tactile wax-sealed seating cards, and an interactive late-evening espresso and editorial portrait lounge.',
             recommendedDivisions: ['Wedding Planning and Design', 'Luxury Event Decoration and Styling', 'Event Lighting and Production'],
           },
         ],
@@ -637,6 +646,7 @@ function buildInitialSeed(): DatabaseSchema {
     bookingIdempotencyKeys: {},
     consultationIdempotencyKeys: {},
     conceptIdempotencyKeys: {},
+    conceptGenerationLeases: {},
   };
 }
 
@@ -657,6 +667,7 @@ function normalizeSchema(parsed: DatabaseSchema): DatabaseSchema {
   parsed.bookingIdempotencyKeys = parsed.bookingIdempotencyKeys || {};
   parsed.consultationIdempotencyKeys = parsed.consultationIdempotencyKeys || {};
   parsed.conceptIdempotencyKeys = parsed.conceptIdempotencyKeys || {};
+  parsed.conceptGenerationLeases = parsed.conceptGenerationLeases || {};
   for (const b of parsed.bookings || []) {
     if (!b.architecturalStage) {
       b.architecturalStage = LEGACY_TO_ARCH_STATUS[b.status] ?? 'INQUIRY';
@@ -716,6 +727,47 @@ export async function withTransaction<T>(fn: (db: DatabaseSchema) => Promise<T> 
   } finally {
     release();
   }
+}
+
+/**
+ * Execute a transaction with an authoritative time source.
+ * PostgreSQL uses the active locked transaction's database clock.
+ * The local JSON adapter uses the local application clock.
+ */
+export async function withClockedTransaction<T>(
+  fn: (
+    db: DatabaseSchema,
+    clock: () => Promise<number>,
+  ) => Promise<T> | T,
+): Promise<T> {
+  assertPersistenceReady();
+
+  if (getPersistenceAdapterMode() === 'postgres') {
+    let transactionClock:
+      (() => Promise<number>) | undefined;
+
+    return runPostgresTransaction(
+      buildInitialSeed,
+      normalizeSchema,
+      async (db) => {
+        if (!transactionClock) {
+          throw new Error('DATABASE_CLOCK_UNAVAILABLE');
+        }
+
+        return fn(db, transactionClock);
+      },
+      {
+        useDatabaseClock: true,
+        receiveTransactionClock(clock) {
+          transactionClock = clock;
+        },
+      },
+    );
+  }
+
+  return withTransaction((db) =>
+    fn(db, async () => Date.now()),
+  );
 }
 
 export function sanitizeUserForClient(
