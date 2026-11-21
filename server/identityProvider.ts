@@ -34,6 +34,7 @@ export interface VerifyProviderTokenOptions {
   jwtSecret?: string;
   keyResolver?: TokenKeyResolver;
   useJwksOnly?: boolean;
+  confirmProviderEmail?: (token: string, subject: string) => Promise<boolean>;
 }
 
 const jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
@@ -121,7 +122,7 @@ export async function verifyProviderAccessToken(
     ? ''
     : (options.jwtSecret ?? (explicitOverrideToDifferentProject ? '' : process.env.SUPABASE_JWT_SECRET ?? '')).trim();
 
-  if (!options.keyResolver && !rawUrl && !rawSecret) {
+  if ((options.useJwksOnly && !rawUrl) || (!options.keyResolver && !rawUrl && !rawSecret)) {
     return null;
   }
 
@@ -183,17 +184,13 @@ export async function verifyProviderAccessToken(
     const appMeta = (payload.app_metadata && typeof payload.app_metadata === 'object'
       ? payload.app_metadata
       : {}) as Record<string, unknown>;
-    const userMeta = (payload.user_metadata && typeof payload.user_metadata === 'object'
-      ? payload.user_metadata
-      : {}) as Record<string, unknown>;
-
-    // Email verification must come from standard JWT / Supabase confirmation claims
+    // Standard Supabase JWTs may omit email confirmation. Use the provider's
+    // authenticated User record as fallback and never trust user_metadata.
     const emailVerified =
       payload.email_verified === true ||
-      Boolean(appMeta.email_verified === true) ||
-      Boolean(typeof payload.email_confirmed_at === 'string' && payload.email_confirmed_at.length > 0) ||
-      // Fallback: if neither email_verified nor user_metadata spoofing overrides exist, check confirmation timestamp
-      (typeof userMeta.email_verified === 'boolean' && payload.email_verified === true);
+      appMeta.email_verified === true ||
+      (typeof payload.email_confirmed_at === 'string' && payload.email_confirmed_at.length > 0) ||
+      (await options.confirmProviderEmail?.(token, payload.sub)) === true;
 
     const aal = payload.aal === 'aal2' ? 'aal2' : 'aal1';
     const sessionId = typeof payload.session_id === 'string' ? payload.session_id : undefined;

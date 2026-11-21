@@ -38,6 +38,7 @@ interface PortalsWorkspaceProps {
   mfaRequired: boolean;
   mfaEnrolled?: boolean;
   externalStagingMode?: boolean;
+  providerMfaMode?: boolean;
   hasPendingExternalFactor?: boolean;
   authProviderReady?: boolean;
   personas: UserSession[];
@@ -81,6 +82,7 @@ export function PortalsWorkspace({
   mfaRequired,
   mfaEnrolled = false,
   externalStagingMode = false,
+  providerMfaMode = false,
   hasPendingExternalFactor = false,
   authProviderReady = false,
   personas,
@@ -92,6 +94,7 @@ export function PortalsWorkspace({
   onRecoverMfa,
   onLogout,
 }: PortalsWorkspaceProps) {
+  const genuineMfaMode = externalStagingMode || providerMfaMode;
   const [bookings, setBookings] = useState<BookingRecord[]>([]);
   const [selectedBookingId, setSelectedBookingId] = useState<string>('');
   const [concepts, setConcepts] = useState<DesignConceptRecord[]>([]);
@@ -264,7 +267,7 @@ export function PortalsWorkspace({
     setActionMessage(null);
     setAuthSubmitting(true);
     try {
-      const result = externalStagingMode
+      const result = genuineMfaMode
         ? await onEnrollTotp({ replaceUnverified })
         : await onEnrollTotp();
       if (!result.ok || !result.secret || !result.otpauthUri) {
@@ -281,7 +284,7 @@ export function PortalsWorkspace({
       setMfaMode('enroll');
       setActionMessage({
         type: 'ok',
-        text: externalStagingMode
+        text: genuineMfaMode
           ? 'Authenticator QR code generated. Scan it in your authenticator app, then enter the 6-digit verification code below to complete AAL2 elevation.'
           : 'TOTP secret generated. Save your single-use recovery codes, then verify with a 6-digit authenticator code.',
       });
@@ -726,7 +729,7 @@ export function PortalsWorkspace({
               </p>
             </div>
 
-            {mfaMode === 'recovery' && !externalStagingMode ? (
+            {mfaMode === 'recovery' && !genuineMfaMode ? (
               <form onSubmit={handleRecoverMfaSubmit} className="space-y-4">
                 <input
                   type="text"
@@ -753,7 +756,7 @@ export function PortalsWorkspace({
               </form>
             ) : (
               <form onSubmit={handleMfaSubmit} className="space-y-4">
-                {externalStagingMode && hasPendingExternalFactor && !totpEnrollment && (
+                {genuineMfaMode && hasPendingExternalFactor && !totpEnrollment && (
                   <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-md text-xs text-amber-900 space-y-2 text-left">
                     <p className="font-semibold">Pending Authenticator Enrollment Detected</p>
                     <p className="leading-relaxed">
@@ -825,15 +828,15 @@ export function PortalsWorkspace({
                     <button
                       type="button"
                       disabled={authSubmitting}
-                      onClick={() => handleEnrollTotpClick(externalStagingMode && hasPendingExternalFactor)}
+                      onClick={() => handleEnrollTotpClick(genuineMfaMode && hasPendingExternalFactor)}
                       className="text-[var(--cs-purple)] hover:underline font-medium cursor-pointer"
                     >
-                      {externalStagingMode && hasPendingExternalFactor
+                      {genuineMfaMode && hasPendingExternalFactor
                         ? 'Restart Authenticator Setup (TOTP)'
                         : 'Enroll Authenticator App (TOTP)'}
                     </button>
                   )}
-                  {onRecoverMfa && !externalStagingMode && (
+                  {onRecoverMfa && !genuineMfaMode && (
                     <button
                       type="button"
                       onClick={() => setMfaMode('recovery')}

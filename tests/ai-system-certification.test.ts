@@ -19,6 +19,7 @@ import { verifySessionToken, signSessionToken } from '../server/auth.ts';
 import {
   classifyGeminiProviderError,
   DEFAULT_GEMINI_MODEL,
+  MAX_GEMINI_TIMEOUT_MS,
   getGeminiConfigStatus,
   normalizeGeminiModelName,
   setGeminiExecutorForTests,
@@ -26,6 +27,7 @@ import {
 } from '../server/gemini.ts';
 import { observability } from '../server/observability.ts';
 import { setInjectedPgPoolForTests, type PgPoolLike } from '../server/repositories/postgresRepository.ts';
+import { AI_RESPONSE_TIMEOUT_MS } from '../src/lib/aiTimeouts.mjs';
 import { apiFetch, parseApiErrorResponse } from '../src/lib/apiClient.ts';
 
 async function startIsolatedServer() {
@@ -199,21 +201,32 @@ test('Gemini model normalization honors GEMINI_MODEL overrides, strips models/ p
 
   const prevModel = process.env.GEMINI_MODEL;
   const prevTimeout = process.env.GEMINI_TIMEOUT_MS;
+  const prevConciergeTimeout = process.env.GEMINI_CONCIERGE_TIMEOUT_MS;
+  const prevConceptTimeout = process.env.GEMINI_CONCEPT_TIMEOUT_MS;
   const prevRetries = process.env.GEMINI_MAX_RETRIES;
   try {
     process.env.GEMINI_MODEL = 'gemini-3.8-flash';
     process.env.GEMINI_TIMEOUT_MS = '55000';
+    process.env.GEMINI_CONCIERGE_TIMEOUT_MS = String(MAX_GEMINI_TIMEOUT_MS);
+    process.env.GEMINI_CONCEPT_TIMEOUT_MS = String(MAX_GEMINI_TIMEOUT_MS + 1);
     process.env.GEMINI_MAX_RETRIES = '3';
     const status = getGeminiConfigStatus();
     assert.equal(status.model, 'gemini-3.8-flash');
     assert.equal(status.modelSource, 'env');
     assert.equal(status.timeoutMs, 55_000);
+    assert.equal(status.conciergeTimeoutMs, MAX_GEMINI_TIMEOUT_MS);
+    assert.equal(status.conceptTimeoutMs, status.timeoutMs);
+    assert.ok(AI_RESPONSE_TIMEOUT_MS >= status.conciergeTimeoutMs + 15_000);
     assert.equal(status.maxRetries, 3);
   } finally {
     if (prevModel === undefined) delete process.env.GEMINI_MODEL;
     else process.env.GEMINI_MODEL = prevModel;
     if (prevTimeout === undefined) delete process.env.GEMINI_TIMEOUT_MS;
     else process.env.GEMINI_TIMEOUT_MS = prevTimeout;
+    if (prevConciergeTimeout === undefined) delete process.env.GEMINI_CONCIERGE_TIMEOUT_MS;
+    else process.env.GEMINI_CONCIERGE_TIMEOUT_MS = prevConciergeTimeout;
+    if (prevConceptTimeout === undefined) delete process.env.GEMINI_CONCEPT_TIMEOUT_MS;
+    else process.env.GEMINI_CONCEPT_TIMEOUT_MS = prevConceptTimeout;
     if (prevRetries === undefined) delete process.env.GEMINI_MAX_RETRIES;
     else process.env.GEMINI_MAX_RETRIES = prevRetries;
   }

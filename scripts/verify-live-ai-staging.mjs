@@ -14,16 +14,20 @@
  *  - Unauthenticated /api/concepts isolation boundary (HTTP 401)
  *
  * Usage:
- *   node scripts/verify-live-ai-staging.mjs --url https://celebrationsisterseventdecor-staging-staging.up.railway.app --output live-ai-staging-report.json
+ *   node scripts/verify-live-ai-staging.mjs --url https://isolated-staging.example.com --output live-ai-staging-report.json
  */
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { AI_RESPONSE_TIMEOUT_MS } from '../src/lib/aiTimeouts.mjs';
 
-const DEFAULT_STAGING_URL =
-  process.env.STAGING_URL ||
-  'https://celebrationsisterseventdecor-staging-staging.up.railway.app';
 const PUBLIC_ORIGIN = 'https://celebrationsistersdecor.com';
+const LIVE_HOSTS = new Set([
+  new URL(PUBLIC_ORIGIN).hostname,
+  'www.celebrationsistersdecor.com',
+  'celebrationsisterseventdecor-production.up.railway.app',
+  'celebrationsisterseventdecor-staging-staging.up.railway.app',
+]);
 
 const WEDDING_CONTAMINATION_TERMS = [
   'bridal bouquet',
@@ -34,7 +38,7 @@ const WEDDING_CONTAMINATION_TERMS = [
 ];
 
 function parseArgs(argv) {
-  const args = { url: DEFAULT_STAGING_URL, output: '' };
+  const args = { url: process.env.STAGING_URL?.trim() || '', output: '' };
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === '--url' && argv[i + 1]) {
       args.url = argv[i + 1];
@@ -47,10 +51,11 @@ function parseArgs(argv) {
   return args;
 }
 
-async function timedFetchJson(url, options = {}, timeoutMs = 75_000) {
+async function timedFetchJson(url, options = {}, timeoutMs = AI_RESPONSE_TIMEOUT_MS) {
   const startedAt = Date.now();
   const res = await fetch(url, {
     ...options,
+    redirect: 'error',
     signal: AbortSignal.timeout(timeoutMs),
   });
   const text = await res.text();
@@ -126,9 +131,19 @@ function validateConceptPayload(concept, { isWedding }) {
 
 async function run() {
   const args = parseArgs(process.argv.slice(2));
+  if (!args.url) {
+    throw new Error('Set --url or STAGING_URL to an isolated staging origin.');
+  }
   const origin = new URL(args.url);
-  if (origin.protocol !== 'https:' && origin.hostname !== '127.0.0.1' && origin.hostname !== 'localhost') {
-    throw new Error(`Refusing non-HTTPS staging URL: ${args.url}`);
+  const localhost = ['127.0.0.1', 'localhost', '[::1]'].includes(origin.hostname);
+  if (origin.protocol !== 'https:' && !(origin.protocol === 'http:' && localhost)) {
+    throw new Error('Staging requires HTTPS, or HTTP on localhost.');
+  }
+  if (origin.username || origin.password || origin.pathname !== '/' || origin.search || origin.hash) {
+    throw new Error('Supply the isolated staging origin without credentials, path, query, or fragment.');
+  }
+  if (LIVE_HOSTS.has(origin.hostname.replace(/\.$/, ''))) {
+    throw new Error('This host serves or backs public traffic. Use an isolated staging origin.');
   }
 
   const results = [];
@@ -159,10 +174,15 @@ async function run() {
       : `Stale or unconfigured AI backend detected: ${JSON.stringify(aiDiag)}`,
   });
 
+  if (!hasRepairedAiStack) {
+    throw new Error('Staging health check failed. No generation requests were sent.');
+  }
+
   // 2. CORS Preflight
   const preflightStart = Date.now();
   const preflightRes = await fetch(new URL('/api/ai/concept-studio', origin), {
     method: 'OPTIONS',
+    redirect: 'error',
     headers: {
       Origin: PUBLIC_ORIGIN,
       'Access-Control-Request-Method': 'POST',
@@ -248,7 +268,7 @@ async function run() {
         },
         body: JSON.stringify(tc.payload),
       },
-      75_000,
+      AI_RESPONSE_TIMEOUT_MS,
     );
 
     const issues = resp.ok ? validateConceptPayload(resp.json?.concept, { isWedding: tc.isWedding }) : [`HTTP ${resp.status}: ${resp.json?.code || resp.rawText}`];
@@ -263,20 +283,24 @@ async function run() {
   }
 
   // 4. AI Event Concierge — Multi-turn live conversation
+  const firstMessage = 'We are planning a 150-guest luxury anniversary dinner in Columbia, SC next autumn with royal purple and gold styling.';
   const turn1 = await timedFetchJson(
     new URL('/api/ai/concierge', origin),
     {
       method: 'POST',
       headers: { Origin: PUBLIC_ORIGIN, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        message: 'We are planning a 150-guest luxury anniversary dinner in Columbia, SC next autumn with royal purple and gold styling.',
+        message: firstMessage,
         history: [],
       }),
     },
-    70_000,
+    AI_RESPONSE_TIMEOUT_MS,
   );
   const turn1Ok =
     turn1.ok &&
+    turn1.json?.persisted === true &&
+    typeof turn1.json?.sessionId === 'string' &&
+    turn1.json.sessionId.length > 0 &&
     typeof turn1.json?.reply === 'string' &&
     turn1.json.reply.length >= 20 &&
     typeof turn1.json?.extractedLead?.eventCategory === 'string';
@@ -287,6 +311,36 @@ async function run() {
     sessionId: turn1.json?.sessionId || null,
     detail: turn1Ok ? `eventCategory=${turn1.json.extractedLead.eventCategory}` : `HTTP ${turn1.status}: ${turn1.json?.code || turn1.rawText}`,
   });
+
+  if (turn1Ok) {
+    const turn2 = await timedFetchJson(new URL('/api/ai/concierge', origin), {
+      method: 'POST',
+      headers: { Origin: PUBLIC_ORIGIN, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'Please update the guest count to 120 and keep the venue in Columbia.',
+        sessionId: turn1.json.sessionId,
+        history: [
+          { role: 'user', content: firstMessage },
+          { role: 'assistant', content: turn1.json.reply.slice(0, 2_000) },
+        ],
+      }),
+    });
+    const turn2Ok =
+      turn2.ok &&
+      turn2.json?.persisted === true &&
+      turn2.json?.sessionId === turn1.json.sessionId &&
+      turn2.json?.extractedLead?.guestCount === 120;
+    addResult('LIVE-AI-05B', 'AI Event Concierge — Turn 2 updates the same session', turn2Ok, {
+      status: turn2.status,
+      durationMs: turn2.durationMs,
+      requestId: turn2.requestId,
+      detail: turn2Ok ? 'Guest count updated to 120' : 'Expected a persisted guest count of 120 in the same session',
+    });
+  } else {
+    addResult('LIVE-AI-05B', 'AI Event Concierge — Turn 2 updates the same session', false, {
+      detail: 'Turn 1 did not return a persisted session',
+    });
+  }
 
   // 5. Validation & Isolation checks
   const badInput = await timedFetchJson(

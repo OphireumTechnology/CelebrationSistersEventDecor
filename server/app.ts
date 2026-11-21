@@ -122,13 +122,17 @@ import {
   type DatabaseSchema,
 } from './store.ts';
 import { buildTotpProvisioningUri, generateTotpSecret } from './totp.ts';
-import { stagingExternalAuthEnabled, STAGING_ADMIN_SUBJECT } from './stagingExternalAuthPolicy.ts';
+import { providerAdminMfaRequired, stagingExternalAuthEnabled, STAGING_ADMIN_SUBJECT, STAGING_AUTH_PROJECT_REF } from './stagingExternalAuthPolicy.ts';
 
 export interface SupabaseAuthClientLike {
   auth: {
     signInWithPassword: (credentials: { email: string; password: string }) => Promise<{
-      data: { session?: { access_token?: string } | null } | null;
+      data: { session?: { access_token?: string; refresh_token?: string } | null } | null;
       error: { message?: string } | null;
+    }>;
+    getUser?: (token: string) => Promise<{
+      data: { user: { id: string; email_confirmed_at?: string | null } | null };
+      error: unknown;
     }>;
     resetPasswordForEmail: (
       email: string,
@@ -433,6 +437,47 @@ export function createApp(options: CreateAppOptions = {}) {
     return candidate;
   }
 
+  function getPublicAuthClient(): SupabaseAuthClientLike | null {
+    if (options.supabaseAuthClient !== undefined) return options.supabaseAuthClient;
+    return stagingExternalAuthEnabled(process.env) ? createStagingExternalAuthClient() : createSupabasePublicClient();
+  }
+
+  function getProviderVerifyOptions(): VerifyProviderTokenOptions {
+    const externalStaging = stagingExternalAuthEnabled(process.env);
+    const issuerOptions = externalStaging
+      ? { supabaseUrl: `https://${STAGING_AUTH_PROJECT_REF}.supabase.co`, useJwksOnly: true }
+      : providerAdminMfaRequired(process.env)
+        ? { supabaseUrl: process.env.SUPABASE_URL?.trim() || '', useJwksOnly: true }
+        : {};
+
+    return {
+      ...options.providerVerifyOptions,
+      ...issuerOptions,
+      confirmProviderEmail: async (token, subject) => {
+        try {
+          const confirmed = await getPublicAuthClient()?.auth.getUser?.(token);
+          const user = confirmed?.data.user;
+          return !confirmed?.error && user?.id === subject && Boolean(user.email_confirmed_at);
+        } catch {
+          return false;
+        }
+      },
+    };
+  }
+
+  function requiresGenuineProviderMfa(): boolean {
+    return stagingExternalAuthEnabled(process.env) || providerAdminMfaRequired(process.env);
+  }
+
+  function isVerifiedProviderAdmin(ctx: AuthenticatedContext): boolean {
+    return ctx.authMethod === 'supabase_jwt' &&
+      ctx.emailVerified &&
+      ctx.accountStatus === 'active' &&
+      Boolean(ctx.session.supabaseUserId) &&
+      (!providerAdminMfaRequired(process.env) || Boolean(ctx.sessionJti)) &&
+      (!stagingExternalAuthEnabled(process.env) || ctx.session.supabaseUserId === STAGING_ADMIN_SUBJECT);
+  }
+
   async function getAuth(
     req: Request,
     transactionDb?: Awaited<ReturnType<typeof readDb>>,
@@ -441,22 +486,15 @@ export function createApp(options: CreateAppOptions = {}) {
     const ctx = await resolveAuthenticatedContextAsync(
       req,
       db.users,
-      options.providerVerifyOptions,
+      getProviderVerifyOptions(),
       db.revokedSessionIds,
     );
-    // Central fail-closed privilege boundary: ALL protected route handlers receive a
-    // non-admin context unless the current request carries genuine external
-    // Supabase AAL2 for the pinned immutable staging administrator UUID.
-    // AAL1 is permitted ONLY on read-only session inspection (/api/auth/session) and
-    // logout (/api/auth/logout) so the client can render the MFA gate and sign out safely.
-    if (stagingExternalAuthEnabled(process.env) && ctx.session.role === 'admin') {
+    // Provider AAL1 remains available only for session inspection and logout.
+    if (requiresGenuineProviderMfa() && ctx.session.role === 'admin') {
       const aal1AllowedPath =
         (req.method === 'GET' && req.path === '/api/auth/session') ||
         (req.method === 'POST' && req.path === '/api/auth/logout');
-      const validExternal =
-        ctx.authMethod === 'supabase_jwt' &&
-        ctx.session.supabaseUserId === STAGING_ADMIN_SUBJECT;
-      if (!validExternal || (!aal1AllowedPath && ctx.aal !== 'aal2')) {
+      if (!isVerifiedProviderAdmin(ctx) || (!aal1AllowedPath && ctx.aal !== 'aal2')) {
         return {
           db,
           ctx: {
@@ -524,12 +562,8 @@ export function createApp(options: CreateAppOptions = {}) {
   });
 
   function requireAdminMfa(ctx: AuthenticatedContext, res: Response): boolean {
-    // External Auth mode does not accept locally signed admin cookies as proof of AAL2.
-    if (stagingExternalAuthEnabled(process.env) &&
-        (ctx.authMethod !== 'supabase_jwt' ||
-         ctx.session.supabaseUserId !== STAGING_ADMIN_SUBJECT ||
-         ctx.aal !== 'aal2')) {
-      res.status(403).json({ error: 'Verified external administrator AAL2 session required.', code: 'MFA_REQUIRED' });
+    if (requiresGenuineProviderMfa() && (!isVerifiedProviderAdmin(ctx) || ctx.aal !== 'aal2')) {
+      res.status(403).json({ error: 'Verified Supabase administrator AAL2 session required.', code: 'MFA_REQUIRED' });
       return false;
     }
     return requireAdminWithMfa(ctx, res);
@@ -687,7 +721,7 @@ export function createApp(options: CreateAppOptions = {}) {
       aal: ctx.aal,
       authMethod: ctx.authMethod,
       externalStagingAuth: externalStaging,
-      csrfToken: !externalStaging && ctx.sessionJti ? deriveCsrfToken(ctx.sessionJti) : undefined,
+      csrfToken: ctx.authMethod !== 'supabase_jwt' && !externalStaging && ctx.sessionJti ? deriveCsrfToken(ctx.sessionJti) : undefined,
     });
   });
 
@@ -697,6 +731,7 @@ export function createApp(options: CreateAppOptions = {}) {
     '/api/auth/login',
     rateLimit(10, 60_000, { failClosed: true, endpointGroup: 'auth' }),
     async (req: Request, res: Response) => {
+      res.setHeader('Cache-Control', 'no-store');
       const parsed = z
         .object({
           email: z.string().trim().email('Valid email address is required').max(180),
@@ -709,9 +744,7 @@ export function createApp(options: CreateAppOptions = {}) {
 
       const normalizedEmail = parsed.data.email.toLowerCase();
       const emailHash = sha256Hex(normalizedEmail).slice(0, 16);
-      const authClient: SupabaseAuthClientLike | null =
-        options.supabaseAuthClient !== undefined ? options.supabaseAuthClient :
-          stagingExternalAuthEnabled(process.env) ? createStagingExternalAuthClient() : createSupabasePublicClient();
+      const authClient = getPublicAuthClient();
 
       if (!authClient) {
         return res.status(503).json({
@@ -721,7 +754,7 @@ export function createApp(options: CreateAppOptions = {}) {
       }
 
       let signInResult: {
-        data: { session?: { access_token?: string } | null } | null;
+        data: { session?: { access_token?: string; refresh_token?: string } | null } | null;
         error: { message?: string } | null;
       };
       try {
@@ -752,18 +785,7 @@ export function createApp(options: CreateAppOptions = {}) {
         });
       }
 
-      const claims = await verifyProviderAccessToken(
-        accessToken,
-        stagingExternalAuthEnabled(process.env)
-          ? {
-              supabaseUrl: 'https://nswxwwmtcasmkjtmrdqg.supabase.co',
-              useJwksOnly: true,
-              ...(options.providerVerifyOptions?.keyResolver
-                ? { keyResolver: options.providerVerifyOptions.keyResolver }
-                : {}),
-            }
-          : options.providerVerifyOptions,
-      );
+      const claims = await verifyProviderAccessToken(accessToken, getProviderVerifyOptions());
       if (!claims) {
         await withTransaction((db) => {
           appendSecurityEvent(db, {
@@ -838,6 +860,16 @@ export function createApp(options: CreateAppOptions = {}) {
         return res.status(403).json({error:'Administrator identity is not authorized in staging.',code:'STAGING_ADMIN_FORBIDDEN'});
       }
 
+      const providerAdmin = providerAdminMfaRequired(process.env) &&
+        !stagingExternalAuthEnabled(process.env) && resolved.user.role === 'admin';
+      const providerRefreshToken = signInResult.data?.session?.refresh_token;
+      if (providerAdmin && (!providerRefreshToken || !claims.sessionId)) {
+        return res.status(502).json({
+          code: 'AUTH_PROVIDER_SESSION_INCOMPLETE',
+          error: 'Identity provider did not establish an administrator session.',
+        });
+      }
+
       const authoritativeUser = await withTransaction((db) => {
         let userRecord = db.users.find(
           (u) => u.id === resolved.user.id || (u.supabaseUserId && u.supabaseUserId === claims.sub),
@@ -876,6 +908,16 @@ export function createApp(options: CreateAppOptions = {}) {
         return finalUser;
       });
 
+      if (providerAdmin && authoritativeUser.role === 'admin') {
+        clearSessionCookie(res, { req });
+        return res.json({
+          user: sanitizeUserForClient(authoritativeUser),
+          providerSession: { access_token: accessToken, refresh_token: providerRefreshToken },
+          providerUrl: process.env.SUPABASE_URL?.trim(),
+          mfaRequired: claims.aal !== 'aal2',
+          mfaVerified: claims.aal === 'aal2',
+        });
+      }
       const mfaVerified = authoritativeUser.role === 'admin' ? claims.aal === 'aal2' : true;
       const jti = generateSessionId();
       const csrfToken = deriveCsrfToken(jti);
@@ -934,27 +976,40 @@ export function createApp(options: CreateAppOptions = {}) {
 
       const normalizedEmail = parsed.data.email.toLowerCase();
       const emailHash = sha256Hex(normalizedEmail).slice(0, 16);
-      const redirectBase = (process.env.FRONTEND_PUBLIC_URL || 'https://celebrationsistersdecor.com').replace(/\/+$/, '');
-      try {
-        await authClient.auth.resetPasswordForEmail(normalizedEmail, {
-          redirectTo: `${redirectBase}/`,
+      const frontendOrigin = process.env.FRONTEND_PUBLIC_URL?.trim() ||
+        (process.env.RAILWAY_ENVIRONMENT_NAME === 'staging' ? '' : 'https://celebrationsistersdecor.com');
+      const callbackBase = URL.parse(frontendOrigin);
+      if (!callbackBase || callbackBase.protocol !== 'https:' || callbackBase.username || callbackBase.password) {
+        return res.status(503).json({
+          code: 'AUTH_RECOVERY_NOT_CONFIGURED',
+          error: 'Password recovery is not configured for this environment.',
         });
+      }
+      const redirectTo = new URL('/?auth=recovery', callbackBase).href;
+      let providerAccepted = false;
+      try {
+        const result = await authClient.auth.resetPasswordForEmail(normalizedEmail, {
+          redirectTo,
+        });
+        providerAccepted = !result.error;
       } catch {
-        // Deliberately suppress provider errors to avoid account enumeration while logging security event
+        // Preserve the same public response for every account.
       }
 
       await withTransaction((db) => {
         appendSecurityEvent(db, {
           eventType: 'PASSWORD_RESET_REQUESTED',
           emailHash,
-          outcome: 'allowed',
-          details: 'Password recovery email requested via Supabase Auth',
+          outcome: providerAccepted ? 'allowed' : 'denied',
+          details: providerAccepted
+            ? 'Password recovery request accepted by Supabase Auth'
+            : 'Password recovery request failed at Supabase Auth',
         });
       });
 
       return res.json({
         ok: true,
-        message: 'If an account matches that email address, password recovery instructions have been dispatched.',
+        message: 'If an account matches that email address, check its inbox for password recovery instructions.',
       });
     },
   );
@@ -1010,7 +1065,7 @@ export function createApp(options: CreateAppOptions = {}) {
     '/api/auth/mfa/totp/enroll',
     rateLimit(5, 60_000, { failClosed: true, endpointGroup: 'mfa' }),
     async (req: Request, res: Response) => {
-      if (stagingExternalAuthEnabled(process.env)) {
+      if (requiresGenuineProviderMfa()) {
         return res.status(409).json({code:'SUPABASE_MFA_REQUIRED',error:'Enroll MFA through Supabase Auth mfa.enroll and mfa.challengeAndVerify in the authenticated client; application-local TOTP is not Supabase AAL2.'});
       }
       const { db: preflightDb, ctx } = await getAuth(req);
@@ -1092,7 +1147,7 @@ export function createApp(options: CreateAppOptions = {}) {
     '/api/auth/mfa/verify',
     rateLimit(10, 60_000, { failClosed: true, endpointGroup: 'mfa' }),
     async (req: Request, res: Response) => {
-      if (stagingExternalAuthEnabled(process.env)) {
+      if (requiresGenuineProviderMfa()) {
         return res.status(409).json({code:'SUPABASE_MFA_REQUIRED',error:'Use the Supabase Auth challengeAndVerify flow to obtain a genuine AAL2 access token.'});
       }
       const { ctx } = await getAuth(req);
@@ -1163,7 +1218,7 @@ export function createApp(options: CreateAppOptions = {}) {
     '/api/auth/mfa/recover',
     rateLimit(5, 60_000, { failClosed: true, endpointGroup: 'mfa_recovery' }),
     async (req: Request, res: Response) => {
-      if (stagingExternalAuthEnabled(process.env)) {
+      if (requiresGenuineProviderMfa()) {
         return res.status(409).json({
           code: 'SUPABASE_MFA_REQUIRED',
           error: 'Application-local MFA recovery codes are disabled in external Supabase Auth mode; complete genuine Supabase AAL2 verification.',
@@ -1245,7 +1300,7 @@ export function createApp(options: CreateAppOptions = {}) {
     '/api/auth/mfa/totp/revoke',
     rateLimit(5, 60_000, { failClosed: true, endpointGroup: 'mfa' }),
     async (req: Request, res: Response) => {
-      if (stagingExternalAuthEnabled(process.env)) {
+      if (requiresGenuineProviderMfa()) {
         return res.status(409).json({
           code: 'SUPABASE_MFA_REQUIRED',
           error: 'Application-local MFA revocation is disabled in external Supabase Auth mode to protect external Auth factors.',

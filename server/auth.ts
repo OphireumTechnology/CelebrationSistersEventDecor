@@ -281,7 +281,9 @@ export function resolveAuthenticatedContext(
 
   const matchedUser = registeredUsers.find((u) => u.id === verified.userId);
   if (!matchedUser) {
-    return guestContext(false);
+    // A supplied authenticated credential whose account no
+    // longer exists must not become an authorized guest request.
+    return guestContext(true);
   }
 
   const accountStatus: AccountStatus = matchedUser.accountStatus ?? 'active';
@@ -330,7 +332,8 @@ export async function resolveAuthenticatedContextAsync(
         ? {
             supabaseUrl: `https://${STAGING_AUTH_PROJECT_REF}.supabase.co`,
             useJwksOnly: true,
-            ...(providerVerifyOptions?.keyResolver ? { keyResolver: providerVerifyOptions.keyResolver } : {}),
+            keyResolver: providerVerifyOptions?.keyResolver,
+            confirmProviderEmail: providerVerifyOptions?.confirmProviderEmail,
           }
         : providerVerifyOptions;
       const claims = await verifyProviderAccessToken(rawToken, verificationOptions);
