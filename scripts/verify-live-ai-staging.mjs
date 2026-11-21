@@ -19,6 +19,7 @@
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { AI_RESPONSE_TIMEOUT_MS } from '../src/lib/aiTimeouts.mjs';
 
 const DEFAULT_STAGING_URL =
   process.env.STAGING_URL ||
@@ -47,7 +48,7 @@ function parseArgs(argv) {
   return args;
 }
 
-async function timedFetchJson(url, options = {}, timeoutMs = 75_000) {
+async function timedFetchJson(url, options = {}, timeoutMs = AI_RESPONSE_TIMEOUT_MS) {
   const startedAt = Date.now();
   const res = await fetch(url, {
     ...options,
@@ -248,7 +249,7 @@ async function run() {
         },
         body: JSON.stringify(tc.payload),
       },
-      75_000,
+      AI_RESPONSE_TIMEOUT_MS,
     );
 
     const issues = resp.ok ? validateConceptPayload(resp.json?.concept, { isWedding: tc.isWedding }) : [`HTTP ${resp.status}: ${resp.json?.code || resp.rawText}`];
@@ -263,20 +264,24 @@ async function run() {
   }
 
   // 4. AI Event Concierge — Multi-turn live conversation
+  const firstMessage = 'We are planning a 150-guest luxury anniversary dinner in Columbia, SC next autumn with royal purple and gold styling.';
   const turn1 = await timedFetchJson(
     new URL('/api/ai/concierge', origin),
     {
       method: 'POST',
       headers: { Origin: PUBLIC_ORIGIN, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        message: 'We are planning a 150-guest luxury anniversary dinner in Columbia, SC next autumn with royal purple and gold styling.',
+        message: firstMessage,
         history: [],
       }),
     },
-    70_000,
+    AI_RESPONSE_TIMEOUT_MS,
   );
   const turn1Ok =
     turn1.ok &&
+    turn1.json?.persisted === true &&
+    typeof turn1.json?.sessionId === 'string' &&
+    turn1.json.sessionId.length > 0 &&
     typeof turn1.json?.reply === 'string' &&
     turn1.json.reply.length >= 20 &&
     typeof turn1.json?.extractedLead?.eventCategory === 'string';
@@ -287,6 +292,36 @@ async function run() {
     sessionId: turn1.json?.sessionId || null,
     detail: turn1Ok ? `eventCategory=${turn1.json.extractedLead.eventCategory}` : `HTTP ${turn1.status}: ${turn1.json?.code || turn1.rawText}`,
   });
+
+  if (turn1Ok) {
+    const turn2 = await timedFetchJson(new URL('/api/ai/concierge', origin), {
+      method: 'POST',
+      headers: { Origin: PUBLIC_ORIGIN, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: 'Please update the guest count to 120 and keep the venue in Columbia.',
+        sessionId: turn1.json.sessionId,
+        history: [
+          { role: 'user', content: firstMessage },
+          { role: 'assistant', content: turn1.json.reply.slice(0, 2_000) },
+        ],
+      }),
+    });
+    const turn2Ok =
+      turn2.ok &&
+      turn2.json?.persisted === true &&
+      turn2.json?.sessionId === turn1.json.sessionId &&
+      turn2.json?.extractedLead?.guestCount === 120;
+    addResult('LIVE-AI-05B', 'AI Event Concierge — Turn 2 updates the same session', turn2Ok, {
+      status: turn2.status,
+      durationMs: turn2.durationMs,
+      requestId: turn2.requestId,
+      detail: turn2Ok ? 'Guest count updated to 120' : 'Expected a persisted guest count of 120 in the same session',
+    });
+  } else {
+    addResult('LIVE-AI-05B', 'AI Event Concierge — Turn 2 updates the same session', false, {
+      detail: 'Turn 1 did not return a persisted session',
+    });
+  }
 
   // 5. Validation & Isolation checks
   const badInput = await timedFetchJson(

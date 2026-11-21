@@ -122,18 +122,23 @@ async function startServer() {
     console.log(`Celebration Sisters Event Decor server listening on http://0.0.0.0:${PORT}`);
   });
 
-  // Production HTTP timeout hardening coordinated with Gemini AI timeout budget (never abort AI calls prematurely)
+  // Node requestTimeout limits receipt of the inbound HTTP request.
   const aiConfig = getGeminiConfigStatus();
-  const minRecommendedHttpTimeoutMs = Math.max(75_000, aiConfig.timeoutMs + 20_000);
+  const aiTimeoutMs = Math.max(
+    aiConfig.timeoutMs,
+    aiConfig.conciergeTimeoutMs,
+    aiConfig.conceptTimeoutMs,
+  );
+  const minRecommendedHttpTimeoutMs = Math.max(75_000, aiTimeoutMs + 20_000);
   const configuredHttpTimeoutMs = Number(process.env.HTTP_REQUEST_TIMEOUT_MS);
   const effectiveHttpRequestTimeoutMs =
     Number.isFinite(configuredHttpTimeoutMs) && configuredHttpTimeoutMs >= 10_000
-      ? Math.max(configuredHttpTimeoutMs, aiConfig.timeoutMs + 10_000)
+      ? Math.max(configuredHttpTimeoutMs, aiTimeoutMs + 10_000)
       : minRecommendedHttpTimeoutMs;
-  if (Number.isFinite(configuredHttpTimeoutMs) && configuredHttpTimeoutMs < aiConfig.timeoutMs + 10_000) {
+  if (Number.isFinite(configuredHttpTimeoutMs) && configuredHttpTimeoutMs < aiTimeoutMs + 10_000) {
     logStructured('warn', 'http_request_timeout_adjusted_for_ai', {
       configuredHttpTimeoutMs,
-      aiTimeoutMs: aiConfig.timeoutMs,
+      aiTimeoutMs,
       effectiveHttpRequestTimeoutMs,
     });
   }

@@ -1,11 +1,12 @@
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import { z } from 'zod';
+import { MAX_GEMINI_TIMEOUT_MS } from '../src/lib/aiTimeouts.mjs';
 import { logStructured, observability } from './observability.ts';
 
 export const DEFAULT_GEMINI_MODEL = 'gemini-4-hydrogen';
 export const DEFAULT_GEMINI_TIMEOUT_MS = 45_000;
 export const MIN_GEMINI_TIMEOUT_MS = 5_000;
-export const MAX_GEMINI_TIMEOUT_MS = 90_000;
+export { MAX_GEMINI_TIMEOUT_MS };
 export const DEFAULT_GEMINI_MAX_RETRIES = 2;
 export const MAX_GEMINI_MAX_RETRIES = 3;
 

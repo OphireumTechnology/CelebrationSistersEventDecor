@@ -15,6 +15,7 @@ import {
   UserCheck,
   Wand2,
 } from 'lucide-react';
+import { AI_RESPONSE_TIMEOUT_MS } from '../lib/aiTimeouts.mjs';
 import { apiFetch, isBackendConfigured, parseApiErrorResponse } from '../lib/apiClient';
 import type { ConceptRevision, DesignConceptRecord, UserSession } from '../types/domain';
 
@@ -262,7 +263,7 @@ function IdentityScopedAIStudioWorkspace({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        timeoutMs: 70_000,
+        timeoutMs: AI_RESPONSE_TIMEOUT_MS,
         body: JSON.stringify({
           sessionId,
           clientName: currentUser.role !== 'guest' ? currentUser.name : undefined,
@@ -444,7 +445,7 @@ function IdentityScopedAIStudioWorkspace({
           'Idempotency-Key': idempotencyKey,
         },
         credentials: 'include',
-        timeoutMs: 75_000,
+        timeoutMs: AI_RESPONSE_TIMEOUT_MS,
         body: requestBody,
       });
 
