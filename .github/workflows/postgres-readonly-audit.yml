@@ -1,0 +1,44 @@
+name: Phase 1 PostgreSQL Read-Only Audit Safety Checks
+on:
+  pull_request:
+    paths:
+      - 'scripts/audit-postgres-readonly.ps1'
+      - '.github/workflows/postgres-readonly-audit.yml'
+      - 'docs/LOCAL_POSTGRES_AUDIT.md'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate-script:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse PowerShell and enforce read-only guardrails
+        shell: pwsh
+        run: |
+          $path = 'scripts/audit-postgres-readonly.ps1'
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $path), [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) { throw ($errors | Out-String) }
+          $script = Get-Content $path -Raw
+          foreach ($required in @('BEGIN TRANSACTION READ ONLY', 'default_transaction_read_only=on', 'ON_ERROR_STOP=1', 'PGUSER', 'PGDATABASE')) {
+            if (-not $script.Contains($required)) { throw "Missing audit guardrail: $required" }
+          }
+          if ($script -match '(?im)^\s*(CREATE|ALTER|DROP|TRUNCATE|DELETE|UPDATE|INSERT|GRANT|REVOKE)\s') {
+            throw 'Unexpected write statement in audit script.'
+          }
+          Write-Host 'PowerShell syntax and read-only guardrails passed.'
+      - name: Verify hosted workflow does not inject database credentials
+        shell: pwsh
+        run: |
+          # Check the workflow configuration, not ambient variables present on the hosted runner.
+          # Presence of an ambient variable is not evidence that this workflow used it.
+          $workflow = Get-Content '.github/workflows/postgres-readonly-audit.yml' -Raw
+          if ($workflow -match '\$\{\{\s*secrets\.' -or
+              $workflow -match '(?im)^\s*(PGPASSWORD|DATABASE_URL)\s*:' -or
+              $workflow -match '(?im)^\s*runs-on:\s*self-hosted') {
+            throw 'Audit workflow must not configure database secrets or self-hosted execution.'
+          }
+          Write-Host 'Hosted CI validates code only; it does not invoke the PostgreSQL audit.'
