@@ -303,6 +303,7 @@ export default function App({ initialRoute = 'home' }: { initialRoute?: AppRoute
     if (!res.ok) {
       return { ok: false, error: data.error || 'MFA verification failed.' };
     }
+    setApiAccessToken(data.token ?? null);
     setApiCsrfToken(data.csrfToken ?? null);
     setMfaRequired(false);
     setCurrentUser(data.user);
@@ -371,6 +372,7 @@ export default function App({ initialRoute = 'home' }: { initialRoute?: AppRoute
       if (!res.ok) {
         return { ok: false, error: data.error || 'Invalid or already-used recovery code.' };
       }
+      setApiAccessToken(data.token ?? null);
       setApiCsrfToken(data.csrfToken ?? null);
       setMfaRequired(false);
       setCurrentUser(data.user);
