@@ -35,7 +35,12 @@ import {
   requireRoles,
   validateCsrfProtection,
 } from './authz.ts';
-import { generateConceptProposal, getGeminiConfigStatus, runConciergeTurn } from './gemini.ts';
+import {
+  AiProviderError,
+  generateConceptProposal,
+  getGeminiConfigStatus,
+  runConciergeTurn,
+} from './gemini.ts';
 import {
   createSupabasePublicClient,
   createStagingExternalAuthClient,
@@ -541,7 +546,14 @@ export function createApp(options: CreateAppOptions = {}) {
       auth,
       email,
       worker,
-      ai: { model: ai.model, configured: ai.configured },
+      ai: {
+        model: ai.model,
+        configured: ai.configured,
+        modelSource: ai.modelSource,
+        timeoutMs: ai.timeoutMs,
+        maxRetries: ai.maxRetries,
+        ...(ai.modelWarning ? { modelWarning: ai.modelWarning } : {}),
+      },
       requestId: res.getHeader('X-Request-Id'),
       timestamp: new Date().toISOString(),
     });
@@ -578,7 +590,16 @@ export function createApp(options: CreateAppOptions = {}) {
       auth,
       email,
       worker,
-      ai: { model: ai.model, configured: ai.configured, timeoutMs: ai.timeoutMs },
+      ai: {
+        model: ai.model,
+        configured: ai.configured,
+        modelSource: ai.modelSource,
+        timeoutMs: ai.timeoutMs,
+        conciergeTimeoutMs: ai.conciergeTimeoutMs,
+        conceptTimeoutMs: ai.conceptTimeoutMs,
+        maxRetries: ai.maxRetries,
+        ...(ai.modelWarning ? { modelWarning: ai.modelWarning } : {}),
+      },
       requestId: res.getHeader('X-Request-Id'),
       timestamp: new Date().toISOString(),
     });
@@ -2180,8 +2201,85 @@ export function createApp(options: CreateAppOptions = {}) {
     res.json({ concept: updated });
   });
 
-  // AI Event Concierge (Server-side Gemini API with usage caps & session ownership isolation)
+  function sendAiErrorResponse(res: Response, requestId: string, err: unknown, fallbackMessage: string) {
+    if (err instanceof AiProviderError) {
+      if (err.retryAfterSeconds && err.retryAfterSeconds > 0) {
+        res.setHeader('Retry-After', String(err.retryAfterSeconds));
+      }
+      return res.status(err.httpStatus).json({
+        success: false,
+        error: err.userMessage,
+        code: err.code,
+        retryable: err.retryable,
+        ...(err.retryAfterSeconds ? { retryAfterSeconds: err.retryAfterSeconds } : {}),
+        requestId,
+        errorDetail: {
+          code: err.code,
+          message: err.userMessage,
+          retryable: err.retryable,
+          ...(err.retryAfterSeconds ? { retryAfterSeconds: err.retryAfterSeconds } : {}),
+        },
+      });
+    }
+
+    const msg = err instanceof Error ? err.message : fallbackMessage;
+    if (msg.startsWith('FORBIDDEN:')) {
+      const clean = msg.slice(10);
+      return res.status(403).json({
+        success: false,
+        error: clean,
+        code: 'FORBIDDEN',
+        retryable: false,
+        requestId,
+        errorDetail: { code: 'FORBIDDEN', message: clean, retryable: false },
+      });
+    }
+    if (msg.startsWith('CONCEPT_LOCKED:')) {
+      const clean = msg.slice(15);
+      return res.status(409).json({
+        success: false,
+        error: clean,
+        code: 'CONCEPT_ALREADY_APPROVED',
+        retryable: false,
+        requestId,
+        errorDetail: { code: 'CONCEPT_ALREADY_APPROVED', message: clean, retryable: false },
+      });
+    }
+    if (msg.startsWith('AI_TIMEOUT:')) {
+      const clean = 'The AI service timed out before completing your request. Please try again.';
+      return res.status(504).json({
+        success: false,
+        error: clean,
+        code: 'AI_TIMEOUT',
+        retryable: true,
+        requestId,
+        errorDetail: { code: 'AI_TIMEOUT', message: clean, retryable: true },
+      });
+    }
+    if (msg.startsWith('AI_INVALID_OUTPUT:')) {
+      const clean = 'The AI service returned an incomplete response. Please retry.';
+      return res.status(502).json({
+        success: false,
+        error: clean,
+        code: 'AI_INVALID_OUTPUT',
+        retryable: false,
+        requestId,
+        errorDetail: { code: 'AI_INVALID_OUTPUT', message: clean, retryable: false },
+      });
+    }
+    return res.status(502).json({
+      success: false,
+      error: fallbackMessage,
+      code: 'AI_PROVIDER_ERROR',
+      retryable: false,
+      requestId,
+      errorDetail: { code: 'AI_PROVIDER_ERROR', message: fallbackMessage, retryable: false },
+    });
+  }
+
+  // AI Event Concierge (Server-side Gemini API with usage caps, resilience, & session ownership isolation)
   app.post('/api/ai/concierge', rateLimit(15, 60_000), async (req: Request, res: Response) => {
+    const requestId = String(res.getHeader('X-Request-Id') || crypto.randomUUID());
     const schema = z.object({
       sessionId: z.string().optional(),
       clientName: z.string().max(120).optional(),
@@ -2198,16 +2296,37 @@ export function createApp(options: CreateAppOptions = {}) {
     });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ error: 'Please enter a valid message for the AI Event Concierge.' });
+      const msg = parsed.error.issues[0]?.message || 'Please enter a valid message for the AI Event Concierge.';
+      return res.status(400).json({
+        success: false,
+        error: msg,
+        code: 'VALIDATION_ERROR',
+        retryable: false,
+        requestId,
+        errorDetail: { code: 'VALIDATION_ERROR', message: msg, retryable: false },
+      });
     }
 
     const { ctx } = await getAuth(req);
     const callerOwnerId = ctx.session.role === 'guest' ? undefined : ctx.session.id;
 
+    let aiResult: Awaited<ReturnType<typeof runConciergeTurn>>;
     try {
-      const aiResult = await runConciergeTurn(parsed.data.history, parsed.data.message);
-      const now = new Date().toISOString();
+      aiResult = await runConciergeTurn(parsed.data.history, parsed.data.message, {
+        requestId,
+        endpoint: '/api/ai/concierge',
+      });
+    } catch (err) {
+      return sendAiErrorResponse(
+        res,
+        requestId,
+        err,
+        'AI Event Concierge encountered an upstream error. Please try again shortly.',
+      );
+    }
 
+    try {
+      const now = new Date().toISOString();
       const savedSession = await withTransaction(async (db) => {
         let existing = parsed.data.sessionId
           ? db.aiSessions.find((s) => s.id === parsed.data.sessionId)
@@ -2220,7 +2339,7 @@ export function createApp(options: CreateAppOptions = {}) {
 
         if (!existing) {
           existing = {
-            id: `ais-${Date.now()}`,
+            id: `ais-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
             ownerUserId: callerOwnerId,
             createdAt: now,
             clientName: parsed.data.clientName || (ctx.session.role !== 'guest' ? ctx.session.name : 'Prospective Client'),
@@ -2248,64 +2367,189 @@ export function createApp(options: CreateAppOptions = {}) {
         return existing;
       });
 
-      res.json({
+      logStructured('info', 'ai_concierge_persisted', {
+        requestId,
+        sessionId: savedSession.id,
+        escalatedToHuman: savedSession.escalatedToHuman,
+        eventCategory: savedSession.eventCategory,
+      });
+
+      return res.json({
+        success: true,
+        persisted: true,
+        requestId,
         sessionId: savedSession.id,
         reply: aiResult.reply,
         extractedLead: aiResult.extractedLead,
       });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'AI Concierge encountered an upstream error.';
-      if (msg.startsWith('AI_TIMEOUT:')) {
-        return res.status(504).json({ error: 'AI Event Concierge timed out. Please try again.', code: 'AI_TIMEOUT' });
-      }
-      if (msg.startsWith('AI_INVALID_OUTPUT:')) {
-        return res.status(502).json({ error: 'AI Event Concierge returned an invalid response. Please retry.', code: 'AI_INVALID_OUTPUT' });
-      }
-      return res.status(502).json({ error: msg, code: 'AI_PROVIDER_ERROR' });
+      observability.recordAiEvent('persistenceError');
+      const dbErr = classifyDatabaseError(err);
+      logStructured('error', 'ai_concierge_persistence_failed', {
+        requestId,
+        dbErrorCode: dbErr?.code ?? 'DB_ERROR',
+        httpStatus: dbErr?.httpStatus ?? 500,
+      });
+      const safeMsg =
+        'Your concierge response was generated, but we could not save the session right now. Please try again.';
+      return res.status(500).json({
+        success: false,
+        error: safeMsg,
+        code: 'AI_PERSISTENCE_FAILED',
+        retryable: true,
+        requestId,
+        errorDetail: { code: 'AI_PERSISTENCE_FAILED', message: safeMsg, retryable: true },
+      });
     }
   });
 
-  // AI Event Concept Studio (Server-side Gemini API with strict concept & booking isolation)
+  // AI Event Concept Studio (Server-side Gemini API with strict concept/booking isolation, idempotency & atomic persistence)
   app.post('/api/ai/concept-studio', rateLimit(12, 60_000), async (req: Request, res: Response) => {
+    const requestId = String(res.getHeader('X-Request-Id') || crypto.randomUUID());
     const schema = z.object({
-      conceptId: z.string().optional(),
-      bookingId: z.string().optional(),
-      eventType: z.string().min(2).max(120),
-      guestCount: z.coerce.number().int().min(10).max(2000),
-      venueStyle: z.string().min(2).max(200),
-      preferredPalette: z.string().min(2).max(200),
-      visionDescription: z.string().min(5).max(1500),
+      conceptId: z.string().trim().min(1).optional(),
+      bookingId: z.string().trim().min(1).optional(),
+      eventType: z.string().trim().min(2, 'Please select an event type.').max(120),
+      guestCount: z.coerce
+        .number()
+        .int('Guest count must be a whole number.')
+        .min(10, 'Guest count must be at least 10.')
+        .max(2000, 'Guest count cannot exceed 2,000.'),
+      venueStyle: z.string().trim().min(2, 'Please describe your venue style.').max(200),
+      preferredPalette: z.string().trim().min(2, 'Please enter your preferred color palette.').max(200),
+      visionDescription: z.string().trim().min(5, 'Please share a few details about your celebration vision.').max(1500),
     });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ error: 'Please describe your event vision and venue style.' });
+      const msg = parsed.error.issues[0]?.message || 'Please describe your event vision and venue style.';
+      return res.status(400).json({
+        success: false,
+        error: msg,
+        code: 'VALIDATION_ERROR',
+        retryable: false,
+        requestId,
+        errorDetail: { code: 'VALIDATION_ERROR', message: msg, retryable: false },
+      });
     }
 
     const { db: preflightDb, ctx } = await getAuth(req);
+    const callerScope = ctx.session.role === 'guest' ? 'guest' : ctx.session.id;
+
+    const rawIdemKey = (req.header('idempotency-key') || '').trim();
+    const scopedIdempotencyKey =
+      rawIdemKey && /^[a-zA-Z0-9_:-]{8,128}$/.test(rawIdemKey)
+        ? `${callerScope}:${rawIdemKey}`
+        : undefined;
+
+    // Fast-path idempotency deduplication before invoking Gemini
+    if (scopedIdempotencyKey && preflightDb.conceptIdempotencyKeys?.[scopedIdempotencyKey]) {
+      const existingId = preflightDb.conceptIdempotencyKeys[scopedIdempotencyKey];
+      const existingConcept = preflightDb.concepts.find((c) => c.id === existingId);
+      if (existingConcept) {
+        logStructured('info', 'ai_concept_idempotency_hit', {
+          requestId,
+          conceptId: existingConcept.id,
+          currentVersion: existingConcept.currentVersion,
+        });
+        return res.json({
+          success: true,
+          persisted: true,
+          deduplicated: true,
+          requestId,
+          concept: existingConcept,
+        });
+      }
+    }
 
     // Pre-check concept revision & booking authorization BEFORE calling Gemini API
     if (parsed.data.conceptId) {
       const existingCheck = preflightDb.concepts.find((c) => c.id === parsed.data.conceptId);
-      if (existingCheck) {
-        const canRevise =
-          hasPlanningClearance(ctx.session) ||
-          (ctx.session.role === 'client' && existingCheck.clientId === ctx.session.id);
-        if (!canRevise) {
-          return res.status(403).json({ error: 'Cannot revise another client concept.' });
-        }
+      if (!existingCheck) {
+        return res.status(404).json({
+          success: false,
+          error: 'The selected concept proposal could not be found. Create a new concept proposal instead.',
+          code: 'CONCEPT_NOT_FOUND',
+          retryable: false,
+          requestId,
+          errorDetail: {
+            code: 'CONCEPT_NOT_FOUND',
+            message: 'The selected concept proposal could not be found.',
+            retryable: false,
+          },
+        });
+      }
+      const canRevise =
+        hasPlanningClearance(ctx.session) ||
+        (ctx.session.role === 'client' && existingCheck.clientId === ctx.session.id);
+      if (!canRevise) {
+        return res.status(403).json({
+          success: false,
+          error: 'Cannot revise another client concept.',
+          code: 'FORBIDDEN',
+          retryable: false,
+          requestId,
+          errorDetail: { code: 'FORBIDDEN', message: 'Cannot revise another client concept.', retryable: false },
+        });
+      }
+      if (existingCheck.clientApproved && existingCheck.staffApproved && !hasPlanningClearance(ctx.session)) {
+        return res.status(409).json({
+          success: false,
+          error: 'This concept proposal has already received dual approval. Create a new concept proposal for a fresh direction.',
+          code: 'CONCEPT_ALREADY_APPROVED',
+          retryable: false,
+          requestId,
+          errorDetail: {
+            code: 'CONCEPT_ALREADY_APPROVED',
+            message: 'This concept proposal has already received dual approval.',
+            retryable: false,
+          },
+        });
       }
     }
     if (parsed.data.bookingId) {
       const bookingCheck = preflightDb.bookings.find((b) => b.id === parsed.data.bookingId);
       if (!bookingCheck || !isAuthorizedForBooking(bookingCheck, ctx.session, preflightDb.vendors)) {
-        return res.status(403).json({ error: 'Not authorized to attach a concept to this booking.' });
+        return res.status(403).json({
+          success: false,
+          error: 'Not authorized to attach a concept to this booking.',
+          code: 'FORBIDDEN',
+          retryable: false,
+          requestId,
+          errorDetail: {
+            code: 'FORBIDDEN',
+            message: 'Not authorized to attach a concept to this booking.',
+            retryable: false,
+          },
+        });
       }
     }
 
+    let proposal: Awaited<ReturnType<typeof generateConceptProposal>>;
     try {
-      const proposal = await generateConceptProposal(parsed.data);
+      proposal = await generateConceptProposal(parsed.data, {
+        requestId,
+        endpoint: '/api/ai/concept-studio',
+      });
+    } catch (err) {
+      return sendAiErrorResponse(
+        res,
+        requestId,
+        err,
+        'Concept Studio AI service could not generate a proposal right now. Please try again.',
+      );
+    }
 
-      const savedConcept = await withTransaction(async (db) => {
+    try {
+      const outcome = await withTransaction(async (db) => {
+        db.conceptIdempotencyKeys = db.conceptIdempotencyKeys || {};
+        if (scopedIdempotencyKey && db.conceptIdempotencyKeys[scopedIdempotencyKey]) {
+          const existingId = db.conceptIdempotencyKeys[scopedIdempotencyKey];
+          const existingConcept = db.concepts.find((c) => c.id === existingId);
+          if (existingConcept) {
+            return { concept: existingConcept, deduplicated: true };
+          }
+        }
+
         const existing = parsed.data.conceptId
           ? db.concepts.find((c) => c.id === parsed.data.conceptId)
           : undefined;
@@ -2317,8 +2561,15 @@ export function createApp(options: CreateAppOptions = {}) {
           if (!canRevise) {
             throw new Error('FORBIDDEN:Cannot revise another client concept.');
           }
+          if (existing.clientApproved && existing.staffApproved && !hasPlanningClearance(ctx.session)) {
+            throw new Error(
+              'CONCEPT_LOCKED:This concept proposal has already received dual approval. Create a new concept proposal instead.',
+            );
+          }
           const nextVer = existing.currentVersion + 1;
           existing.currentVersion = nextVer;
+          existing.eventType = parsed.data.eventType;
+          existing.title = `${proposal.themeName} Concept`;
           existing.clientApproved = false;
           existing.staffApproved = false;
           existing.revisions.unshift({
@@ -2326,8 +2577,11 @@ export function createApp(options: CreateAppOptions = {}) {
             createdAt: new Date().toISOString(),
             ...proposal,
           });
+          if (scopedIdempotencyKey) {
+            db.conceptIdempotencyKeys[scopedIdempotencyKey] = existing.id;
+          }
           appendAudit(db, ctx.session, 'CONCEPT_REVISED', 'DesignConcept', existing.id, `Created revision v${nextVer}`);
-          return existing;
+          return { concept: existing, deduplicated: false };
         }
 
         const safeBookingId = parsed.data.bookingId
@@ -2336,8 +2590,9 @@ export function createApp(options: CreateAppOptions = {}) {
             ? db.bookings.find((b) => b.clientId === ctx.session.id)?.id || 'unassigned-client-concept'
             : 'public-concierge-preview';
 
+        const nowIso = new Date().toISOString();
         const newConcept = {
-          id: `cnc-${Date.now()}`,
+          id: `cnc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
           bookingId: safeBookingId,
           clientId:
             ctx.session.role === 'client'
@@ -2351,31 +2606,61 @@ export function createApp(options: CreateAppOptions = {}) {
           revisions: [
             {
               version: 1,
-              createdAt: new Date().toISOString(),
+              createdAt: nowIso,
               ...proposal,
             },
           ],
           clientApproved: false,
           staffApproved: false,
           isConceptualVisualization: true as const,
-          createdAt: new Date().toISOString(),
+          createdAt: nowIso,
         };
         db.concepts.unshift(newConcept);
+        if (scopedIdempotencyKey) {
+          db.conceptIdempotencyKeys[scopedIdempotencyKey] = newConcept.id;
+        }
         appendAudit(db, ctx.session, 'CONCEPT_GENERATED', 'DesignConcept', newConcept.id, `Generated conceptual visualization (${proposal.themeName})`);
-        return newConcept;
+        return { concept: newConcept, deduplicated: false };
       });
 
-      res.json({ concept: savedConcept });
+      logStructured('info', 'ai_concept_persisted', {
+        requestId,
+        conceptId: outcome.concept.id,
+        currentVersion: outcome.concept.currentVersion,
+        eventType: outcome.concept.eventType,
+        deduplicated: outcome.deduplicated,
+        paletteCount: outcome.concept.revisions[0]?.colorPalette.length ?? 0,
+        recommendedDivisionsCount: outcome.concept.revisions[0]?.recommendedDivisions.length ?? 0,
+      });
+
+      return res.json({
+        success: true,
+        persisted: true,
+        deduplicated: outcome.deduplicated,
+        requestId,
+        concept: outcome.concept,
+      });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Concept Studio AI service error.';
-      if (msg.startsWith('FORBIDDEN:')) return res.status(403).json({ error: msg.slice(10) });
-      if (msg.startsWith('AI_TIMEOUT:')) {
-        return res.status(504).json({ error: 'AI Event Concept Studio timed out. Please try again.', code: 'AI_TIMEOUT' });
+      if (err instanceof Error && (err.message.startsWith('FORBIDDEN:') || err.message.startsWith('CONCEPT_LOCKED:'))) {
+        return sendAiErrorResponse(res, requestId, err, 'Unable to update concept proposal.');
       }
-      if (msg.startsWith('AI_INVALID_OUTPUT:')) {
-        return res.status(502).json({ error: 'AI Event Concept Studio returned an invalid proposal. Please retry.', code: 'AI_INVALID_OUTPUT' });
-      }
-      return res.status(502).json({ error: msg, code: 'AI_PROVIDER_ERROR' });
+      observability.recordAiEvent('persistenceError');
+      const dbErr = classifyDatabaseError(err);
+      logStructured('error', 'ai_concept_persistence_failed', {
+        requestId,
+        dbErrorCode: dbErr?.code ?? 'DB_ERROR',
+        httpStatus: dbErr?.httpStatus ?? 500,
+      });
+      const safeMsg =
+        'Your concept proposal was generated, but we could not save it to the database right now. Your details are preserved — please click Retry.';
+      return res.status(500).json({
+        success: false,
+        error: safeMsg,
+        code: 'AI_PERSISTENCE_FAILED',
+        retryable: true,
+        requestId,
+        errorDetail: { code: 'AI_PERSISTENCE_FAILED', message: safeMsg, retryable: true },
+      });
     }
   });
 

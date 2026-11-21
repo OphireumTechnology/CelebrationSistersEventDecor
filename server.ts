@@ -65,9 +65,19 @@ function logSafeStartupDiagnostics(distPath: string): void {
     emailProvider: email.provider,
     emailLiveEnabled: email.liveDeliveryEnabled,
     aiConfigured: ai.configured,
+    aiModel: ai.model,
+    aiModelSource: ai.modelSource,
+    aiTimeoutMs: ai.timeoutMs,
+    aiMaxRetries: ai.maxRetries,
     allowedOriginsCount: getAllowedOrigins().length,
     staticFrontendPresent: fs.existsSync(path.join(distPath, 'index.html')),
   });
+  if (ai.modelWarning) {
+    logStructured('warn', 'ai_model_configuration_warning', {
+      model: ai.model,
+      warning: ai.modelWarning,
+    });
+  }
 }
 
 async function startServer() {
@@ -112,8 +122,22 @@ async function startServer() {
     console.log(`Celebration Sisters Event Decor server listening on http://0.0.0.0:${PORT}`);
   });
 
-  // Production HTTP timeout hardening for Railway edge proxy reliability (Block 13.12)
-  server.requestTimeout = Number(process.env.HTTP_REQUEST_TIMEOUT_MS) || 30_000;
+  // Production HTTP timeout hardening coordinated with Gemini AI timeout budget (never abort AI calls prematurely)
+  const aiConfig = getGeminiConfigStatus();
+  const minRecommendedHttpTimeoutMs = Math.max(75_000, aiConfig.timeoutMs + 20_000);
+  const configuredHttpTimeoutMs = Number(process.env.HTTP_REQUEST_TIMEOUT_MS);
+  const effectiveHttpRequestTimeoutMs =
+    Number.isFinite(configuredHttpTimeoutMs) && configuredHttpTimeoutMs >= 10_000
+      ? Math.max(configuredHttpTimeoutMs, aiConfig.timeoutMs + 10_000)
+      : minRecommendedHttpTimeoutMs;
+  if (Number.isFinite(configuredHttpTimeoutMs) && configuredHttpTimeoutMs < aiConfig.timeoutMs + 10_000) {
+    logStructured('warn', 'http_request_timeout_adjusted_for_ai', {
+      configuredHttpTimeoutMs,
+      aiTimeoutMs: aiConfig.timeoutMs,
+      effectiveHttpRequestTimeoutMs,
+    });
+  }
+  server.requestTimeout = effectiveHttpRequestTimeoutMs;
   server.headersTimeout = Number(process.env.HTTP_HEADERS_TIMEOUT_MS) || 35_000;
   server.keepAliveTimeout = Number(process.env.HTTP_KEEP_ALIVE_TIMEOUT_MS) || 65_000;
 

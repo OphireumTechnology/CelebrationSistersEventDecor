@@ -1,17 +1,22 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   AlertCircle,
+  ArrowRight,
   CheckCircle2,
+  History,
+  Info,
+  Layers,
   Loader2,
-  MessageSquare,
   Palette,
+  RefreshCw,
   Send,
+  ShieldCheck,
   Sparkles,
   UserCheck,
+  Wand2,
 } from 'lucide-react';
-import { SERVICE_DIVISIONS } from '../data/brandCatalog';
-import { apiFetch, isBackendConfigured } from '../lib/apiClient';
-import type { DesignConceptRecord, UserSession } from '../types/domain';
+import { apiFetch, isBackendConfigured, parseApiErrorResponse } from '../lib/apiClient';
+import type { ConceptRevision, DesignConceptRecord, UserSession } from '../types/domain';
 
 interface AIStudioWorkspaceProps {
   currentUser: UserSession;
@@ -23,7 +28,7 @@ interface AIStudioWorkspaceProps {
   }) => void;
 }
 
-interface ConciergeMessage {
+interface ConciergeMsg {
   role: 'user' | 'assistant';
   content: string;
 }
@@ -40,313 +45,687 @@ interface ExtractedLead {
   summary: string;
 }
 
-const QUICK_PROMPTS = [
-  'We are planning an autumn wedding for 180 guests in Columbia, SC with ivory florals and royal purple accents.',
-  'Looking for corporate gala lighting, stage design, and banquet tablescapes for 300 guests in January.',
-  'Planning an intimate garden baby shower for 45 guests near Lake Murray with a portrait photo booth.',
-];
+type StudioStatus =
+  | 'idle'
+  | 'generating'
+  | 'saving'
+  | 'success'
+  | 'retryable_error'
+  | 'validation_error'
+  | 'persistence_error'
+  | 'session_error';
 
-export function AIStudioWorkspace({ currentUser, onOpenBookingPrefilled }: AIStudioWorkspaceProps) {
+interface StudioFeedback {
+  status: StudioStatus;
+  message: string;
+  code?: string;
+  retryable?: boolean;
+  requestId?: string;
+}
+
+function generateIdempotencyKey(prefix: string): string {
+  const rand =
+    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID().replace(/-/g, '')
+      : `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+  return `${prefix}-${rand}`;
+}
+
+function isValidConceptPayload(candidate: unknown): candidate is DesignConceptRecord {
+  if (!candidate || typeof candidate !== 'object') return false;
+  const c = candidate as Partial<DesignConceptRecord>;
+  if (typeof c.id !== 'string' || c.id.trim().length === 0) return false;
+  if (!Array.isArray(c.revisions) || c.revisions.length === 0) return false;
+  const first = c.revisions[0] as Partial<ConceptRevision> | undefined;
+  if (!first || typeof first.themeName !== 'string' || first.themeName.trim().length === 0) return false;
+  if (typeof first.visionSummary !== 'string' || first.visionSummary.trim().length === 0) return false;
+  if (!Array.isArray(first.colorPalette) || first.colorPalette.length === 0) return false;
+  return true;
+}
+
+function formatRevisionTimestamp(iso?: string): string {
+  if (!iso) return 'Just generated';
+  const dt = new Date(iso);
+  if (Number.isNaN(dt.getTime())) return iso;
+  return dt.toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+}
+
+export function AIStudioWorkspace({
+  currentUser,
+  onOpenBookingPrefilled,
+}: AIStudioWorkspaceProps) {
   const [activeTab, setActiveTab] = useState<'concierge' | 'concept'>('concierge');
 
-  // AI Concierge state
+  // AI Event Concierge State
   const [sessionId, setSessionId] = useState<string | undefined>(undefined);
-  const [messages, setMessages] = useState<ConciergeMessage[]>([
+  const [messages, setMessages] = useState<ConciergeMsg[]>([
     {
       role: 'assistant',
       content:
-        'Welcome to Celebration Sisters Event Decor in Columbia, South Carolina. Tell me a little about the celebration you are envisioning—such as your event type, preferred date, location, and guest count—and I will guide you toward tailored service recommendations.',
+        'Welcome to Celebration Sisters Event Decor. I am your Columbia luxury event concierge. Tell me about the celebration you are envisioning — event type, approximate date, venue or city, and guest count — and I will curate tailored service divisions and prepare your planner brief.',
     },
   ]);
-  const [chatInput, setChatInput] = useState('');
-  const [chatLoading, setChatLoading] = useState(false);
-  const [chatError, setChatError] = useState<string | null>(null);
+  const [inputText, setInputText] = useState('');
+  const [lastFailedConciergeMessage, setLastFailedConciergeMessage] = useState<string | null>(null);
+  const [conciergeLoading, setConciergeLoading] = useState(false);
+  const [conciergeFeedback, setConciergeFeedback] = useState<StudioFeedback | null>(null);
   const [extractedLead, setExtractedLead] = useState<ExtractedLead | null>(null);
 
-  // AI Concept Studio state
+  // AI Concept Studio State
   const [concepts, setConcepts] = useState<DesignConceptRecord[]>([]);
-  const [selectedConceptId, setSelectedConceptId] = useState<string | null>(null);
-  const [conceptEventType, setConceptEventType] = useState(SERVICE_DIVISIONS[0].title);
-  const [conceptGuests, setConceptGuests] = useState(150);
-  const [conceptVenueStyle, setConceptVenueStyle] = useState('Historic Estate Ballroom');
-  const [conceptPalette, setConceptPalette] = useState('Royal Purple, Champagne Gold & Soft Ivory');
-  const [conceptVision, setConceptVision] = useState(
-    'Candlelit tables with elevated ivory garden roses, gold charger plates, and warm architectural uplighting.',
-  );
+  const [selectedConceptId, setSelectedConceptId] = useState<string>('');
+  const [activeRevisionIndex, setActiveRevisionIndex] = useState<number>(0);
   const [conceptLoading, setConceptLoading] = useState(false);
-  const [conceptError, setConceptError] = useState<string | null>(null);
-  const [activeRevisionIndex, setActiveRevisionIndex] = useState(0);
+  const [conceptFeedback, setConceptFeedback] = useState<StudioFeedback>({
+    status: 'idle',
+    message: '',
+  });
+  const [lastFailedReviseFlag, setLastFailedReviseFlag] = useState<boolean>(false);
+  const [pendingIdempotencyKey, setPendingIdempotencyKey] = useState<string | null>(null);
+  const [approvalSaving, setApprovalSaving] = useState(false);
 
+  const [conceptForm, setConceptForm] = useState({
+    eventType: 'Wedding Planning and Design',
+    guestCount: 150,
+    venueStyle: 'Historic Southern Estate & Ballroom',
+    preferredPalette: 'Royal Purple, Champagne Gold, and Soft Ivory',
+    visionDescription:
+      'Candlelit estate reception with elevated ivory floral towers, velvet lounge seating, and warm gold table details.',
+  });
+
+  const moodBoardRef = useRef<HTMLDivElement | null>(null);
+  const conceptSubmitInFlightRef = useRef(false);
+  const conciergeSubmitInFlightRef = useRef(false);
+
+  // Load persisted concepts ONLY when authenticated user identity changes (never on selectedConceptId change!)
   useEffect(() => {
+    let active = true;
+
     const loadConcepts = async () => {
-      if (currentUser.role === 'guest') {
-        setConcepts([]);
+      if (!isBackendConfigured) {
+        if (active) {
+          setConcepts([]);
+          setSelectedConceptId('');
+        }
         return;
       }
+
+      if (currentUser.role === 'guest') {
+        // Clear any previous authenticated user's private concepts when switching to guest,
+        // without interfering with concepts generated during the active guest session.
+        if (active) {
+          setConcepts((prev) => prev.filter((c) => c.clientId === 'public-concierge-preview'));
+          setSelectedConceptId((prevId) => prevId);
+        }
+        return;
+      }
+
       try {
         const res = await apiFetch('/api/concepts', {
           credentials: 'include',
+          timeoutMs: 15_000,
         });
-        if (!res.ok) return;
-        const data = await res.json();
-        setConcepts(data.concepts || []);
-        if (data.concepts?.length > 0 && !selectedConceptId) {
-          setSelectedConceptId(data.concepts[0].id);
+        if (!active) return;
+
+        if (res.status === 401) {
+          setConceptFeedback({
+            status: 'session_error',
+            code: 'AUTH_REQUIRED',
+            message: 'Your saved concepts require an active sign-in session. Please sign in again to access saved boards.',
+            retryable: false,
+          });
+          setConcepts([]);
+          setSelectedConceptId('');
+          return;
+        }
+
+        if (res.ok) {
+          const data = (await res.json()) as { concepts?: DesignConceptRecord[] };
+          const list = Array.isArray(data.concepts) ? data.concepts : [];
+          setConcepts(list);
+          setSelectedConceptId((prevSelected) => {
+            if (prevSelected && list.some((c) => c.id === prevSelected)) {
+              return prevSelected;
+            }
+            return list[0]?.id || '';
+          });
+          setActiveRevisionIndex(0);
         }
       } catch {
-        // Silent initial load
+        // Preserve current client state on transient load issue
       }
     };
-    loadConcepts();
-  }, [currentUser.id, currentUser.role, selectedConceptId]);
 
-  const sendConciergeMessage = async (textToSend: string) => {
-    const trimmed = textToSend.trim();
-    if (!trimmed || chatLoading) return;
+    void loadConcepts();
+    return () => {
+      active = false;
+    };
+  }, [currentUser.id, currentUser.role]);
 
-    setChatError(null);
-    const nextHistory: ConciergeMessage[] = [...messages, { role: 'user', content: trimmed }];
-    setMessages(nextHistory);
-    setChatInput('');
-    setChatLoading(true);
+  const selectedConcept = concepts.find((c) => c.id === selectedConceptId) || concepts[0] || null;
+  const activeRevision: ConceptRevision | null = selectedConcept
+    ? selectedConcept.revisions[activeRevisionIndex] || selectedConcept.revisions[0] || null
+    : null;
+
+  const updateConceptForm = (patch: Partial<typeof conceptForm>) => {
+    setConceptForm((prev) => ({ ...prev, ...patch }));
+    // Fresh inputs require a fresh idempotency key so edits are never deduplicated against an older vision
+    setPendingIdempotencyKey(null);
+  };
+
+  const sendConciergeMessage = async (messageOverride?: string) => {
+    const trimmed = (messageOverride ?? inputText).trim();
+    if (!trimmed || conciergeLoading || conciergeSubmitInFlightRef.current) return;
+
+    conciergeSubmitInFlightRef.current = true;
+    const isRetry = messageOverride !== undefined;
+    const priorHistory = messages;
+    const optimisticMessages: ConciergeMsg[] = isRetry
+      ? messages
+      : [...messages, { role: 'user', content: trimmed }];
+
+    setMessages(optimisticMessages);
+    if (!isRetry) {
+      setInputText('');
+    }
+    setConciergeLoading(true);
+    setConciergeFeedback(null);
+    setLastFailedConciergeMessage(null);
 
     try {
       const res = await apiFetch('/api/ai/concierge', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
+        timeoutMs: 65_000,
         body: JSON.stringify({
           sessionId,
           clientName: currentUser.role !== 'guest' ? currentUser.name : undefined,
           message: trimmed,
-          history: messages,
+          history: priorHistory,
         }),
       });
-      const data = await res.json();
+
       if (!res.ok) {
-        throw new Error(data.error || 'AI Event Concierge is currently unavailable.');
+        const parsedErr = await parseApiErrorResponse(
+          res,
+          'AI Event Concierge could not respond right now. Please try again.',
+        );
+        // Preserve user's draft input so they never lose their message
+        if (!isRetry) {
+          setMessages(priorHistory);
+          setInputText(trimmed);
+        }
+        setLastFailedConciergeMessage(trimmed);
+        setConciergeFeedback({
+          status:
+            parsedErr.status === 400
+              ? 'validation_error'
+              : parsedErr.status === 401
+                ? 'session_error'
+                : parsedErr.code === 'AI_PERSISTENCE_FAILED'
+                  ? 'persistence_error'
+                  : 'retryable_error',
+          message: parsedErr.message,
+          code: parsedErr.code,
+          retryable: parsedErr.retryable || parsedErr.status >= 500 || parsedErr.status === 429,
+          requestId: parsedErr.requestId,
+        });
+        return;
       }
-      setSessionId(data.sessionId);
-      setMessages([...nextHistory, { role: 'assistant', content: data.reply }]);
-      setExtractedLead(data.extractedLead);
-    } catch (err) {
-      setChatError(err instanceof Error ? err.message : 'Unable to reach AI Concierge.');
+
+      const data = (await res.json()) as {
+        sessionId?: string;
+        reply?: string;
+        extractedLead?: ExtractedLead;
+        requestId?: string;
+      };
+
+      if (!data.reply || typeof data.reply !== 'string') {
+        if (!isRetry) {
+          setMessages(priorHistory);
+          setInputText(trimmed);
+        }
+        setLastFailedConciergeMessage(trimmed);
+        setConciergeFeedback({
+          status: 'retryable_error',
+          code: 'INVALID_RESPONSE_PAYLOAD',
+          message: 'The AI Event Concierge returned an incomplete response. Please retry.',
+          retryable: true,
+          requestId: data.requestId,
+        });
+        return;
+      }
+
+      if (data.sessionId) setSessionId(data.sessionId);
+      setMessages((prev) => {
+        const base = isRetry ? [...priorHistory, { role: 'user' as const, content: trimmed }] : prev;
+        return [...base, { role: 'assistant' as const, content: data.reply! }];
+      });
+      if (data.extractedLead) setExtractedLead(data.extractedLead);
+      setConciergeFeedback({
+        status: 'success',
+        message: 'Concierge brief updated.',
+        requestId: data.requestId,
+      });
+    } catch {
+      if (!isRetry) {
+        setMessages(priorHistory);
+        setInputText(trimmed);
+      }
+      setLastFailedConciergeMessage(trimmed);
+      setConciergeFeedback({
+        status: 'retryable_error',
+        code: 'NETWORK_ERROR',
+        message:
+          'Unable to reach the AI Event Concierge right now. Your message is preserved below — please click Retry.',
+        retryable: true,
+      });
     } finally {
-      setChatLoading(false);
+      setConciergeLoading(false);
+      conciergeSubmitInFlightRef.current = false;
     }
   };
 
-  const handleChatSubmit = (e: FormEvent) => {
-    e.preventDefault();
-    sendConciergeMessage(chatInput);
-  };
+  const handleGenerateConcept = async (reviseExisting: boolean, isRetry = false) => {
+    if (conceptLoading || conceptSubmitInFlightRef.current) return;
 
-  const handleGenerateConcept = async (e: FormEvent, reviseExisting = false) => {
-    e.preventDefault();
+    // Client-side pre-validation so invalid entries produce crisp, immediate feedback without losing inputs
+    const trimmedVenue = conceptForm.venueStyle.trim();
+    const trimmedPalette = conceptForm.preferredPalette.trim();
+    const trimmedVision = conceptForm.visionDescription.trim();
+    const guestCountNum = Number(conceptForm.guestCount);
+
+    if (
+      !Number.isInteger(guestCountNum) ||
+      guestCountNum < 10 ||
+      guestCountNum > 2000 ||
+      trimmedVenue.length < 2 ||
+      trimmedPalette.length < 2 ||
+      trimmedVision.length < 5
+    ) {
+      setConceptFeedback({
+        status: 'validation_error',
+        code: 'VALIDATION_ERROR',
+        message:
+          'Please provide a guest count between 10 and 2,000, a venue style, a color palette, and at least 5 characters describing your vision.',
+        retryable: false,
+      });
+      return;
+    }
+
+    conceptSubmitInFlightRef.current = true;
     setConceptLoading(true);
-    setConceptError(null);
+    setLastFailedReviseFlag(reviseExisting);
+    setConceptFeedback({
+      status: 'generating',
+      message: reviseExisting
+        ? 'Composing your updated concept revision and saving to your board...'
+        : 'Composing your custom luxury concept mood board...',
+    });
+
+    const idempotencyKey =
+      isRetry && pendingIdempotencyKey
+        ? pendingIdempotencyKey
+        : generateIdempotencyKey(reviseExisting ? 'cnc-rev' : 'cnc-new');
+    setPendingIdempotencyKey(idempotencyKey);
 
     try {
       const res = await apiFetch('/api/ai/concept-studio', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'Idempotency-Key': idempotencyKey,
         },
         credentials: 'include',
+        timeoutMs: 70_000,
         body: JSON.stringify({
-          conceptId: reviseExisting && selectedConceptId ? selectedConceptId : undefined,
-          eventType: conceptEventType,
-          guestCount: Number(conceptGuests),
-          venueStyle: conceptVenueStyle,
-          preferredPalette: conceptPalette,
-          visionDescription: conceptVision,
+          conceptId: reviseExisting && selectedConcept ? selectedConcept.id : undefined,
+          eventType: conceptForm.eventType,
+          guestCount: guestCountNum,
+          venueStyle: trimmedVenue,
+          preferredPalette: trimmedPalette,
+          visionDescription: trimmedVision,
         }),
       });
-      const data = await res.json();
+
       if (!res.ok) {
-        throw new Error(data.error || 'Unable to generate concept proposal.');
+        const parsedErr = await parseApiErrorResponse(
+          res,
+          'Unable to generate concept proposal right now. Your inputs are preserved — please try again.',
+        );
+        const status: StudioStatus =
+          parsedErr.status === 400
+            ? 'validation_error'
+            : parsedErr.status === 401
+              ? 'session_error'
+              : parsedErr.code === 'AI_PERSISTENCE_FAILED'
+                ? 'persistence_error'
+                : 'retryable_error';
+        setConceptFeedback({
+          status,
+          code: parsedErr.code,
+          message: parsedErr.message,
+          retryable: parsedErr.retryable || parsedErr.status >= 500 || parsedErr.status === 429,
+          requestId: parsedErr.requestId,
+        });
+        return;
       }
-      const created: DesignConceptRecord = data.concept;
+
+      setConceptFeedback({
+        status: 'saving',
+        message: 'Validating and displaying your saved mood board...',
+      });
+
+      const data = (await res.json().catch(() => ({}))) as {
+        concept?: unknown;
+        persisted?: boolean;
+        deduplicated?: boolean;
+        requestId?: string;
+      };
+
+      if (!isValidConceptPayload(data.concept)) {
+        setConceptFeedback({
+          status: 'persistence_error',
+          code: 'INVALID_CONCEPT_PAYLOAD',
+          message:
+            'The server responded without a valid mood board payload. Your celebration details are preserved — please click Retry.',
+          retryable: true,
+          requestId: data.requestId || res.headers.get('X-Request-Id') || undefined,
+        });
+        return;
+      }
+
+      const created = data.concept;
+      const latestIdx = created.revisions.findIndex((r) => r.version === created.currentVersion);
+      const targetRevIndex = latestIdx >= 0 ? latestIdx : 0;
+
       setConcepts((prev) => {
         const exists = prev.some((c) => c.id === created.id);
         return exists ? prev.map((c) => (c.id === created.id ? created : c)) : [created, ...prev];
       });
       setSelectedConceptId(created.id);
-      setActiveRevisionIndex(0);
-    } catch (err) {
-      setConceptError(err instanceof Error ? err.message : 'Concept generation failed.');
+      setActiveRevisionIndex(targetRevIndex);
+      setPendingIdempotencyKey(null);
+
+      setConceptFeedback({
+        status: 'success',
+        message: reviseExisting
+          ? `Revision v${created.currentVersion} saved and displayed (${created.id}).`
+          : `Concept proposal "${created.revisions[targetRevIndex]?.themeName}" saved and ready (${created.id}).`,
+        requestId: data.requestId || res.headers.get('X-Request-Id') || undefined,
+      });
+
+      // Bring the newly rendered mood board into clear viewport focus (critical on mobile & smaller screens)
+      requestAnimationFrame(() => {
+        moodBoardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        moodBoardRef.current?.focus?.({ preventScroll: true });
+      });
+    } catch {
+      setConceptFeedback({
+        status: 'retryable_error',
+        code: 'NETWORK_ERROR',
+        message:
+          'Unable to reach the Concept Studio AI service. Your celebration details are preserved — please click Retry.',
+        retryable: true,
+      });
     } finally {
       setConceptLoading(false);
+      conceptSubmitInFlightRef.current = false;
     }
   };
 
-  const handleApproveConcept = async (conceptId: string) => {
+  const handleApproveConcept = async () => {
+    if (!selectedConcept || currentUser.role === 'guest' || approvalSaving) return;
+    setApprovalSaving(true);
     try {
-      const res = await apiFetch(`/api/concepts/${conceptId}/approve`, {
+      const res = await apiFetch(`/api/concepts/${selectedConcept.id}/approve`, {
         method: 'POST',
         credentials: 'include',
+        timeoutMs: 15_000,
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Approval failed.');
-      setConcepts((prev) => prev.map((c) => (c.id === conceptId ? data.concept : c)));
-    } catch (err) {
-      setConceptError(err instanceof Error ? err.message : 'Approval error.');
+      if (!res.ok) {
+        const parsedErr = await parseApiErrorResponse(res, 'Could not record concept approval.');
+        setConceptFeedback({
+          status: parsedErr.status === 401 ? 'session_error' : 'persistence_error',
+          code: parsedErr.code,
+          message: parsedErr.message,
+          retryable: parsedErr.retryable,
+          requestId: parsedErr.requestId,
+        });
+        return;
+      }
+      const data = (await res.json()) as { concept: DesignConceptRecord };
+      setConcepts((prev) => prev.map((c) => (c.id === data.concept.id ? data.concept : c)));
+      setConceptFeedback({
+        status: 'success',
+        message:
+          currentUser.role === 'client'
+            ? 'Client design approval recorded on this concept board.'
+            : 'Lead designer sign-off recorded on this concept board.',
+      });
+    } catch {
+      setConceptFeedback({
+        status: 'retryable_error',
+        code: 'NETWORK_ERROR',
+        message: 'Unable to reach the approval server right now. Please try again.',
+        retryable: true,
+      });
+    } finally {
+      setApprovalSaving(false);
     }
   };
 
-  const activeConcept = concepts.find((c) => c.id === selectedConceptId) || concepts[0];
-  const activeRevision = activeConcept?.revisions[activeRevisionIndex] || activeConcept?.revisions[0];
+  const canReviseSelected =
+    Boolean(selectedConcept) &&
+    currentUser.role !== 'guest' &&
+    !(selectedConcept?.clientApproved && selectedConcept?.staffApproved && currentUser.role === 'client');
 
   return (
-    <div className="bg-[var(--cs-ivory)] min-h-[82vh] py-12 text-[var(--cs-charcoal)]">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 space-y-8">
-        {/* Studio Header & Mode Switch */}
-        <div className="flex flex-col md:flex-row md:items-end justify-between gap-6 border-b border-[var(--cs-border)] pb-6">
-          <div className="space-y-2">
-            <p className="text-xs font-semibold tracking-[0.18em] text-[var(--cs-gold-muted)] uppercase">
-              Intelligent Planning Suite
+    <div className="bg-white min-h-[82vh]">
+      {/* Header Banner */}
+      <section className="bg-[var(--cs-cream)] border-b border-[var(--cs-border)] py-12">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col lg:flex-row lg:items-end justify-between gap-6">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.22em] text-[var(--cs-gold)]">
+              Celebration Sisters Intelligent Design Suite
             </p>
-            <h1 className="font-display text-3xl sm:text-4xl font-semibold text-[var(--cs-purple)]">
-              AI Event Concierge & Concept Studio
+            <h1 className="font-serif text-4xl sm:text-5xl text-[var(--cs-purple)] mt-2">
+              AI Concierge & Event Concept Studio
             </h1>
+            <p className="text-sm text-[var(--cs-charcoal-light)] mt-3 max-w-2xl leading-relaxed">
+              Explore service divisions with our luxury concierge or compose structured conceptual
+              mood boards with color palettes, floral installations, and lighting plans. All AI
+              proposals remain conceptual visualizations subject to human Lead Planner review.
+            </p>
           </div>
 
-          <div className="inline-flex bg-white border border-[var(--cs-border)] p-1 rounded-lg self-start">
+          <div className="inline-flex bg-white p-1.5 rounded-xl border border-[var(--cs-border)] shadow-sm self-start lg:self-auto">
             <button
               type="button"
               onClick={() => setActiveTab('concierge')}
-              className={`px-4 py-2 text-xs font-medium rounded-md inline-flex items-center gap-2 transition-colors whitespace-nowrap cursor-pointer ${
+              className={`px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-colors ${
                 activeTab === 'concierge'
-                  ? 'bg-[var(--cs-purple)] text-white'
-                  : 'text-[var(--cs-charcoal-muted)] hover:text-[var(--cs-purple)]'
+                  ? 'bg-[var(--cs-purple)] text-white shadow-sm'
+                  : 'text-[var(--cs-charcoal)] hover:bg-[var(--cs-cream)]'
               }`}
             >
-              <MessageSquare className="w-3.5 h-3.5" />
+              <Sparkles className="w-4 h-4" />
               AI Event Concierge
             </button>
             <button
               type="button"
               onClick={() => setActiveTab('concept')}
-              className={`px-4 py-2 text-xs font-medium rounded-md inline-flex items-center gap-2 transition-colors whitespace-nowrap cursor-pointer ${
+              className={`px-4 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 transition-colors ${
                 activeTab === 'concept'
-                  ? 'bg-[var(--cs-purple)] text-white'
-                  : 'text-[var(--cs-charcoal-muted)] hover:text-[var(--cs-purple)]'
+                  ? 'bg-[var(--cs-purple)] text-white shadow-sm'
+                  : 'text-[var(--cs-charcoal)] hover:bg-[var(--cs-cream)]'
               }`}
             >
-              <Palette className="w-3.5 h-3.5" />
+              <Palette className="w-4 h-4" />
               AI Concept Studio
             </button>
           </div>
         </div>
+      </section>
 
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
         {!isBackendConfigured && (
-          <div className="p-4 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-900 flex items-start gap-2.5">
-            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-amber-700" />
-            <div>
-              <p className="font-semibold">Interactive AI Studio Requires Hosted Backend Connection</p>
-              <p className="mt-0.5 leading-relaxed">
-                This static preview showcases the Celebration Sisters design experience. Connect your secure HTTPS backend via <code className="font-mono">VITE_API_BASE_URL</code> or contact our Columbia studio directly to start a live AI planning session.
-              </p>
+          <div className="mb-8 rounded-2xl border border-[var(--cs-gold)]/40 bg-[var(--cs-cream)] p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div className="flex items-start gap-3">
+              <Info className="w-5 h-5 text-[var(--cs-purple)] shrink-0 mt-0.5" />
+              <div>
+                <p className="text-sm font-semibold text-[var(--cs-purple)]">
+                  Live AI Studio requires the Celebration Sisters backend API connection
+                </p>
+                <p className="text-xs text-[var(--cs-charcoal-light)] mt-1 leading-relaxed">
+                  You are viewing the static GitHub Pages preview build. Live Gemini AI Concierge
+                  sessions and saved Concept Studio mood boards activate automatically once{' '}
+                  <code className="text-[11px] bg-white px-1.5 py-0.5 rounded border border-[var(--cs-border)]">
+                    VITE_API_BASE_URL
+                  </code>{' '}
+                  is connected to the deployed Express API service.
+                </p>
+              </div>
             </div>
+            <button
+              type="button"
+              onClick={() => onOpenBookingPrefilled({ location: 'Columbia, SC' })}
+              className="px-4 py-2.5 rounded-lg bg-[var(--cs-purple)] text-white text-xs font-semibold shrink-0 hover:bg-[var(--cs-purple-dark)]"
+            >
+              Request Direct Consultation
+            </button>
           </div>
         )}
 
-        {activeTab === 'concierge' ? (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-            {/* Purple & Ivory Chat Workspace */}
-            <div className="lg:col-span-8 bg-white border border-[var(--cs-border)] rounded-lg overflow-hidden flex flex-col">
-              <div className="bg-[var(--cs-purple)] text-white px-6 py-4 flex items-center justify-between gap-4 border-b border-[var(--cs-gold)]/40">
-                <div className="flex items-center gap-2.5">
-                  <Sparkles className="w-4 h-4 text-[#E6C98F]" />
+        {/* TAB 1: AI EVENT CONCIERGE */}
+        {activeTab === 'concierge' && (
+          <div className="grid lg:grid-cols-12 gap-8 items-start">
+            {/* Chat Column */}
+            <div className="lg:col-span-8 bg-white rounded-2xl border border-[var(--cs-border)] shadow-sm overflow-hidden flex flex-col h-[620px]">
+              <div className="px-6 py-4 bg-[var(--cs-purple)] text-white flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="w-9 h-9 rounded-lg bg-white/10 flex items-center justify-center">
+                    <Sparkles className="w-4 h-4 text-[var(--cs-gold-light)]" />
+                  </div>
                   <div>
-                    <h2 className="font-display text-base font-semibold">Celebration Sisters AI Concierge</h2>
-                    <p className="text-[11px] text-white/80">
-                      Guided discovery · Preliminary service matching · Human planner escalation
+                    <p className="font-serif text-lg leading-tight">
+                      Celebration Sisters AI Concierge
+                    </p>
+                    <p className="text-[11px] text-white/75">
+                      Columbia & Midlands SC • Powered by Server-Side Gemini • Human Escalation Ready
                     </p>
                   </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={() =>
-                    onOpenBookingPrefilled({
-                      eventType: extractedLead?.eventCategory !== 'Unknown' ? extractedLead?.eventCategory : undefined,
-                      location: extractedLead?.location,
-                      guestCount: extractedLead?.guestCount ?? undefined,
-                      notes: extractedLead?.summary,
-                    })
-                  }
-                  className="px-3.5 py-1.5 text-xs font-medium bg-white text-[var(--cs-purple)] hover:bg-[var(--cs-ivory)] rounded-md whitespace-nowrap cursor-pointer"
-                >
-                  Request Human Consultation
-                </button>
+                {sessionId && (
+                  <span className="text-[11px] font-mono bg-white/10 px-2.5 py-1 rounded-md">
+                    {sessionId}
+                  </span>
+                )}
               </div>
 
-              {/* Conversation History */}
-              <div className="p-6 space-y-4 h-[420px] overflow-y-auto bg-[var(--cs-ivory)]/45">
-                {messages.map((msg, idx) => (
+              <div className="flex-1 overflow-y-auto p-6 space-y-4 bg-[var(--cs-cream)]/40">
+                {messages.map((m, idx) => (
                   <div
                     key={idx}
-                    className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                    className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}
                   >
                     <div
-                      className={`max-w-[85%] rounded-lg px-4 py-3 text-sm leading-relaxed ${
-                        msg.role === 'user'
-                          ? 'bg-[var(--cs-purple)] text-white'
-                          : 'bg-white border border-[var(--cs-border)] text-[var(--cs-charcoal)]'
+                      className={`max-w-[82%] rounded-2xl px-5 py-3.5 text-sm leading-relaxed shadow-sm ${
+                        m.role === 'user'
+                          ? 'bg-[var(--cs-purple)] text-white rounded-br-sm'
+                          : 'bg-white border border-[var(--cs-border)] text-[var(--cs-charcoal)] rounded-bl-sm'
                       }`}
                     >
-                      {msg.content}
+                      {m.content}
                     </div>
                   </div>
                 ))}
-
-                {chatLoading && (
-                  <div className="flex justify-start">
-                    <div className="bg-white border border-[var(--cs-border)] rounded-lg px-4 py-3 text-xs text-[var(--cs-charcoal-muted)] inline-flex items-center gap-2">
-                      <Loader2 className="w-3.5 h-3.5 animate-spin text-[var(--cs-purple)]" />
-                      <span>Composing tailored recommendations...</span>
+                {conciergeLoading && (
+                  <div className="flex justify-start" role="status" aria-live="polite">
+                    <div className="bg-white border border-[var(--cs-border)] rounded-2xl px-5 py-3.5 text-sm text-[var(--cs-charcoal-light)] flex items-center gap-2">
+                      <Loader2 className="w-4 h-4 animate-spin text-[var(--cs-gold)]" />
+                      Curating tailored Columbia event guidance...
                     </div>
                   </div>
                 )}
-
-                {chatError && (
-                  <div className="p-3 rounded-md bg-red-50 border border-red-200 text-xs text-red-800 flex items-center gap-2">
-                    <AlertCircle className="w-4 h-4 shrink-0" />
-                    <span>{chatError}</span>
+                {conciergeFeedback && conciergeFeedback.status !== 'success' && (
+                  <div
+                    role="alert"
+                    className="rounded-xl bg-red-50 border border-red-200 px-4 py-3 text-xs text-red-800 space-y-2"
+                  >
+                    <div className="flex items-start gap-2">
+                      <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-red-700" />
+                      <div className="flex-1">
+                        <p className="font-semibold text-red-900">{conciergeFeedback.message}</p>
+                        {conciergeFeedback.requestId && (
+                          <p className="text-[11px] text-red-700/80 font-mono mt-1">
+                            Ref: {conciergeFeedback.requestId}
+                            {conciergeFeedback.code ? ` • ${conciergeFeedback.code}` : ''}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                    {conciergeFeedback.retryable && lastFailedConciergeMessage && (
+                      <div className="flex items-center gap-2 pl-6">
+                        <button
+                          type="button"
+                          onClick={() => void sendConciergeMessage(lastFailedConciergeMessage)}
+                          disabled={conciergeLoading}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-700 text-white text-xs font-semibold hover:bg-red-800 disabled:opacity-50"
+                        >
+                          <RefreshCw className="w-3.5 h-3.5" />
+                          Retry Concierge Request
+                        </button>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
 
-              {/* Quick Prompts */}
-              <div className="px-6 py-3 bg-[var(--cs-ivory)] border-t border-[var(--cs-border)] flex flex-wrap gap-2">
-                {QUICK_PROMPTS.map((q) => (
+              {/* Suggested Prompts */}
+              <div className="px-6 py-2.5 bg-white border-t border-[var(--cs-border)] flex flex-wrap gap-2">
+                {[
+                  'Autumn estate wedding in Columbia for 180 guests in purple & gold',
+                  'Corporate awards gala for 300 guests with lighting & DJ',
+                  'Garden baby shower in Irmo for 50 guests with balloon garland',
+                ].map((prompt) => (
                   <button
-                    key={q}
+                    key={prompt}
                     type="button"
-                    onClick={() => sendConciergeMessage(q)}
-                    disabled={chatLoading}
-                    className="text-left text-[11px] px-3 py-1.5 bg-white border border-[var(--cs-border)] hover:border-[var(--cs-gold)] rounded-md text-[var(--cs-charcoal-muted)] hover:text-[var(--cs-purple)] transition-colors cursor-pointer"
+                    onClick={() => setInputText(prompt)}
+                    className="text-[11px] px-3 py-1.5 rounded-md bg-[var(--cs-cream)] text-[var(--cs-purple)] hover:bg-[var(--cs-purple)]/10 transition-colors"
                   >
-                    {q.slice(0, 56)}...
+                    {prompt}
                   </button>
                 ))}
               </div>
 
-              {/* Input Bar */}
-              <form onSubmit={handleChatSubmit} className="p-4 bg-white border-t border-[var(--cs-border)] flex gap-3">
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void sendConciergeMessage();
+                }}
+                className="p-4 bg-white border-t border-[var(--cs-border)] flex gap-3"
+              >
                 <input
                   type="text"
-                  value={chatInput}
-                  onChange={(e) => setChatInput(e.target.value)}
-                  placeholder="Describe your celebration date, location, guest count, or aesthetic..."
-                  className="flex-1 px-4 py-2.5 text-sm border border-[var(--cs-border-strong)] rounded-md focus:border-[var(--cs-purple)] outline-none"
+                  value={inputText}
+                  onChange={(e) => setInputText(e.target.value)}
+                  placeholder="Describe your event type, target date, venue, and guest count..."
+                  aria-label="Message for AI Event Concierge"
+                  className="flex-1 px-4 py-2.5 rounded-xl border border-[var(--cs-border)] text-sm focus:outline-none focus:border-[var(--cs-purple)]"
                 />
                 <button
                   type="submit"
-                  disabled={chatLoading || !chatInput.trim()}
-                  className="px-5 py-2.5 text-sm font-medium text-white bg-[var(--cs-purple)] hover:bg-[var(--cs-purple-hover)] disabled:opacity-50 rounded-md inline-flex items-center gap-2 whitespace-nowrap cursor-pointer"
+                  disabled={conciergeLoading || !inputText.trim()}
+                  className="px-5 py-2.5 rounded-xl bg-[var(--cs-purple)] text-white text-sm font-medium hover:bg-[var(--cs-purple-dark)] disabled:opacity-50 flex items-center gap-2 transition-colors"
                 >
                   <Send className="w-4 h-4" />
                   Send
@@ -354,330 +733,607 @@ export function AIStudioWorkspace({ currentUser, onOpenBookingPrefilled }: AIStu
               </form>
             </div>
 
-            {/* Right Panel: Live Captured Lead Brief & Guardrails */}
-            <aside className="lg:col-span-4 space-y-6">
-              <div className="bg-white border border-[var(--cs-border)] rounded-lg p-6 space-y-4">
-                <h3 className="font-display text-lg font-semibold text-[var(--cs-purple)]">
-                  Captured Discovery Profile
-                </h3>
-                {extractedLead ? (
-                  <div className="space-y-3 text-xs">
-                    <div className="flex justify-between gap-4 py-1.5 border-b border-[var(--cs-border)]">
-                      <span className="text-[var(--cs-charcoal-muted)]">Category</span>
-                      <span className="font-medium text-right">{extractedLead.eventCategory}</span>
-                    </div>
-                    <div className="flex justify-between gap-4 py-1.5 border-b border-[var(--cs-border)]">
-                      <span className="text-[var(--cs-charcoal-muted)]">Target Date</span>
-                      <span className="font-medium tabular-nums">{extractedLead.eventDate}</span>
-                    </div>
-                    <div className="flex justify-between gap-4 py-1.5 border-b border-[var(--cs-border)]">
-                      <span className="text-[var(--cs-charcoal-muted)]">Location</span>
-                      <span className="font-medium">{extractedLead.location}</span>
-                    </div>
-                    <div className="flex justify-between gap-4 py-1.5 border-b border-[var(--cs-border)]">
-                      <span className="text-[var(--cs-charcoal-muted)]">Guest Count</span>
-                      <span className="font-medium tabular-nums">
-                        {extractedLead.guestCount ?? 'Unspecified'}
-                      </span>
-                    </div>
-                    <div className="flex justify-between gap-4 py-1.5 border-b border-[var(--cs-border)]">
-                      <span className="text-[var(--cs-charcoal-muted)]">Theme</span>
-                      <span className="font-medium text-right">{extractedLead.theme}</span>
-                    </div>
-                    <div className="flex justify-between gap-4 py-1.5 border-b border-[var(--cs-border)]">
-                      <span className="text-[var(--cs-charcoal-muted)]">Budget Range</span>
-                      <span className="font-medium text-right">{extractedLead.budgetRange}</span>
-                    </div>
+            {/* Structured Lead & Escalation Panel */}
+            <div className="lg:col-span-4 space-y-5">
+              <div className="bg-[var(--cs-cream)] rounded-2xl border border-[var(--cs-border)] p-6">
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[var(--cs-gold)]">
+                  Captured Planner Brief
+                </p>
+                <h2 className="font-serif text-2xl text-[var(--cs-purple)] mt-1">
+                  Structured Event Summary
+                </h2>
+                <p className="text-xs text-[var(--cs-charcoal-light)] mt-1">
+                  Automatically extracted from your conversation so our Columbia planning team can
+                  prepare your consultation seamlessly.
+                </p>
 
-                    {extractedLead.recommendedDivisions.length > 0 && (
-                      <div className="pt-1 space-y-1.5">
-                        <p className="text-[var(--cs-charcoal-muted)] font-medium">Recommended Divisions</p>
-                        <ul className="space-y-1 text-[var(--cs-purple)] font-medium">
+                {extractedLead ? (
+                  <div className="mt-5 space-y-3 text-sm">
+                    <div className="p-3 bg-white rounded-xl border border-[var(--cs-border)]">
+                      <p className="text-[11px] uppercase tracking-wider text-[var(--cs-charcoal-light)]">
+                        Event Category
+                      </p>
+                      <p className="font-medium text-[var(--cs-purple)] mt-0.5">
+                        {extractedLead.eventCategory}
+                      </p>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="p-3 bg-white rounded-xl border border-[var(--cs-border)]">
+                        <p className="text-[11px] uppercase tracking-wider text-[var(--cs-charcoal-light)]">
+                          Target Date
+                        </p>
+                        <p className="font-medium text-[var(--cs-charcoal)] mt-0.5">
+                          {extractedLead.eventDate || 'TBD'}
+                        </p>
+                      </div>
+                      <div className="p-3 bg-white rounded-xl border border-[var(--cs-border)]">
+                        <p className="text-[11px] uppercase tracking-wider text-[var(--cs-charcoal-light)]">
+                          Guests
+                        </p>
+                        <p className="font-medium text-[var(--cs-charcoal)] mt-0.5">
+                          {extractedLead.guestCount ?? 'TBD'}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="p-3 bg-white rounded-xl border border-[var(--cs-border)]">
+                      <p className="text-[11px] uppercase tracking-wider text-[var(--cs-charcoal-light)]">
+                        Location & Aesthetic
+                      </p>
+                      <p className="font-medium text-[var(--cs-charcoal)] mt-0.5">
+                        {extractedLead.location || 'Columbia, SC'} •{' '}
+                        {extractedLead.theme || 'Bespoke Luxury'}
+                      </p>
+                    </div>
+                    {extractedLead.recommendedDivisions?.length > 0 && (
+                      <div className="p-3 bg-white rounded-xl border border-[var(--cs-border)]">
+                        <p className="text-[11px] uppercase tracking-wider text-[var(--cs-charcoal-light)] mb-1.5">
+                          Recommended Divisions
+                        </p>
+                        <div className="flex flex-wrap gap-1.5">
                           {extractedLead.recommendedDivisions.map((d) => (
-                            <li key={d}>· {d}</li>
+                            <span
+                              key={d}
+                              className="text-[11px] px-2.5 py-1 rounded-md bg-[var(--cs-cream)] text-[var(--cs-purple)] font-medium"
+                            >
+                              {d}
+                            </span>
                           ))}
-                        </ul>
+                        </div>
                       </div>
                     )}
 
-                    <div className="pt-2">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          onOpenBookingPrefilled({
-                            eventType: extractedLead.eventCategory,
-                            location: extractedLead.location,
-                            guestCount: extractedLead.guestCount ?? 100,
-                            notes: extractedLead.summary,
-                          })
-                        }
-                        className="w-full py-2.5 text-xs font-medium text-white bg-[var(--cs-purple)] hover:bg-[var(--cs-purple-hover)] rounded-md cursor-pointer"
-                      >
-                        Convert Profile to Consultation Inquiry
-                      </button>
-                    </div>
+                    {extractedLead.needsHumanEscalation && (
+                      <div className="p-3.5 rounded-xl bg-[var(--cs-purple)]/5 border border-[var(--cs-purple)]/25 text-xs text-[var(--cs-purple)] flex items-start gap-2.5">
+                        <UserCheck className="w-4 h-4 shrink-0 mt-0.5 text-[var(--cs-gold)]" />
+                        <span>
+                          <strong>Human Planner Recommended:</strong> This request involves custom
+                          quotations, availability confirmation, or contract coordination.
+                        </span>
+                      </div>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onOpenBookingPrefilled({
+                          eventType: extractedLead.eventCategory,
+                          location: extractedLead.location || 'Columbia, SC',
+                          guestCount: extractedLead.guestCount || 120,
+                          notes: extractedLead.summary,
+                        })
+                      }
+                      className="w-full py-3 px-4 rounded-xl bg-[var(--cs-purple)] text-white text-sm font-medium hover:bg-[var(--cs-purple-dark)] flex items-center justify-center gap-2 transition-colors"
+                    >
+                      Transfer Brief to Consultation Form
+                      <ArrowRight className="w-4 h-4" />
+                    </button>
                   </div>
                 ) : (
-                  <p className="text-xs text-[var(--cs-charcoal-muted)] leading-relaxed">
-                    As you chat with the Concierge, your event category, guest count, location, and recommended service divisions will populate here for seamless planner handoff.
-                  </p>
+                  <div className="mt-5 p-4 rounded-xl bg-white border border-dashed border-[var(--cs-border)] text-xs text-[var(--cs-charcoal-light)] leading-relaxed">
+                    Start chatting with the concierge to see your event category, estimated guest
+                    count, aesthetic direction, and recommended Celebration Sisters divisions
+                    populated here in real time.
+                  </div>
                 )}
               </div>
 
-              <div className="bg-white border border-[var(--cs-border)] rounded-lg p-5 space-y-2 text-xs text-[var(--cs-charcoal-muted)]">
-                <p className="font-semibold text-[var(--cs-purple)]">Consultation Governance</p>
-                <p className="leading-relaxed">
-                  The AI Concierge provides discovery guidance only. Binding quotations, date availability verification, contracts, and payments are confirmed strictly by Celebration Sisters staff via secure backend workflows.
+              <div className="bg-white rounded-2xl border border-[var(--cs-border)] p-5 text-xs text-[var(--cs-charcoal-light)] space-y-2">
+                <p className="font-semibold text-[var(--cs-purple)] flex items-center gap-1.5">
+                  <ShieldCheck className="w-4 h-4 text-[var(--cs-gold)]" />
+                  Responsible AI Guardrails
+                </p>
+                <p>
+                  Our concierge never issues binding contracts, unauthorized discounts, or
+                  unverified venue holds. Final itemized quotations are always reviewed and issued
+                  by our Lead Planning Team.
                 </p>
               </div>
-            </aside>
+            </div>
           </div>
-        ) : (
-          /* AI Event Concept Studio */
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-            {/* Vision Input Form */}
-            <form
-              onSubmit={(e) => handleGenerateConcept(e, false)}
-              className="lg:col-span-4 bg-white border border-[var(--cs-border)] rounded-lg p-6 space-y-4"
-            >
-              <div className="space-y-1">
-                <h2 className="font-display text-xl font-semibold text-[var(--cs-purple)]">
-                  Compose Design Vision
-                </h2>
-                <p className="text-xs text-[var(--cs-charcoal-muted)]">
-                  Describe your room, palette, and mood in plain language.
+        )}
+
+        {/* TAB 2: AI CONCEPT STUDIO */}
+        {activeTab === 'concept' && (
+          <div className="grid lg:grid-cols-12 gap-8 items-start">
+            {/* Generator Form */}
+            <div className="lg:col-span-5 bg-[var(--cs-cream)] rounded-2xl border border-[var(--cs-border)] p-6 space-y-5">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[var(--cs-gold)]">
+                  Concept Studio Composer
                 </p>
+                <h2 className="font-serif text-2xl text-[var(--cs-purple)] mt-1">
+                  Generate Event Mood Board
+                </h2>
               </div>
 
-              {conceptError && (
-                <div className="p-3 rounded-md bg-red-50 border border-red-200 text-xs text-red-800">
-                  {conceptError}
-                </div>
-              )}
-
-              <div>
-                <label className="block text-xs font-medium mb-1">Celebration Division</label>
-                <select
-                  value={conceptEventType}
-                  onChange={(e) => setConceptEventType(e.target.value)}
-                  className="w-full px-3 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md bg-white"
-                >
-                  {SERVICE_DIVISIONS.map((d) => (
-                    <option key={d.id} value={d.title}>
-                      {d.title}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-4">
                 <div>
-                  <label className="block text-xs font-medium mb-1">Guest Count</label>
-                  <input
-                    type="number"
-                    min={10}
-                    max={1500}
-                    value={conceptGuests}
-                    onChange={(e) => setConceptGuests(Number(e.target.value))}
-                    className="w-full px-3 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md tabular-nums"
-                  />
+                  <label
+                    htmlFor="concept-event-type"
+                    className="block text-xs font-medium text-[var(--cs-charcoal)] mb-1"
+                  >
+                    Event Type
+                  </label>
+                  <select
+                    id="concept-event-type"
+                    value={conceptForm.eventType}
+                    onChange={(e) => updateConceptForm({ eventType: e.target.value })}
+                    className="w-full px-3.5 py-2.5 rounded-lg bg-white border border-[var(--cs-border)] text-sm"
+                  >
+                    <option>Wedding Planning and Design</option>
+                    <option>Corporate Events</option>
+                    <option>Birthday Celebrations</option>
+                    <option>Baby Showers and Gender Reveals</option>
+                    <option>Anniversaries and Private Events</option>
+                    <option>Custom Event Concepts and Full Production</option>
+                  </select>
                 </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label
+                      htmlFor="concept-guest-count"
+                      className="block text-xs font-medium text-[var(--cs-charcoal)] mb-1"
+                    >
+                      Guest Count
+                    </label>
+                    <input
+                      id="concept-guest-count"
+                      type="number"
+                      min={10}
+                      max={2000}
+                      value={conceptForm.guestCount}
+                      onChange={(e) =>
+                        updateConceptForm({ guestCount: Number(e.target.value) || 0 })
+                      }
+                      className="w-full px-3.5 py-2.5 rounded-lg bg-white border border-[var(--cs-border)] text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label
+                      htmlFor="concept-venue-style"
+                      className="block text-xs font-medium text-[var(--cs-charcoal)] mb-1"
+                    >
+                      Venue Style
+                    </label>
+                    <input
+                      id="concept-venue-style"
+                      type="text"
+                      value={conceptForm.venueStyle}
+                      onChange={(e) => updateConceptForm({ venueStyle: e.target.value })}
+                      className="w-full px-3.5 py-2.5 rounded-lg bg-white border border-[var(--cs-border)] text-sm"
+                    />
+                  </div>
+                </div>
+
                 <div>
-                  <label className="block text-xs font-medium mb-1">Venue Architecture</label>
+                  <label
+                    htmlFor="concept-preferred-palette"
+                    className="block text-xs font-medium text-[var(--cs-charcoal)] mb-1"
+                  >
+                    Preferred Palette
+                  </label>
                   <input
+                    id="concept-preferred-palette"
                     type="text"
-                    value={conceptVenueStyle}
-                    onChange={(e) => setConceptVenueStyle(e.target.value)}
-                    className="w-full px-3 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md"
+                    value={conceptForm.preferredPalette}
+                    onChange={(e) => updateConceptForm({ preferredPalette: e.target.value })}
+                    className="w-full px-3.5 py-2.5 rounded-lg bg-white border border-[var(--cs-border)] text-sm"
                   />
                 </div>
-              </div>
 
-              <div>
-                <label className="block text-xs font-medium mb-1">Preferred Palette & Metals</label>
-                <input
-                  type="text"
-                  value={conceptPalette}
-                  onChange={(e) => setConceptPalette(e.target.value)}
-                  className="w-full px-3 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md"
-                />
-              </div>
+                <div>
+                  <label
+                    htmlFor="concept-vision-description"
+                    className="block text-xs font-medium text-[var(--cs-charcoal)] mb-1"
+                  >
+                    Celebration Vision & Signature Elements
+                  </label>
+                  <textarea
+                    id="concept-vision-description"
+                    rows={4}
+                    value={conceptForm.visionDescription}
+                    onChange={(e) => updateConceptForm({ visionDescription: e.target.value })}
+                    className="w-full px-3.5 py-2.5 rounded-lg bg-white border border-[var(--cs-border)] text-sm"
+                  />
+                </div>
 
-              <div>
-                <label className="block text-xs font-medium mb-1">Dream Event Description</label>
-                <textarea
-                  rows={4}
-                  value={conceptVision}
-                  onChange={(e) => setConceptVision(e.target.value)}
-                  className="w-full px-3 py-2 text-xs border border-[var(--cs-border-strong)] rounded-md"
-                />
-              </div>
+                {/* Explicit Status Feedback Banners */}
+                {(conceptFeedback.status === 'generating' || conceptFeedback.status === 'saving') && (
+                  <div
+                    role="status"
+                    aria-live="polite"
+                    className="p-3.5 rounded-xl bg-[var(--cs-purple)]/5 border border-[var(--cs-purple)]/20 text-xs text-[var(--cs-purple)] flex items-center gap-2.5"
+                  >
+                    <Loader2 className="w-4 h-4 animate-spin text-[var(--cs-gold)] shrink-0" />
+                    <span>{conceptFeedback.message}</span>
+                  </div>
+                )}
 
-              <div className="flex flex-col gap-2 pt-2">
-                <button
-                  type="submit"
-                  disabled={conceptLoading}
-                  className="w-full py-2.5 text-xs font-medium text-white bg-[var(--cs-purple)] hover:bg-[var(--cs-purple-hover)] rounded-md inline-flex items-center justify-center gap-2 cursor-pointer"
-                >
-                  {conceptLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
-                  {conceptLoading ? 'Composing Proposal...' : 'Create New Concept Proposal'}
-                </button>
-                {activeConcept && (
+                {conceptFeedback.status === 'success' && conceptFeedback.message && (
+                  <div
+                    role="status"
+                    aria-live="polite"
+                    className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-xs text-emerald-900 flex items-start gap-2.5"
+                  >
+                    <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0 mt-0.5" />
+                    <div className="flex-1">
+                      <p className="font-medium">{conceptFeedback.message}</p>
+                      {conceptFeedback.requestId && (
+                        <p className="text-[11px] text-emerald-800/75 font-mono mt-0.5">
+                          Ref: {conceptFeedback.requestId}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {(conceptFeedback.status === 'retryable_error' ||
+                  conceptFeedback.status === 'validation_error' ||
+                  conceptFeedback.status === 'persistence_error' ||
+                  conceptFeedback.status === 'session_error') && (
+                  <div
+                    role="alert"
+                    className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-xs text-red-800 space-y-2"
+                  >
+                    <div className="flex items-start gap-2">
+                      <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-red-700" />
+                      <div className="flex-1">
+                        <p className="font-semibold text-red-900">{conceptFeedback.message}</p>
+                        {conceptFeedback.requestId && (
+                          <p className="text-[11px] text-red-700/80 font-mono mt-1">
+                            Ref: {conceptFeedback.requestId}
+                            {conceptFeedback.code ? ` • ${conceptFeedback.code}` : ''}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                    {conceptFeedback.retryable && (
+                      <div className="pl-6">
+                        <button
+                          type="button"
+                          onClick={() => void handleGenerateConcept(lastFailedReviseFlag, true)}
+                          disabled={conceptLoading}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-700 text-white text-xs font-semibold hover:bg-red-800 disabled:opacity-50"
+                        >
+                          <RefreshCw className="w-3.5 h-3.5" />
+                          Retry Proposal Generation
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div className="flex flex-col sm:flex-row gap-3 pt-1">
                   <button
                     type="button"
                     disabled={conceptLoading}
-                    onClick={(e) => handleGenerateConcept(e, true)}
-                    className="w-full py-2 text-xs font-medium text-[var(--cs-purple)] border border-[var(--cs-purple)] hover:bg-[var(--cs-purple-soft)] rounded-md cursor-pointer"
+                    onClick={() => void handleGenerateConcept(false)}
+                    className="flex-1 py-3 px-4 rounded-xl bg-[var(--cs-purple)] text-white text-sm font-medium hover:bg-[var(--cs-purple-dark)] disabled:opacity-50 flex items-center justify-center gap-2 transition-colors"
                   >
-                    Save as Revision v{activeConcept.currentVersion + 1} on Current Board
+                    {conceptLoading ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Wand2 className="w-4 h-4" />
+                    )}
+                    {conceptLoading ? 'Composing Proposal...' : 'Create New Concept Proposal'}
                   </button>
-                )}
+                  {canReviseSelected && (
+                    <button
+                      type="button"
+                      disabled={conceptLoading}
+                      onClick={() => void handleGenerateConcept(true)}
+                      className="py-3 px-4 rounded-xl bg-white border border-[var(--cs-purple)] text-[var(--cs-purple)] text-sm font-medium hover:bg-[var(--cs-purple)]/5 disabled:opacity-50 transition-colors"
+                    >
+                      Save as Revision v{(selectedConcept?.currentVersion ?? 1) + 1}
+                    </button>
+                  )}
+                </div>
               </div>
-            </form>
 
-            {/* Mood Board & Dual Approval Canvas */}
-            <div className="lg:col-span-8 space-y-6">
-              {activeConcept && activeRevision ? (
-                <div className="bg-white border border-[var(--cs-border)] rounded-lg overflow-hidden">
-                  {/* Mandatory Conceptual Visualization Notice */}
-                  <div className="bg-[var(--cs-purple)] text-white px-6 py-3 flex flex-wrap items-center justify-between gap-3 text-xs">
-                    <span className="font-medium text-[#E6C98F]">
-                      Conceptual Visualization · Not an Actual Event Portfolio Photograph
-                    </span>
-                    <div className="flex items-center gap-2">
-                      {activeConcept.revisions.map((rev, idx) => (
-                        <button
-                          key={rev.version}
-                          type="button"
-                          onClick={() => setActiveRevisionIndex(idx)}
-                          className={`px-2.5 py-1 rounded text-[11px] tabular-nums cursor-pointer ${
-                            activeRevisionIndex === idx
-                              ? 'bg-white text-[var(--cs-purple)] font-semibold'
-                              : 'bg-white/15 text-white hover:bg-white/25'
+              {/* Saved Concepts Selector */}
+              {concepts.length > 0 && (
+                <div className="pt-4 border-t border-[var(--cs-border)]">
+                  <p className="text-xs font-semibold uppercase tracking-wider text-[var(--cs-charcoal-light)] mb-2.5">
+                    {currentUser.role === 'guest'
+                      ? 'Generated Session Proposals'
+                      : `Saved Concept Boards (${concepts.length})`}
+                  </p>
+                  <div className="space-y-2">
+                    {concepts.map((c) => (
+                      <button
+                        key={c.id}
+                        type="button"
+                        onClick={() => {
+                          setSelectedConceptId(c.id);
+                          const latestIdx = c.revisions.findIndex(
+                            (r) => r.version === c.currentVersion,
+                          );
+                          setActiveRevisionIndex(latestIdx >= 0 ? latestIdx : 0);
+                        }}
+                        className={`w-full text-left px-3.5 py-2.5 rounded-xl border text-xs transition-colors flex items-center justify-between ${
+                          selectedConcept?.id === c.id
+                            ? 'bg-white border-[var(--cs-purple)] shadow-sm'
+                            : 'bg-white/60 border-[var(--cs-border)] hover:bg-white'
+                        }`}
+                      >
+                        <div>
+                          <p className="font-semibold text-[var(--cs-purple)]">{c.title}</p>
+                          <p className="text-[var(--cs-charcoal-light)] mt-0.5">
+                            {c.eventType} • v{c.currentVersion} •{' '}
+                            <span className="font-mono text-[10px]">{c.id}</span>
+                          </p>
+                        </div>
+                        <span
+                          className={`px-2 py-0.5 rounded-md font-medium ${
+                            c.clientApproved && c.staffApproved
+                              ? 'bg-emerald-100 text-emerald-800'
+                              : 'bg-amber-100 text-amber-800'
                           }`}
                         >
-                          Rev v{rev.version}
-                        </button>
-                      ))}
-                    </div>
+                          {c.clientApproved && c.staffApproved ? 'Dual Approved' : 'In Review'}
+                        </span>
+                      </button>
+                    ))}
                   </div>
+                </div>
+              )}
+            </div>
 
-                  <div className="p-6 sm:p-8 space-y-8">
-                    <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4 border-b border-[var(--cs-border)] pb-6">
-                      <div className="space-y-1.5">
-                        <p className="text-xs text-[var(--cs-gold-muted)] font-medium">
-                          {activeConcept.eventType} · Revision {activeRevision.version}
-                        </p>
-                        <h2 className="font-display text-2xl sm:text-3xl font-semibold text-[var(--cs-purple)]">
-                          {activeRevision.themeName}
-                        </h2>
-                        <p className="text-sm text-[var(--cs-charcoal-muted)] leading-relaxed max-w-2xl">
-                          {activeRevision.visionSummary}
-                        </p>
+            {/* Concept Board Output Display */}
+            <div
+              ref={moodBoardRef}
+              tabIndex={-1}
+              data-testid="concept-mood-board"
+              className="lg:col-span-7 outline-none scroll-mt-24"
+            >
+              {selectedConcept && activeRevision ? (
+                <div className="bg-white rounded-2xl border border-[var(--cs-border)] shadow-sm overflow-hidden">
+                  {/* Conceptual Label & Revision Selector */}
+                  <div className="px-6 py-4 bg-[var(--cs-purple)] text-white flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-[10px] font-semibold uppercase tracking-[0.2em] px-2.5 py-0.5 rounded-md bg-[var(--cs-gold)] text-white">
+                          Conceptual Visualization
+                        </span>
+                        <span className="text-xs text-white/80">
+                          {selectedConcept.eventType} • Revision v{activeRevision.version}
+                        </span>
+                      </div>
+                      <h3
+                        data-testid="concept-theme-name"
+                        className="font-serif text-2xl sm:text-3xl mt-1.5"
+                      >
+                        {activeRevision.themeName}
+                      </h3>
+                      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-1.5 text-[11px] text-white/75">
+                        <span className="font-mono" data-testid="concept-persistence-id">
+                          Proposal ID: {selectedConcept.id}
+                        </span>
+                        <span data-testid="concept-revision-timestamp">
+                          Saved: {formatRevisionTimestamp(activeRevision.createdAt)}
+                        </span>
                       </div>
                     </div>
 
-                    {/* Visual Color Harmony Swatches */}
-                    <div className="space-y-3">
-                      <h3 className="text-xs font-semibold tracking-wider text-[var(--cs-purple)] uppercase">
-                        Curated Color & Material Palette
-                      </h3>
-                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                    {selectedConcept.revisions.length > 1 && (
+                      <div className="flex items-center gap-1.5 bg-white/10 p-1 rounded-lg">
+                        <History className="w-3.5 h-3.5 ml-1.5 text-[var(--cs-gold-light)]" />
+                        {selectedConcept.revisions.map((rev, idx) => (
+                          <button
+                            key={rev.version}
+                            type="button"
+                            onClick={() => setActiveRevisionIndex(idx)}
+                            className={`px-2.5 py-1 rounded-md text-xs font-medium ${
+                              activeRevisionIndex === idx
+                                ? 'bg-white text-[var(--cs-purple)]'
+                                : 'text-white/80 hover:text-white'
+                            }`}
+                          >
+                            v{rev.version}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="p-6 sm:p-8 space-y-6">
+                    <p
+                      data-testid="concept-vision-summary"
+                      className="text-sm text-[var(--cs-charcoal)] leading-relaxed bg-[var(--cs-cream)] p-4 rounded-xl border border-[var(--cs-border)]"
+                    >
+                      {activeRevision.visionSummary}
+                    </p>
+
+                    {/* Color Palette Swatches */}
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[var(--cs-gold)] mb-3">
+                        Curated Color Palette
+                      </p>
+                      <div
+                        data-testid="concept-color-palette"
+                        className="grid grid-cols-2 sm:grid-cols-4 gap-3"
+                      >
                         {activeRevision.colorPalette.map((swatch) => (
-                          <div key={swatch.name} className="border border-[var(--cs-border)] rounded-md overflow-hidden">
+                          <div
+                            key={`${swatch.name}-${swatch.hex}`}
+                            className="rounded-xl border border-[var(--cs-border)] overflow-hidden bg-white"
+                          >
                             <div
                               className="h-16 w-full border-b border-[var(--cs-border)]"
                               style={{ backgroundColor: swatch.hex }}
+                              aria-label={`${swatch.name} swatch ${swatch.hex}`}
                             />
-                            <div className="p-3 space-y-1">
-                              <div className="flex items-center justify-between text-xs">
-                                <span className="font-semibold text-[var(--cs-charcoal)]">{swatch.name}</span>
-                                <span className="font-mono text-[11px] text-[var(--cs-charcoal-muted)]">{swatch.hex}</span>
-                              </div>
-                              <p className="text-[11px] text-[var(--cs-charcoal-muted)] leading-snug">{swatch.usage}</p>
+                            <div className="p-2.5">
+                              <p className="text-xs font-semibold text-[var(--cs-charcoal)]">
+                                {swatch.name}
+                              </p>
+                              <p className="text-[10px] font-mono text-[var(--cs-charcoal-light)]">
+                                {swatch.hex}
+                              </p>
+                              <p className="text-[11px] text-[var(--cs-charcoal-light)] mt-1 leading-snug">
+                                {swatch.usage}
+                              </p>
                             </div>
                           </div>
                         ))}
                       </div>
                     </div>
 
-                    {/* Architectural Concept Specs */}
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                      <div className="bg-[var(--cs-ivory)] border border-[var(--cs-border)] rounded-md p-5 space-y-1.5">
-                        <h4 className="font-display text-base font-semibold text-[var(--cs-purple)]">
-                          Floral Architecture
-                        </h4>
-                        <p className="text-xs sm:text-sm text-[var(--cs-charcoal-muted)] leading-relaxed">
+                    {/* Design Architecture Grid */}
+                    <div className="grid sm:grid-cols-2 gap-4">
+                      <div className="p-4 rounded-xl border border-[var(--cs-border)]">
+                        <p className="text-xs font-semibold uppercase tracking-wider text-[var(--cs-purple)] mb-1.5">
+                          Floral Concept
+                        </p>
+                        <p
+                          data-testid="concept-floral-concept"
+                          className="text-sm text-[var(--cs-charcoal-light)] leading-relaxed"
+                        >
                           {activeRevision.floralConcept}
                         </p>
                       </div>
-                      <div className="bg-[var(--cs-ivory)] border border-[var(--cs-border)] rounded-md p-5 space-y-1.5">
-                        <h4 className="font-display text-base font-semibold text-[var(--cs-purple)]">
-                          Tablescape Arrangement
-                        </h4>
-                        <p className="text-xs sm:text-sm text-[var(--cs-charcoal-muted)] leading-relaxed">
+                      <div className="p-4 rounded-xl border border-[var(--cs-border)]">
+                        <p className="text-xs font-semibold uppercase tracking-wider text-[var(--cs-purple)] mb-1.5">
+                          Table Arrangement
+                        </p>
+                        <p
+                          data-testid="concept-table-arrangement"
+                          className="text-sm text-[var(--cs-charcoal-light)] leading-relaxed"
+                        >
                           {activeRevision.tableArrangement}
                         </p>
                       </div>
-                      <div className="bg-[var(--cs-ivory)] border border-[var(--cs-border)] rounded-md p-5 space-y-1.5">
-                        <h4 className="font-display text-base font-semibold text-[var(--cs-purple)]">
-                          Stage & Focal Backdrop
-                        </h4>
-                        <p className="text-xs sm:text-sm text-[var(--cs-charcoal-muted)] leading-relaxed">
+                      <div className="p-4 rounded-xl border border-[var(--cs-border)]">
+                        <p className="text-xs font-semibold uppercase tracking-wider text-[var(--cs-purple)] mb-1.5">
+                          Stage & Backdrop
+                        </p>
+                        <p
+                          data-testid="concept-stage-backdrop"
+                          className="text-sm text-[var(--cs-charcoal-light)] leading-relaxed"
+                        >
                           {activeRevision.stageBackdrop}
                         </p>
                       </div>
-                      <div className="bg-[var(--cs-ivory)] border border-[var(--cs-border)] rounded-md p-5 space-y-1.5">
-                        <h4 className="font-display text-base font-semibold text-[var(--cs-purple)]">
-                          Lighting Calibration
-                        </h4>
-                        <p className="text-xs sm:text-sm text-[var(--cs-charcoal-muted)] leading-relaxed">
+                      <div className="p-4 rounded-xl border border-[var(--cs-border)]">
+                        <p className="text-xs font-semibold uppercase tracking-wider text-[var(--cs-purple)] mb-1.5">
+                          Lighting Plan
+                        </p>
+                        <p
+                          data-testid="concept-lighting-plan"
+                          className="text-sm text-[var(--cs-charcoal-light)] leading-relaxed"
+                        >
                           {activeRevision.lightingPlan}
                         </p>
                       </div>
                     </div>
 
+                    {/* Recommended Service Divisions */}
+                    {Array.isArray(activeRevision.recommendedDivisions) &&
+                      activeRevision.recommendedDivisions.length > 0 && (
+                        <div className="p-4 rounded-xl bg-[var(--cs-cream)]/60 border border-[var(--cs-border)]">
+                          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[var(--cs-purple)] flex items-center gap-1.5 mb-2.5">
+                            <Layers className="w-3.5 h-3.5 text-[var(--cs-gold)]" />
+                            Recommended Service Divisions
+                          </p>
+                          <div
+                            data-testid="concept-recommended-divisions"
+                            className="flex flex-wrap gap-2"
+                          >
+                            {activeRevision.recommendedDivisions.map((division) => (
+                              <span
+                                key={division}
+                                className="text-xs px-3 py-1.5 rounded-lg bg-white border border-[var(--cs-border)] text-[var(--cs-purple)] font-medium"
+                              >
+                                {division}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
                     {/* Dual Approval Workflow Bar */}
-                    <div className="border-t border-[var(--cs-border)] pt-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                      <div className="space-y-1 text-xs">
-                        <p className="font-semibold text-[var(--cs-purple)]">
-                          Dual Approval Status:{' '}
-                          {activeConcept.clientApproved && activeConcept.staffApproved
-                            ? 'Fully Approved for Production'
-                            : 'Awaiting Required Signatures'}
-                        </p>
-                        <p className="text-[var(--cs-charcoal-muted)]">
-                          Client Approval: {activeConcept.clientApproved ? 'Approved' : 'Pending'} · Lead Designer Approval:{' '}
-                          {activeConcept.staffApproved ? `Approved (${activeConcept.staffApprovedBy})` : 'Pending'}
-                        </p>
+                    <div className="pt-5 border-t border-[var(--cs-border)] flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                      <div className="flex flex-wrap items-center gap-3 text-xs">
+                        <span
+                          className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md font-medium ${
+                            selectedConcept.clientApproved
+                              ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                              : 'bg-gray-100 text-gray-600'
+                          }`}
+                        >
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          Client Approved: {selectedConcept.clientApproved ? 'Yes' : 'Pending'}
+                        </span>
+                        <span
+                          className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md font-medium ${
+                            selectedConcept.staffApproved
+                              ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                              : 'bg-gray-100 text-gray-600'
+                          }`}
+                        >
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          Lead Designer Approved:{' '}
+                          {selectedConcept.staffApproved ? 'Yes' : 'Pending'}
+                        </span>
                       </div>
 
-                      <div className="flex flex-wrap gap-3">
-                        {currentUser.role !== 'guest' && currentUser.role !== 'vendor' ? (
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onOpenBookingPrefilled({
+                              eventType: selectedConcept.eventType,
+                              guestCount: conceptForm.guestCount,
+                              notes: `Concept Studio Proposal (${selectedConcept.id} v${activeRevision.version}): ${activeRevision.themeName} — ${activeRevision.visionSummary}`,
+                            })
+                          }
+                          className="px-4 py-2 rounded-lg border border-[var(--cs-purple)] text-[var(--cs-purple)] text-xs font-semibold hover:bg-[var(--cs-purple)]/5 transition-colors"
+                        >
+                          Book Consultation with This Concept
+                        </button>
+                        {currentUser.role !== 'guest' && (
                           <button
                             type="button"
-                            onClick={() => handleApproveConcept(activeConcept.id)}
-                            className="px-4 py-2 text-xs font-medium text-white bg-[var(--cs-purple)] hover:bg-[var(--cs-purple-hover)] rounded-md inline-flex items-center gap-1.5 cursor-pointer"
+                            disabled={approvalSaving}
+                            onClick={() => void handleApproveConcept()}
+                            className="px-4 py-2 rounded-lg bg-[var(--cs-purple)] text-white text-xs font-semibold hover:bg-[var(--cs-purple-dark)] disabled:opacity-50 transition-colors"
                           >
-                            {activeConcept.clientApproved && activeConcept.staffApproved ? (
-                              <CheckCircle2 className="w-4 h-4" />
-                            ) : (
-                              <UserCheck className="w-4 h-4" />
-                            )}
-                            Record {currentUser.role === 'client' ? 'Client' : 'Staff Designer'} Approval
+                            {approvalSaving
+                              ? 'Recording...'
+                              : currentUser.role === 'client'
+                                ? 'Approve Design Direction'
+                                : 'Record Staff Creative Sign-Off'}
                           </button>
-                        ) : (
-                          <span className="text-xs text-[var(--cs-charcoal-muted)]">
-                            Sign in under Portals to record client or designer approval.
-                          </span>
                         )}
                       </div>
                     </div>
                   </div>
                 </div>
               ) : (
-                <div className="bg-white border border-[var(--cs-border)] rounded-lg p-12 text-center text-sm text-[var(--cs-charcoal-muted)]">
-                  Compose your celebration vision on the left to generate a structured luxury mood board.
+                <div className="p-12 rounded-2xl border border-dashed border-[var(--cs-border)] text-center text-sm text-[var(--cs-charcoal-light)]">
+                  Compose your celebration vision on the left to generate a structured luxury mood
+                  board.
                 </div>
               )}
             </div>

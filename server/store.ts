@@ -59,6 +59,7 @@ export interface DatabaseSchema {
   revokedSessionIds: Record<string, number>;
   bookingIdempotencyKeys: Record<string, string>;
   consultationIdempotencyKeys: Record<string, string>;
+  conceptIdempotencyKeys?: Record<string, string>;
 }
 
 function getDbPath(): string {
@@ -635,6 +636,7 @@ function buildInitialSeed(): DatabaseSchema {
     revokedSessionIds: {},
     bookingIdempotencyKeys: {},
     consultationIdempotencyKeys: {},
+    conceptIdempotencyKeys: {},
   };
 }
 
@@ -654,6 +656,7 @@ function normalizeSchema(parsed: DatabaseSchema): DatabaseSchema {
   parsed.revokedSessionIds = parsed.revokedSessionIds || {};
   parsed.bookingIdempotencyKeys = parsed.bookingIdempotencyKeys || {};
   parsed.consultationIdempotencyKeys = parsed.consultationIdempotencyKeys || {};
+  parsed.conceptIdempotencyKeys = parsed.conceptIdempotencyKeys || {};
   for (const b of parsed.bookings || []) {
     if (!b.architecturalStage) {
       b.architecturalStage = LEGACY_TO_ARCH_STATUS[b.status] ?? 'INQUIRY';
