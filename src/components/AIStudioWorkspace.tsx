@@ -186,11 +186,13 @@ function IdentityScopedAIStudioWorkspace({
         });
         if (!active) return;
 
-        if (res.status === 401) {
+        if (res.status === 401 || res.status === 403) {
+          setPendingIdempotencyKey(null);
+          setActiveRevisionIndex(0);
           setConceptFeedback({
             status: 'session_error',
-            code: 'AUTH_REQUIRED',
-            message: 'Your saved concepts require an active sign-in session. Please sign in again to access saved boards.',
+            code: res.status === 401 ? 'AUTH_REQUIRED' : 'FORBIDDEN',
+            message: 'Your saved concepts require an authorized sign-in session. Please sign in again to access saved boards.',
             retryable: false,
           });
           setConcepts([]);
@@ -200,6 +202,7 @@ function IdentityScopedAIStudioWorkspace({
 
         if (res.ok) {
           const data = (await res.json()) as { concepts?: DesignConceptRecord[] };
+          if (!active) return;
           const list = Array.isArray(data.concepts) ? data.concepts : [];
           setConcepts(list);
           setSelectedConceptId((prevSelected) => {
@@ -443,6 +446,20 @@ function IdentityScopedAIStudioWorkspace({
           res,
           'Unable to generate concept proposal right now. Your inputs are preserved — please try again.',
         );
+        if (parsedErr.status === 401 || parsedErr.status === 403) {
+          setConcepts([]);
+          setSelectedConceptId('');
+          setActiveRevisionIndex(0);
+          setPendingIdempotencyKey(null);
+          setConceptFeedback({
+            status: 'session_error',
+            code: parsedErr.code,
+            message: parsedErr.message,
+            retryable: false,
+            requestId: parsedErr.requestId,
+          });
+          return;
+        }
         if (parsedErr.code === 'IDEMPOTENCY_CONFLICT') {
           setPendingIdempotencyKey(null);
           setConceptFeedback({
