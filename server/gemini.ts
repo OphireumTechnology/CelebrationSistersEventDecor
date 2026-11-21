@@ -2,8 +2,12 @@ import { GoogleGenAI, Type } from '@google/genai';
 import { z } from 'zod';
 import { logStructured, observability } from './observability.ts';
 
-const AI_MODEL_ID = 'gemini-4-hydrogen';
-const AI_REQUEST_TIMEOUT_MS = 18_000;
+const AI_MODEL_ID = process.env.GEMINI_MODEL?.trim() || 'gemini-2.5-flash';
+// Keep provider latency configurable without permitting unbounded requests.
+const configuredTimeoutMs = Number(process.env.GEMINI_TIMEOUT_MS);
+const AI_REQUEST_TIMEOUT_MS = Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs >= 5_000 && configuredTimeoutMs <= 60_000
+  ? configuredTimeoutMs
+  : 45_000;
 const CONCIERGE_MAX_OUTPUT_TOKENS = 1024;
 const CONCEPT_MAX_OUTPUT_TOKENS = 2048;
 
