@@ -14,7 +14,15 @@ import { PublicHomeView } from './components/PublicHomeView';
 import { ServiceDivisionCatalog } from './components/ServiceDivisionCatalog';
 import { apiFetch, isBackendConfigured, setApiAccessToken, setApiCsrfToken } from './lib/apiClient';
 import type { UserSession } from './types/domain';
-import { getExternalStagingMfaClient, enrollExternalStagingTotp, verifyExternalStagingTotp, getPendingExternalTotpFactorId } from './lib/externalStagingMfa';
+import {
+  clearPendingExternalTotpFactor,
+  enrollExternalStagingTotp,
+  getExternalStagingMfaClient,
+  getPendingExternalTotpFactorId,
+  resolveExternalTotpFactorId,
+  signOutExternalStagingSession,
+  verifyExternalStagingTotp,
+} from './lib/externalStagingMfa';
 
 const DEFAULT_GUEST: UserSession = {
   id: 'guest-public',
@@ -26,6 +34,8 @@ const DEFAULT_GUEST: UserSession = {
 export interface TotpEnrollmentResult {
   ok: boolean;
   error?: string;
+  factorId?: string;
+  qrCode?: string;
   secret?: string;
   otpauthUri?: string;
   recoveryCodes?: string[];
@@ -35,10 +45,14 @@ export default function App() {
   const [activeRoute, setActiveRoute] = useState<AppRoute>('home');
   const [selectedServiceId, setSelectedServiceId] = useState<string | null>(null);
 
+  const externalStagingMode = Boolean(getExternalStagingMfaClient());
   const [personas, setPersonas] = useState<UserSession[]>([]);
   const [currentUser, setCurrentUser] = useState<UserSession>(DEFAULT_GUEST);
   const [mfaRequired, setMfaRequired] = useState(false);
   const [mfaEnrolled, setMfaEnrolled] = useState(false);
+  const [hasPendingExternalFactor, setHasPendingExternalFactor] = useState(
+    () => Boolean(getPendingExternalTotpFactorId()),
+  );
   const [authProviderReady, setAuthProviderReady] = useState(false);
 
   const [bookingModalOpen, setBookingModalOpen] = useState(false);
@@ -54,29 +68,59 @@ export default function App() {
     if (!isBackendConfigured) {
       return;
     }
+
+    let mounted = true;
+    const externalClient = getExternalStagingMfaClient();
+
+    const syncBackendSession = async () => {
+      const sessionRes = await apiFetch('/api/auth/session', { credentials: 'include' });
+      if (!mounted) return;
+      if (sessionRes.ok) {
+        const sData = await sessionRes.json();
+        if (!mounted) return;
+        setApiCsrfToken(sData.csrfToken ?? null);
+        if (sData.user) {
+          setCurrentUser(sData.user);
+          setMfaRequired(Boolean(sData.mfaRequired));
+          setMfaEnrolled(Boolean(sData.mfaEnrolled || sData.user.mfaEnrolled));
+        } else {
+          setCurrentUser(DEFAULT_GUEST);
+          setMfaRequired(false);
+          setMfaEnrolled(false);
+        }
+      }
+    };
+
     const initAuth = async () => {
       try {
-        const [configRes, sessionRes] = await Promise.all([
-          apiFetch('/api/auth/config', { credentials: 'include' }),
-          apiFetch('/api/auth/session', { credentials: 'include' }),
-        ]);
-        if (sessionRes.ok) {
-          const sData = await sessionRes.json();
-          setApiCsrfToken(sData.csrfToken ?? null);
-          if (sData.user) {
-            setCurrentUser(sData.user);
-            setMfaRequired(Boolean(sData.mfaRequired));
-            setMfaEnrolled(Boolean(sData.mfaEnrolled || sData.user.mfaEnrolled));
+        if (externalClient) {
+          const { data: extData } = await externalClient.auth.getSession();
+          if (extData?.session?.access_token) {
+            setApiAccessToken(extData.session.access_token);
+            setHasPendingExternalFactor(
+              Boolean(getPendingExternalTotpFactorId(extData.session.user?.id)),
+            );
+          } else {
+            setApiAccessToken(null);
+            clearPendingExternalTotpFactor();
+            setHasPendingExternalFactor(false);
           }
         }
-        if (configRes.ok) {
+
+        const [configRes] = await Promise.all([
+          apiFetch('/api/auth/config', { credentials: 'include' }),
+          syncBackendSession(),
+        ]);
+
+        if (mounted && configRes.ok) {
           const cfg = await configRes.json();
+          if (!mounted) return;
           setAuthProviderReady(Boolean(cfg.readyForProductionAuth));
           if (cfg.demoPersonasAvailable === true) {
             const personasRes = await apiFetch('/api/auth/personas', { credentials: 'include' });
-            if (personasRes.ok) {
+            if (mounted && personasRes.ok) {
               const pData = await personasRes.json();
-              setPersonas(pData.personas || []);
+              if (mounted) setPersonas(pData.personas || []);
             }
           }
         }
@@ -84,7 +128,36 @@ export default function App() {
         // Keep guest fallback if offline
       }
     };
-    initAuth();
+
+    void initAuth();
+
+    let unsubscribe: (() => void) | undefined;
+    if (externalClient) {
+      const { data: listenerData } = externalClient.auth.onAuthStateChange((event, session) => {
+        if (!mounted) return;
+        if (event === 'SIGNED_OUT' || !session?.access_token) {
+          clearPendingExternalTotpFactor();
+          setHasPendingExternalFactor(false);
+          setApiAccessToken(null);
+          setApiCsrfToken(null);
+          setCurrentUser(DEFAULT_GUEST);
+          setMfaRequired(false);
+          setMfaEnrolled(false);
+          return;
+        }
+        setApiAccessToken(session.access_token);
+        setHasPendingExternalFactor(Boolean(getPendingExternalTotpFactorId(session.user?.id)));
+        if (event === 'TOKEN_REFRESHED' || event === 'USER_UPDATED') {
+          void syncBackendSession();
+        }
+      });
+      unsubscribe = () => listenerData.subscription.unsubscribe();
+    }
+
+    return () => {
+      mounted = false;
+      unsubscribe?.();
+    };
   }, []);
 
   const handleSwitchPersona = async (user: UserSession) => {
@@ -107,6 +180,46 @@ export default function App() {
     password: string,
   ): Promise<{ ok: boolean; error?: string }> => {
     try {
+      const externalClient = getExternalStagingMfaClient();
+      if (externalClient) {
+        const { data: externalLogin, error: externalError } =
+          await externalClient.auth.signInWithPassword({ email, password });
+        if (externalError || !externalLogin.session?.access_token) {
+          return {
+            ok: false,
+            error: externalError?.message || 'Sign-in failed. Verify your email and password.',
+          };
+        }
+
+        setApiAccessToken(externalLogin.session.access_token);
+        const sessionRes = await apiFetch('/api/auth/session', { credentials: 'include' });
+        const sData = await sessionRes.json().catch(() => ({}));
+        if (!sessionRes.ok || !sData.user || sData.user.role === 'guest') {
+          await signOutExternalStagingSession();
+          setHasPendingExternalFactor(false);
+          setApiAccessToken(null);
+          setApiCsrfToken(null);
+          setCurrentUser(DEFAULT_GUEST);
+          setMfaRequired(false);
+          setMfaEnrolled(false);
+          return {
+            ok: false,
+            error:
+              sData.error ||
+              'Authenticated account is not authorized for this staging portal session.',
+          };
+        }
+
+        setApiCsrfToken(sData.csrfToken ?? null);
+        setCurrentUser(sData.user);
+        setMfaRequired(Boolean(sData.mfaRequired));
+        setMfaEnrolled(Boolean(sData.mfaEnrolled || sData.user?.mfaEnrolled));
+        setHasPendingExternalFactor(
+          Boolean(getPendingExternalTotpFactorId(externalLogin.session.user?.id)),
+        );
+        return { ok: true };
+      }
+
       const res = await apiFetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -117,12 +230,7 @@ export default function App() {
       if (!res.ok) {
         return { ok: false, error: data.error || 'Sign-in failed. Verify your email and password.' };
       }
-      const externalClient = getExternalStagingMfaClient();
-      if (externalClient) {
-        const {data:externalLogin,error:externalError} = await externalClient.auth.signInWithPassword({email,password});
-        if (externalError || !externalLogin.session) return {ok:false,error:'Unable to establish external Supabase session.'};
-        setApiAccessToken(externalLogin.session.access_token);
-      } else if (data.token) {
+      if (data.token) {
         setApiAccessToken(data.token);
       }
       setApiCsrfToken(data.csrfToken ?? null);
@@ -157,16 +265,33 @@ export default function App() {
     const externalClient = getExternalStagingMfaClient();
     if (externalClient) {
       try {
-        const {data:factors,error} = await externalClient.auth.mfa.listFactors();
-        if (error) throw error;
-        const factorId = getPendingExternalTotpFactorId() ?? factors.totp[0]?.id;
-        if (!factorId) return {ok:false,error:'Enroll an authenticator before verifying MFA.'};
-        const verified = await verifyExternalStagingTotp(factorId,code);
+        const factorId = await resolveExternalTotpFactorId();
+        if (!factorId) {
+          return { ok: false, error: 'Enroll an authenticator before verifying MFA.' };
+        }
+        const verified = await verifyExternalStagingTotp(factorId, code);
         setApiAccessToken(verified.accessToken);
+        setHasPendingExternalFactor(false);
+
+        const sessionRes = await apiFetch('/api/auth/session', { credentials: 'include' });
+        const sData = await sessionRes.json().catch(() => ({}));
+        if (!sessionRes.ok || !sData.mfaVerified || sData.aal !== 'aal2' || !sData.user) {
+          return {
+            ok: false,
+            error:
+              sData.error ||
+              'Backend session did not confirm Supabase AAL2 verification. Please retry.',
+          };
+        }
+
+        setApiCsrfToken(sData.csrfToken ?? null);
+        setCurrentUser(sData.user);
         setMfaRequired(false);
         setMfaEnrolled(true);
-        return {ok:true};
-      } catch(e) {return {ok:false,error:e instanceof Error?e.message:'External MFA verification failed.'};}
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : 'External MFA verification failed.' };
+      }
     }
     const res = await apiFetch('/api/auth/mfa/verify', {
       method: 'POST',
@@ -184,14 +309,32 @@ export default function App() {
     return { ok: true };
   };
 
-  const handleEnrollTotp = async (recoveryCode?: string): Promise<TotpEnrollmentResult> => {
+  const handleEnrollTotp = async (
+    optionsOrRecoveryCode?: string | { replaceUnverified?: boolean },
+  ): Promise<TotpEnrollmentResult> => {
     if (getExternalStagingMfaClient()) {
       try {
-        const factor = await enrollExternalStagingTotp();
-        return {ok:true,secret:factor.secret,otpauthUri:factor.uri,recoveryCodes:[]};
-      } catch(e) {return {ok:false,error:e instanceof Error?e.message:'External MFA enrollment failed.'};}
+        const replaceUnverified =
+          typeof optionsOrRecoveryCode === 'object'
+            ? Boolean(optionsOrRecoveryCode?.replaceUnverified)
+            : false;
+        const factor = await enrollExternalStagingTotp({ replaceUnverified });
+        setHasPendingExternalFactor(true);
+        return {
+          ok: true,
+          factorId: factor.factorId,
+          qrCode: factor.qr,
+          secret: factor.secret,
+          otpauthUri: factor.uri,
+          recoveryCodes: [],
+        };
+      } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : 'External MFA enrollment failed.' };
+      }
     }
     try {
+      const recoveryCode =
+        typeof optionsOrRecoveryCode === 'string' ? optionsOrRecoveryCode : undefined;
       const res = await apiFetch('/api/auth/mfa/totp/enroll', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -238,12 +381,18 @@ export default function App() {
   };
 
   const handleLogout = async () => {
-    await apiFetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
-    setApiAccessToken(null);
-    setApiCsrfToken(null);
-    setCurrentUser(DEFAULT_GUEST);
-    setMfaRequired(false);
-    setMfaEnrolled(false);
+    try {
+      await signOutExternalStagingSession();
+      await apiFetch('/api/auth/logout', { method: 'POST', credentials: 'include' }).catch(() => null);
+    } finally {
+      clearPendingExternalTotpFactor();
+      setHasPendingExternalFactor(false);
+      setApiAccessToken(null);
+      setApiCsrfToken(null);
+      setCurrentUser(DEFAULT_GUEST);
+      setMfaRequired(false);
+      setMfaEnrolled(false);
+    }
   };
 
   const openBooking = (serviceId?: string) => {
@@ -315,6 +464,8 @@ export default function App() {
             currentUser={currentUser}
             mfaRequired={mfaRequired}
             mfaEnrolled={mfaEnrolled}
+            externalStagingMode={externalStagingMode}
+            hasPendingExternalFactor={hasPendingExternalFactor}
             authProviderReady={authProviderReady}
             personas={personas}
             onSwitchPersona={handleSwitchPersona}

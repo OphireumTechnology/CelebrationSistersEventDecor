@@ -106,7 +106,13 @@ export interface OperationalMetricsSnapshot {
     requests: number;
     failures: number;
     timeouts: number;
+    retries: number;
+    rateLimited: number;
+    modelErrors: number;
+    schemaErrors: number;
+    persistenceErrors: number;
     avgLatencyMs: number;
+    p95LatencyMs: number;
   };
   rateLimiter: {
     blocked429: number;
@@ -171,6 +177,11 @@ export class ObservabilityMetrics {
   private aiRequests = 0;
   private aiFailures = 0;
   private aiTimeouts = 0;
+  private aiRetries = 0;
+  private aiRateLimited = 0;
+  private aiModelErrors = 0;
+  private aiSchemaErrors = 0;
+  private aiPersistenceErrors = 0;
   private aiLatencies: number[] = [];
 
   private rateBlocked429 = 0;
@@ -231,6 +242,17 @@ export class ObservabilityMetrics {
       this.aiFailures += 1;
     }
     pushSample(this.aiLatencies, durationMs);
+  }
+
+  recordAiRetry(): void {
+    this.aiRetries += 1;
+  }
+
+  recordAiEvent(kind: 'rateLimited' | 'modelError' | 'schemaError' | 'persistenceError'): void {
+    if (kind === 'rateLimited') this.aiRateLimited += 1;
+    else if (kind === 'modelError') this.aiModelErrors += 1;
+    else if (kind === 'schemaError') this.aiSchemaErrors += 1;
+    else if (kind === 'persistenceError') this.aiPersistenceErrors += 1;
   }
 
   recordRateLimitEvent(event: 'blocked429' | 'failClosed503' | 'fallback'): void {
@@ -304,7 +326,13 @@ export class ObservabilityMetrics {
         requests: this.aiRequests,
         failures: this.aiFailures,
         timeouts: this.aiTimeouts,
+        retries: this.aiRetries,
+        rateLimited: this.aiRateLimited,
+        modelErrors: this.aiModelErrors,
+        schemaErrors: this.aiSchemaErrors,
+        persistenceErrors: this.aiPersistenceErrors,
         avgLatencyMs: aiSummary.avg,
+        p95LatencyMs: aiSummary.p95,
       },
       rateLimiter: {
         blocked429: this.rateBlocked429,

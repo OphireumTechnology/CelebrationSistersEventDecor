@@ -1,3 +1,12 @@
+import {
+  acquireConceptLease,
+  assertConceptLeaseOwnership,
+  completeConceptLease,
+  releaseConceptLease,
+  type ConceptLease,
+} from './repositories/conceptLeaseRepository.ts';
+import { withClockedTransaction } from './store.ts';
+
 import crypto from 'node:crypto';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { z } from 'zod';
@@ -35,7 +44,12 @@ import {
   requireRoles,
   validateCsrfProtection,
 } from './authz.ts';
-import { generateConceptProposal, getGeminiConfigStatus, runConciergeTurn } from './gemini.ts';
+import {
+  AiProviderError,
+  generateConceptProposal,
+  getGeminiConfigStatus,
+  runConciergeTurn,
+} from './gemini.ts';
 import {
   createSupabasePublicClient,
   createStagingExternalAuthClient,
@@ -269,6 +283,24 @@ export function createApp(options: CreateAppOptions = {}) {
   const enableRateLimit = options.enableRateLimit ?? true;
   const app = express();
 
+  // Phase 46F: per-application single-flight coordination.
+  // This registry is not a substitute for database idempotency.
+  type ConceptGenerationFlight = {
+    durableLease?: ConceptLease;
+    fingerprint: string;
+    proposal: Promise<
+      Awaited<ReturnType<typeof generateConceptProposal>> | undefined
+    >;
+    participants: number;
+  };
+
+  const conceptGenerationFlights =
+    new Map<string, ConceptGenerationFlight>();
+
+  const MAX_CONCEPT_GENERATION_FLIGHTS = 256;
+  const MAX_CONCEPT_FLIGHT_PARTICIPANTS = 16;
+
+
   // Express 4 does not catch rejected promises from async route handlers automatically.
   // Wrap route registration methods so any async DB/runtime rejection routes cleanly to the global error handler.
   const wrapAsyncArgs = (args: unknown[]) =>
@@ -401,31 +433,39 @@ export function createApp(options: CreateAppOptions = {}) {
     return candidate;
   }
 
-  async function getAuth(req: Request) {
-    const db = await readDb();
+  async function getAuth(
+    req: Request,
+    transactionDb?: Awaited<ReturnType<typeof readDb>>,
+  ) {
+    const db = transactionDb ?? await readDb();
     const ctx = await resolveAuthenticatedContextAsync(
       req,
       db.users,
       options.providerVerifyOptions,
       db.revokedSessionIds,
     );
-    // Central fail-closed privilege boundary: ALL route handlers receive a
+    // Central fail-closed privilege boundary: ALL protected route handlers receive a
     // non-admin context unless the current request carries genuine external
     // Supabase AAL2 for the pinned immutable staging administrator UUID.
-    // AAL1 is allowed only on the MFA enrollment/challenge endpoints.
+    // AAL1 is permitted ONLY on read-only session inspection (/api/auth/session) and
+    // logout (/api/auth/logout) so the client can render the MFA gate and sign out safely.
     if (stagingExternalAuthEnabled(process.env) && ctx.session.role === 'admin') {
-      const mfaPath = req.path === '/api/auth/mfa/totp/enroll' ||
-        req.path === '/api/auth/mfa/verify' ||
-        req.path === '/api/auth/mfa/recover';
-      const validExternal = ctx.authMethod === 'supabase_jwt' &&
+      const aal1AllowedPath =
+        (req.method === 'GET' && req.path === '/api/auth/session') ||
+        (req.method === 'POST' && req.path === '/api/auth/logout');
+      const validExternal =
+        ctx.authMethod === 'supabase_jwt' &&
         ctx.session.supabaseUserId === STAGING_ADMIN_SUBJECT;
-      if (!validExternal || (!mfaPath && ctx.aal !== 'aal2')) {
-        return { db, ctx: {
-          ...ctx,
-          session: { ...ctx.session, role: 'guest' as const },
-          mfaVerified: false,
-          spoofAttemptDetected: true,
-        } };
+      if (!validExternal || (!aal1AllowedPath && ctx.aal !== 'aal2')) {
+        return {
+          db,
+          ctx: {
+            ...ctx,
+            session: { ...ctx.session, role: 'guest' as const },
+            mfaVerified: false,
+            spoofAttemptDetected: true,
+          },
+        };
       }
     }
     return { db, ctx };
@@ -536,7 +576,14 @@ export function createApp(options: CreateAppOptions = {}) {
       auth,
       email,
       worker,
-      ai: { model: ai.model, configured: ai.configured },
+      ai: {
+        model: ai.model,
+        configured: ai.configured,
+        modelSource: ai.modelSource,
+        timeoutMs: ai.timeoutMs,
+        maxRetries: ai.maxRetries,
+        ...(ai.modelWarning ? { modelWarning: ai.modelWarning } : {}),
+      },
       requestId: res.getHeader('X-Request-Id'),
       timestamp: new Date().toISOString(),
     });
@@ -573,7 +620,16 @@ export function createApp(options: CreateAppOptions = {}) {
       auth,
       email,
       worker,
-      ai: { model: ai.model, configured: ai.configured, timeoutMs: ai.timeoutMs },
+      ai: {
+        model: ai.model,
+        configured: ai.configured,
+        modelSource: ai.modelSource,
+        timeoutMs: ai.timeoutMs,
+        conciergeTimeoutMs: ai.conciergeTimeoutMs,
+        conceptTimeoutMs: ai.conceptTimeoutMs,
+        maxRetries: ai.maxRetries,
+        ...(ai.modelWarning ? { modelWarning: ai.modelWarning } : {}),
+      },
       requestId: res.getHeader('X-Request-Id'),
       timestamp: new Date().toISOString(),
     });
@@ -616,6 +672,7 @@ export function createApp(options: CreateAppOptions = {}) {
         'Blocked email-only privilege inheritance; immutable supabaseUserId binding required',
       );
     }
+    const externalStaging = stagingExternalAuthEnabled(process.env);
     res.json({
       user: sanitizeUserForClient(ctx.session),
       mfaVerified: ctx.mfaVerified,
@@ -625,7 +682,8 @@ export function createApp(options: CreateAppOptions = {}) {
       accountStatus: ctx.accountStatus,
       aal: ctx.aal,
       authMethod: ctx.authMethod,
-      csrfToken: ctx.sessionJti ? deriveCsrfToken(ctx.sessionJti) : undefined,
+      externalStagingAuth: externalStaging,
+      csrfToken: !externalStaging && ctx.sessionJti ? deriveCsrfToken(ctx.sessionJti) : undefined,
     });
   });
 
@@ -690,10 +748,18 @@ export function createApp(options: CreateAppOptions = {}) {
         });
       }
 
-      const claims = await verifyProviderAccessToken(accessToken,
+      const claims = await verifyProviderAccessToken(
+        accessToken,
         stagingExternalAuthEnabled(process.env)
-          ? { supabaseUrl: 'https://nswxwwmtcasmkjtmrdqg.supabase.co' }
-          : options.providerVerifyOptions);
+          ? {
+              supabaseUrl: 'https://nswxwwmtcasmkjtmrdqg.supabase.co',
+              useJwksOnly: true,
+              ...(options.providerVerifyOptions?.keyResolver
+                ? { keyResolver: options.providerVerifyOptions.keyResolver }
+                : {}),
+            }
+          : options.providerVerifyOptions,
+      );
       if (!claims) {
         await withTransaction((db) => {
           appendSecurityEvent(db, {
@@ -838,6 +904,12 @@ export function createApp(options: CreateAppOptions = {}) {
     '/api/auth/password-reset',
     rateLimit(5, 60_000, { failClosed: true, endpointGroup: 'auth_recovery' }),
     async (req: Request, res: Response) => {
+      if (stagingExternalAuthEnabled(process.env)) {
+        return res.status(409).json({
+          code: 'EXTERNAL_AUTH_READ_ONLY',
+          error: 'Password reset is disabled in isolated staging external-Auth mode to protect external identity accounts.',
+        });
+      }
       const parsed = z
         .object({
           email: z.string().trim().email('Valid email address is required').max(180),
@@ -1087,6 +1159,12 @@ export function createApp(options: CreateAppOptions = {}) {
     '/api/auth/mfa/recover',
     rateLimit(5, 60_000, { failClosed: true, endpointGroup: 'mfa_recovery' }),
     async (req: Request, res: Response) => {
+      if (stagingExternalAuthEnabled(process.env)) {
+        return res.status(409).json({
+          code: 'SUPABASE_MFA_REQUIRED',
+          error: 'Application-local MFA recovery codes are disabled in external Supabase Auth mode; complete genuine Supabase AAL2 verification.',
+        });
+      }
       const { ctx } = await getAuth(req);
       if (!requireActiveAccount(ctx, res)) return;
       if (ctx.session.role !== 'admin') {
@@ -1163,6 +1241,12 @@ export function createApp(options: CreateAppOptions = {}) {
     '/api/auth/mfa/totp/revoke',
     rateLimit(5, 60_000, { failClosed: true, endpointGroup: 'mfa' }),
     async (req: Request, res: Response) => {
+      if (stagingExternalAuthEnabled(process.env)) {
+        return res.status(409).json({
+          code: 'SUPABASE_MFA_REQUIRED',
+          error: 'Application-local MFA revocation is disabled in external Supabase Auth mode to protect external Auth factors.',
+        });
+      }
       const { ctx } = await getAuth(req);
       if (!requireAdminMfa(ctx, res)) return;
 
@@ -2147,8 +2231,85 @@ export function createApp(options: CreateAppOptions = {}) {
     res.json({ concept: updated });
   });
 
-  // AI Event Concierge (Server-side Gemini API with usage caps & session ownership isolation)
+  function sendAiErrorResponse(res: Response, requestId: string, err: unknown, fallbackMessage: string) {
+    if (err instanceof AiProviderError) {
+      if (err.retryAfterSeconds && err.retryAfterSeconds > 0) {
+        res.setHeader('Retry-After', String(err.retryAfterSeconds));
+      }
+      return res.status(err.httpStatus).json({
+        success: false,
+        error: err.userMessage,
+        code: err.code,
+        retryable: err.retryable,
+        ...(err.retryAfterSeconds ? { retryAfterSeconds: err.retryAfterSeconds } : {}),
+        requestId,
+        errorDetail: {
+          code: err.code,
+          message: err.userMessage,
+          retryable: err.retryable,
+          ...(err.retryAfterSeconds ? { retryAfterSeconds: err.retryAfterSeconds } : {}),
+        },
+      });
+    }
+
+    const msg = err instanceof Error ? err.message : fallbackMessage;
+    if (msg.startsWith('FORBIDDEN:')) {
+      const clean = msg.slice(10);
+      return res.status(403).json({
+        success: false,
+        error: clean,
+        code: 'FORBIDDEN',
+        retryable: false,
+        requestId,
+        errorDetail: { code: 'FORBIDDEN', message: clean, retryable: false },
+      });
+    }
+    if (msg.startsWith('CONCEPT_LOCKED:')) {
+      const clean = msg.slice(15);
+      return res.status(409).json({
+        success: false,
+        error: clean,
+        code: 'CONCEPT_ALREADY_APPROVED',
+        retryable: false,
+        requestId,
+        errorDetail: { code: 'CONCEPT_ALREADY_APPROVED', message: clean, retryable: false },
+      });
+    }
+    if (msg.startsWith('AI_TIMEOUT:')) {
+      const clean = 'The AI service timed out before completing your request. Please try again.';
+      return res.status(504).json({
+        success: false,
+        error: clean,
+        code: 'AI_TIMEOUT',
+        retryable: true,
+        requestId,
+        errorDetail: { code: 'AI_TIMEOUT', message: clean, retryable: true },
+      });
+    }
+    if (msg.startsWith('AI_INVALID_OUTPUT:')) {
+      const clean = 'The AI service returned an incomplete response. Please retry.';
+      return res.status(502).json({
+        success: false,
+        error: clean,
+        code: 'AI_INVALID_OUTPUT',
+        retryable: false,
+        requestId,
+        errorDetail: { code: 'AI_INVALID_OUTPUT', message: clean, retryable: false },
+      });
+    }
+    return res.status(502).json({
+      success: false,
+      error: fallbackMessage,
+      code: 'AI_PROVIDER_ERROR',
+      retryable: false,
+      requestId,
+      errorDetail: { code: 'AI_PROVIDER_ERROR', message: fallbackMessage, retryable: false },
+    });
+  }
+
+  // AI Event Concierge (Server-side Gemini API with usage caps, resilience, & session ownership isolation)
   app.post('/api/ai/concierge', rateLimit(15, 60_000), async (req: Request, res: Response) => {
+    const requestId = String(res.getHeader('X-Request-Id') || crypto.randomUUID());
     const schema = z.object({
       sessionId: z.string().optional(),
       clientName: z.string().max(120).optional(),
@@ -2165,16 +2326,37 @@ export function createApp(options: CreateAppOptions = {}) {
     });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ error: 'Please enter a valid message for the AI Event Concierge.' });
+      const msg = parsed.error.issues[0]?.message || 'Please enter a valid message for the AI Event Concierge.';
+      return res.status(400).json({
+        success: false,
+        error: msg,
+        code: 'VALIDATION_ERROR',
+        retryable: false,
+        requestId,
+        errorDetail: { code: 'VALIDATION_ERROR', message: msg, retryable: false },
+      });
     }
 
     const { ctx } = await getAuth(req);
     const callerOwnerId = ctx.session.role === 'guest' ? undefined : ctx.session.id;
 
+    let aiResult: Awaited<ReturnType<typeof runConciergeTurn>>;
     try {
-      const aiResult = await runConciergeTurn(parsed.data.history, parsed.data.message);
-      const now = new Date().toISOString();
+      aiResult = await runConciergeTurn(parsed.data.history, parsed.data.message, {
+        requestId,
+        endpoint: '/api/ai/concierge',
+      });
+    } catch (err) {
+      return sendAiErrorResponse(
+        res,
+        requestId,
+        err,
+        'AI Event Concierge encountered an upstream error. Please try again shortly.',
+      );
+    }
 
+    try {
+      const now = new Date().toISOString();
       const savedSession = await withTransaction(async (db) => {
         let existing = parsed.data.sessionId
           ? db.aiSessions.find((s) => s.id === parsed.data.sessionId)
@@ -2187,7 +2369,7 @@ export function createApp(options: CreateAppOptions = {}) {
 
         if (!existing) {
           existing = {
-            id: `ais-${Date.now()}`,
+            id: `ais-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
             ownerUserId: callerOwnerId,
             createdAt: now,
             clientName: parsed.data.clientName || (ctx.session.role !== 'guest' ? ctx.session.name : 'Prospective Client'),
@@ -2215,67 +2397,801 @@ export function createApp(options: CreateAppOptions = {}) {
         return existing;
       });
 
-      res.json({
+      logStructured('info', 'ai_concierge_persisted', {
+        requestId,
+        sessionId: savedSession.id,
+        escalatedToHuman: savedSession.escalatedToHuman,
+        eventCategory: savedSession.eventCategory,
+      });
+
+      return res.json({
+        success: true,
+        persisted: true,
+        requestId,
         sessionId: savedSession.id,
         reply: aiResult.reply,
         extractedLead: aiResult.extractedLead,
       });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'AI Concierge encountered an upstream error.';
-      if (msg.startsWith('AI_TIMEOUT:')) {
-        return res.status(504).json({ error: 'AI Event Concierge timed out. Please try again.', code: 'AI_TIMEOUT' });
-      }
-      if (msg.startsWith('AI_INVALID_OUTPUT:')) {
-        return res.status(502).json({ error: 'AI Event Concierge returned an invalid response. Please retry.', code: 'AI_INVALID_OUTPUT' });
-      }
-      return res.status(502).json({ error: msg, code: 'AI_PROVIDER_ERROR' });
+      observability.recordAiEvent('persistenceError');
+      const dbErr = classifyDatabaseError(err);
+      logStructured('error', 'ai_concierge_persistence_failed', {
+        requestId,
+        dbErrorCode: dbErr?.code ?? 'DB_ERROR',
+        httpStatus: dbErr?.httpStatus ?? 500,
+      });
+      const safeMsg =
+        'Your concierge response was generated, but we could not save the session right now. Please try again.';
+      return res.status(500).json({
+        success: false,
+        error: safeMsg,
+        code: 'AI_PERSISTENCE_FAILED',
+        retryable: true,
+        requestId,
+        errorDetail: { code: 'AI_PERSISTENCE_FAILED', message: safeMsg, retryable: true },
+      });
     }
   });
 
-  // AI Event Concept Studio (Server-side Gemini API with strict concept & booking isolation)
+  // AI Event Concept Studio (Server-side Gemini API with strict concept/booking isolation, idempotency & atomic persistence)
   app.post('/api/ai/concept-studio', rateLimit(12, 60_000), async (req: Request, res: Response) => {
+    const requestId = String(res.getHeader('X-Request-Id') || crypto.randomUUID());
     const schema = z.object({
-      conceptId: z.string().optional(),
-      bookingId: z.string().optional(),
-      eventType: z.string().min(2).max(120),
-      guestCount: z.coerce.number().int().min(10).max(2000),
-      venueStyle: z.string().min(2).max(200),
-      preferredPalette: z.string().min(2).max(200),
-      visionDescription: z.string().min(5).max(1500),
+      conceptId: z.string().trim().min(1).optional(),
+      bookingId: z.string().trim().min(1).optional(),
+      eventType: z.string().trim().min(2, 'Please select an event type.').max(120),
+      guestCount: z.coerce
+        .number()
+        .int('Guest count must be a whole number.')
+        .min(10, 'Guest count must be at least 10.')
+        .max(2000, 'Guest count cannot exceed 2,000.'),
+      venueStyle: z.string().trim().min(2, 'Please describe your venue style.').max(200),
+      preferredPalette: z.string().trim().min(2, 'Please enter your preferred color palette.').max(200),
+      visionDescription: z.string().trim().min(5, 'Please share a few details about your celebration vision.').max(1500),
     });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) {
-      return res.status(400).json({ error: 'Please describe your event vision and venue style.' });
+      const msg = parsed.error.issues[0]?.message || 'Please describe your event vision and venue style.';
+      return res.status(400).json({
+        success: false,
+        error: msg,
+        code: 'VALIDATION_ERROR',
+        retryable: false,
+        requestId,
+        errorDetail: { code: 'VALIDATION_ERROR', message: msg, retryable: false },
+      });
     }
 
     const { db: preflightDb, ctx } = await getAuth(req);
+    // Reject invalid or inactive authenticated contexts before
+    // joining an existing operation or invoking the AI provider.
+    if (ctx.spoofAttemptDetected || ctx.accountStatus !== 'active') {
+      const message = 'Your session is not authorized to generate a concept.';
+      return res.status(403).json({
+        success: false,
+        error: message,
+        code: 'FORBIDDEN',
+        retryable: false,
+        requestId,
+        errorDetail: {
+          code: 'FORBIDDEN',
+          message,
+          retryable: false,
+        },
+      });
+    }
 
-    // Pre-check concept revision & booking authorization BEFORE calling Gemini API
-    if (parsed.data.conceptId) {
-      const existingCheck = preflightDb.concepts.find((c) => c.id === parsed.data.conceptId);
-      if (existingCheck) {
+    // Prevent shared anonymous proposal retrieval.
+    const callerScope =
+      ctx.session.role === 'guest' ? undefined : ctx.session.id;
+
+    const rawIdemKey = (req.header('idempotency-key') || '').trim();
+    const scopedIdempotencyKey =
+      callerScope && rawIdemKey && /^[a-zA-Z0-9_:-]{8,128}$/.test(rawIdemKey)
+        ? `${callerScope}:${rawIdemKey}`
+        : undefined;
+
+
+    const { createHash } = await import('node:crypto');
+
+    const requestFingerprint = createHash('sha256')
+      .update(JSON.stringify(parsed.data))
+      .digest('hex');
+
+    const encodeIdempotencyRecord = (conceptId: string) =>
+      `v2:${requestFingerprint}:${conceptId}`;
+
+    const canAccessAttachedBooking = (
+      db: typeof preflightDb,
+      bookingId: string
+    ): boolean => {
+      if (
+        bookingId === 'unassigned-client-concept' ||
+        bookingId === 'public-concierge-preview'
+      ) {
+        return true;
+      }
+
+      const booking = db.bookings.find(
+        (b) => b.id === bookingId
+      );
+
+      return Boolean(
+        booking &&
+        isAuthorizedForBooking(
+          booking, ctx.session, db.vendors
+        )
+      );
+    };
+
+    const resolveCachedConcept = (
+      db: typeof preflightDb,
+      record: string
+    ) => {
+      const prefix = `v2:${requestFingerprint}:`;
+
+      if (!record.startsWith(prefix)) {
+        throw new Error('IDEMPOTENCY_CONFLICT');
+      }
+
+      const existing = db.concepts.find(
+        (c) => c.id === record.slice(prefix.length)
+      );
+
+      if (!existing) {
+        throw new Error('IDEMPOTENCY_CONFLICT');
+      }
+
+      const authorized =
+        hasPlanningClearance(ctx.session) ||
+        (ctx.session.role === 'client' &&
+          existing.clientId === ctx.session.id);
+
+      if (!authorized) {
+        throw new Error('IDEMPOTENCY_FORBIDDEN');
+      }
+
+      if (!canAccessAttachedBooking(
+        db, existing.bookingId
+      )) {
+        throw new Error('IDEMPOTENCY_FORBIDDEN');
+      }
+
+      return existing;
+    };
+
+    const sendIdempotencyError = (err: unknown) => {
+      const forbidden =
+        err instanceof Error &&
+        err.message === 'IDEMPOTENCY_FORBIDDEN';
+
+      const code = forbidden
+        ? 'FORBIDDEN'
+        : 'IDEMPOTENCY_CONFLICT';
+
+      const message = forbidden
+        ? 'Not authorized to access this concept.'
+        : 'This request key cannot be reused. Start a new request.';
+
+      return res.status(forbidden ? 403 : 409).json({
+        success: false,
+        error: message,
+        code,
+        retryable: false,
+        requestId,
+        errorDetail: { code, message, retryable: false },
+      });
+    };
+
+    // Cached results must cross the same fresh authorization
+    // and transaction boundary as newly generated proposals.
+    const cacheOnlyRequest = Boolean(
+      scopedIdempotencyKey &&
+      preflightDb.conceptIdempotencyKeys?.[scopedIdempotencyKey]
+    );
+
+    if (!cacheOnlyRequest) {
+      // Pre-check concept revision & booking authorization BEFORE calling Gemini API
+      if (parsed.data.conceptId) {
+        const existingCheck = preflightDb.concepts.find((c) => c.id === parsed.data.conceptId);
+        if (!existingCheck) {
+          return res.status(404).json({
+            success: false,
+            error: 'The selected concept proposal could not be found. Create a new concept proposal instead.',
+            code: 'CONCEPT_NOT_FOUND',
+            retryable: false,
+            requestId,
+            errorDetail: {
+              code: 'CONCEPT_NOT_FOUND',
+              message: 'The selected concept proposal could not be found.',
+              retryable: false,
+            },
+          });
+        }
         const canRevise =
           hasPlanningClearance(ctx.session) ||
           (ctx.session.role === 'client' && existingCheck.clientId === ctx.session.id);
         if (!canRevise) {
-          return res.status(403).json({ error: 'Cannot revise another client concept.' });
+          return res.status(403).json({
+            success: false,
+            error: 'Cannot revise another client concept.',
+            code: 'FORBIDDEN',
+            retryable: false,
+            requestId,
+            errorDetail: { code: 'FORBIDDEN', message: 'Cannot revise another client concept.', retryable: false },
+          });
+        }
+        if (!canAccessAttachedBooking(
+          preflightDb, existingCheck.bookingId
+        )) {
+          return sendIdempotencyError(
+            new Error('IDEMPOTENCY_FORBIDDEN')
+          );
+        }
+
+        if (
+          parsed.data.bookingId &&
+          parsed.data.bookingId !== existingCheck.bookingId
+        ) {
+          return res.status(409).json({
+            success: false,
+            code: 'CONCEPT_BOOKING_CONFLICT',
+            error: 'An existing concept cannot be reassigned by generating a revision.',
+            retryable: false,
+            requestId,
+          });
+        }
+
+        if (existingCheck.clientApproved && existingCheck.staffApproved && !hasPlanningClearance(ctx.session)) {
+          return res.status(409).json({
+            success: false,
+            error: 'This concept proposal has already received dual approval. Create a new concept proposal for a fresh direction.',
+            code: 'CONCEPT_ALREADY_APPROVED',
+            retryable: false,
+            requestId,
+            errorDetail: {
+              code: 'CONCEPT_ALREADY_APPROVED',
+              message: 'This concept proposal has already received dual approval.',
+              retryable: false,
+            },
+          });
+        }
+      }
+      if (parsed.data.bookingId) {
+        const bookingCheck = preflightDb.bookings.find((b) => b.id === parsed.data.bookingId);
+        if (!bookingCheck || !isAuthorizedForBooking(bookingCheck, ctx.session, preflightDb.vendors)) {
+          return res.status(403).json({
+            success: false,
+            error: 'Not authorized to attach a concept to this booking.',
+            code: 'FORBIDDEN',
+            retryable: false,
+            requestId,
+            errorDetail: {
+              code: 'FORBIDDEN',
+              message: 'Not authorized to attach a concept to this booking.',
+              retryable: false,
+            },
+          });
         }
       }
     }
-    if (parsed.data.bookingId) {
-      const bookingCheck = preflightDb.bookings.find((b) => b.id === parsed.data.bookingId);
-      if (!bookingCheck || !isAuthorizedForBooking(bookingCheck, ctx.session, preflightDb.vendors)) {
-        return res.status(403).json({ error: 'Not authorized to attach a concept to this booking.' });
+
+    const flightKey = scopedIdempotencyKey
+      ? JSON.stringify([callerScope, rawIdemKey])
+      : undefined;
+
+    let flight: ConceptGenerationFlight | undefined;
+
+    const releaseFlight = async () => {
+      if (!flightKey || !flight) return;
+      const completed = flight;
+      flight = undefined;
+      completed.participants -= 1;
+
+      if (
+        completed.participants === 0 &&
+        conceptGenerationFlights.get(flightKey) === completed
+      ) {
+        conceptGenerationFlights.delete(flightKey);
+        if (completed.durableLease) {
+          try {
+            await releaseConceptLease(completed.durableLease);
+          } catch {
+            logStructured('error',
+              'ai_concept_lease_cleanup_failed', { requestId });
+          }
+        }
       }
+    };
+
+    let proposal:
+      Awaited<ReturnType<typeof generateConceptProposal>> | undefined;
+
+    try {
+      if (cacheOnlyRequest) {
+        // Never invoke the provider for a known cached request.
+        // A missing or unauthorized durable result fails closed
+        // inside the final transaction.
+        proposal = undefined;
+      } else if (flightKey) {
+        const existingFlight =
+          conceptGenerationFlights.get(flightKey);
+
+        if (
+          existingFlight &&
+          existingFlight.fingerprint !== requestFingerprint
+        ) {
+          return sendIdempotencyError(
+            new Error('IDEMPOTENCY_CONFLICT'),
+          );
+        }
+
+        if (existingFlight) {
+          if (
+            existingFlight.participants >=
+            MAX_CONCEPT_FLIGHT_PARTICIPANTS
+          ) {
+            const message =
+              'Too many requests are waiting for this proposal. Please retry shortly.';
+
+            return res.status(503).json({
+              success: false,
+              error: message,
+              code: 'AI_SERVICE_BUSY',
+              retryable: true,
+              requestId,
+              errorDetail: {
+                code: 'AI_SERVICE_BUSY',
+                message,
+                retryable: true,
+              },
+            });
+          }
+
+          flight = existingFlight;
+          flight.participants += 1;
+
+          logStructured('info', 'ai_concept_singleflight_joined', {
+            requestId,
+          });
+        } else {
+          if (
+            conceptGenerationFlights.size >=
+            MAX_CONCEPT_GENERATION_FLIGHTS
+          ) {
+            const message =
+              'Concept Studio is busy. Please retry shortly.';
+
+            return res.status(503).json({
+              success: false,
+              error: message,
+              code: 'AI_SERVICE_BUSY',
+              retryable: true,
+              requestId,
+              errorDetail: {
+                code: 'AI_SERVICE_BUSY',
+                message,
+                retryable: true,
+              },
+            });
+          }
+
+          // Defer execution until the coordination entry is registered.
+          // This closes the local stale-preflight snapshot window.
+          const sharedProposal = Promise.resolve().then(async () => {
+            const {
+              db: latestDb,
+              ctx: latestCtx,
+            } = await getAuth(req);
+
+            if (
+              latestCtx.spoofAttemptDetected ||
+              latestCtx.accountStatus !== 'active' ||
+              latestCtx.session.id !== ctx.session.id ||
+              latestCtx.session.role !== ctx.session.role ||
+              latestCtx.authMethod !== ctx.authMethod ||
+              latestCtx.sessionJti !== ctx.sessionJti ||
+              latestCtx.mfaVerified !== ctx.mfaVerified ||
+              latestCtx.aal !== ctx.aal ||
+              JSON.stringify(latestCtx.session) !==
+                JSON.stringify(ctx.session)
+            ) {
+              throw new Error('AI_AUTHORIZATION_CHANGED');
+            }
+
+            // A previous operation may have committed after the
+            // original preflight snapshot was collected.
+            const durableRecord = scopedIdempotencyKey
+              ? latestDb.conceptIdempotencyKeys?.[
+                  scopedIdempotencyKey
+                ]
+              : undefined;
+
+            if (durableRecord) {
+              resolveCachedConcept(latestDb, durableRecord);
+
+              logStructured(
+                'info',
+                'ai_concept_fresh_snapshot_deduplicated',
+                { requestId },
+              );
+
+              // The final transaction independently resolves
+              // the durable result for every participant.
+              return undefined;
+            }
+
+            if (!scopedIdempotencyKey) {
+              throw new Error('AI_LEASE_ACQUISITION_FAILED');
+            }
+
+            const acquisition = await acquireConceptLease(
+  scopedIdempotencyKey,
+  requestFingerprint,
+
+async (db) => {
+const { ctx: freshCtx } = await getAuth(req, db);
+
+        if (
+          freshCtx.spoofAttemptDetected ||
+          freshCtx.session.id !== ctx.session.id ||
+          freshCtx.session.role !== ctx.session.role ||
+          freshCtx.accountStatus !== ctx.accountStatus ||
+          freshCtx.accountStatus !== 'active' ||
+          freshCtx.authMethod !== ctx.authMethod ||
+          freshCtx.sessionJti !== ctx.sessionJti ||
+          freshCtx.mfaVerified !== ctx.mfaVerified ||
+          freshCtx.aal !== ctx.aal ||
+          JSON.stringify(freshCtx.session) !==
+            JSON.stringify(ctx.session)
+        ) {
+          throw new Error('AI_AUTHORIZATION_CHANGED');
+        }
+
+  // Validate explicit booking access.
+  if (parsed.data.bookingId) {
+    const booking = db.bookings.find(
+      (b) => b.id === parsed.data.bookingId,
+    );
+
+    if (!booking || !isAuthorizedForBooking(
+      booking, ctx.session, db.vendors,
+    )) {
+      throw new Error('IDEMPOTENCY_FORBIDDEN');
+    }
+  }
+
+  // Preserve durable replay semantics.
+  const cachedRecord = scopedIdempotencyKey
+    ? db.conceptIdempotencyKeys?.[scopedIdempotencyKey]
+    : undefined;
+
+  if (cachedRecord) {
+    resolveCachedConcept(db, cachedRecord);
+    return;
+  }
+
+  // Revalidate revision permissions before generation.
+  if (parsed.data.conceptId) {
+    const existing = db.concepts.find(
+      (c) => c.id === parsed.data.conceptId,
+    );
+
+    if (!existing) {
+      throw new Error('CONCEPT_REVISION_MISSING');
+    }
+
+    const canRevise =
+      hasPlanningClearance(ctx.session) ||
+      (
+        ctx.session.role === 'client' &&
+        existing.clientId === ctx.session.id
+      );
+
+    if (!canRevise) {
+      throw new Error(
+        'FORBIDDEN:Cannot revise another client concept.',
+      );
+    }
+
+    if (
+      existing.clientApproved &&
+      existing.staffApproved &&
+      !hasPlanningClearance(ctx.session)
+    ) {
+      throw new Error(
+        'CONCEPT_LOCKED:This concept proposal has already received dual approval.',
+      );
+    }
+
+    if (!canAccessAttachedBooking(
+      db, existing.bookingId,
+    )) {
+      throw new Error('IDEMPOTENCY_FORBIDDEN');
+    }
+
+    if (
+      parsed.data.bookingId &&
+      parsed.data.bookingId !== existing.bookingId
+    ) {
+      throw new Error('CONCEPT_BOOKING_CONFLICT');
+    }
+  } else {
+    const safeBookingId = parsed.data.bookingId
+      ? parsed.data.bookingId
+      : ctx.session.role === 'client'
+        ? db.bookings.find(
+            (b) => b.clientId === ctx.session.id,
+          )?.id || 'unassigned-client-concept'
+        : 'public-concierge-preview';
+
+    if (!canAccessAttachedBooking(db, safeBookingId)) {
+      throw new Error('IDEMPOTENCY_FORBIDDEN');
+    }
+  }
+}
+,
+).catch((error: unknown) => {
+  if (error instanceof Error && (
+    [
+      'AI_AUTHORIZATION_CHANGED',
+      'IDEMPOTENCY_CONFLICT',
+      'IDEMPOTENCY_FORBIDDEN',
+      'CONCEPT_REVISION_MISSING',
+      'CONCEPT_BOOKING_CONFLICT',
+    ].includes(error.message) ||
+    error.message.startsWith('FORBIDDEN:') ||
+    error.message.startsWith('CONCEPT_LOCKED:')
+  )) {
+    throw error;
+  }
+  throw new Error('AI_LEASE_ACQUISITION_FAILED');
+});
+
+            if (acquisition.status === 'conflict') {
+              throw new Error('IDEMPOTENCY_CONFLICT');
+            }
+
+            if (acquisition.status === 'completed') {
+              return undefined;
+            }
+
+            if (acquisition.status !== 'acquired') {
+              throw new Error('AI_DURABLE_LEASE_BUSY');
+            }
+
+            const activeFlight =
+              conceptGenerationFlights.get(flightKey);
+
+            if (!activeFlight) {
+              await releaseConceptLease(acquisition.lease);
+              throw new Error('AI_LEASE_ACQUISITION_FAILED');
+            }
+
+            activeFlight.durableLease = acquisition.lease;
+
+            logStructured('info',
+              'ai_concept_durable_lease_acquired', { requestId });
+
+            return generateConceptProposal(parsed.data, {
+              requestId,
+              endpoint: '/api/ai/concept-studio',
+            });
+          });
+
+          flight = {
+            fingerprint: requestFingerprint,
+            proposal: sharedProposal,
+            participants: 1,
+          };
+
+          conceptGenerationFlights.set(flightKey, flight);
+        }
+
+        proposal = await flight.proposal;
+      } else {
+        // Anonymous or unkeyed requests remain independent.
+        proposal = await generateConceptProposal(parsed.data, {
+          requestId,
+          endpoint: '/api/ai/concept-studio',
+        });
+      }
+    } catch (err) {
+      // A provider timeout does not prove that upstream
+      // generation has stopped. Retain durable ownership
+      // until its database-clock expiry to prevent immediate
+      // duplicate generation across backend replicas.
+      if (
+        flight?.durableLease &&
+        err instanceof Error &&
+        (
+          ('code' in err && err.code === 'AI_TIMEOUT') ||
+          err.message.startsWith('AI_TIMEOUT:')
+        )
+      ) {
+        flight.durableLease = undefined;
+
+        logStructured(
+          'warn',
+          'ai_concept_timeout_lease_retained',
+          { requestId },
+        );
+      }
+
+      await releaseFlight();
+
+      if (err instanceof Error) {
+        if (err.message === 'CONCEPT_REVISION_MISSING') {
+          return res.status(404).json({
+            success: false,
+            code: 'CONCEPT_NOT_FOUND',
+            error: 'The selected concept no longer exists.',
+            retryable: false,
+            requestId,
+          });
+        }
+
+        if (err.message === 'CONCEPT_BOOKING_CONFLICT') {
+          return res.status(409).json({
+            success: false,
+            code: 'CONCEPT_BOOKING_CONFLICT',
+            error: 'The concept booking association has changed.',
+            retryable: false,
+            requestId,
+          });
+        }
+
+        if (
+          err.message.startsWith('FORBIDDEN:') ||
+          err.message.startsWith('CONCEPT_LOCKED:')
+        ) {
+          return sendAiErrorResponse(
+            res, requestId, err,
+            'Unable to update concept proposal.',
+          );
+        }
+      }
+
+
+      if (err instanceof Error &&
+          ['AI_DURABLE_LEASE_BUSY',
+           'AI_LEASE_ACQUISITION_FAILED'].includes(err.message)) {
+        const busy = err.message === 'AI_DURABLE_LEASE_BUSY';
+        const code = busy ? 'AI_SERVICE_BUSY' : 'AI_PERSISTENCE_FAILED';
+        const message = busy
+          ? 'A matching proposal is being processed. Please retry shortly.'
+          : 'Proposal coordination is unavailable. Please retry.';
+
+        if (busy) res.setHeader('Retry-After', '3');
+
+        return res.status(busy ? 503 : 500).json({
+          success: false, code, error: message,
+          retryable: true, requestId,
+          errorDetail: { code, message, retryable: true },
+        });
+      }
+
+      if (
+        err instanceof Error &&
+        (
+          err.message === 'IDEMPOTENCY_CONFLICT' ||
+          err.message === 'IDEMPOTENCY_FORBIDDEN'
+        )
+      ) {
+        return sendIdempotencyError(err);
+      }
+
+      if (
+        err instanceof Error &&
+        err.message === 'AI_AUTHORIZATION_CHANGED'
+      ) {
+        const code = 'AI_AUTHORIZATION_CHANGED';
+        const message =
+          'Authorization changed. Sign in again before retrying.';
+
+        return res.status(403).json({
+          success: false,
+          error: message,
+          code,
+          retryable: false,
+          requestId,
+          errorDetail: {
+            code,
+            message,
+            retryable: false,
+          },
+        });
+      }
+
+      return sendAiErrorResponse(
+        res,
+        requestId,
+        err,
+        'Concept Studio AI service could not generate a proposal right now. Please try again.',
+      );
     }
 
     try {
-      const proposal = await generateConceptProposal(parsed.data);
+      const outcome = await withClockedTransaction(async (db, clock) => {
+        // Revalidate the original credential against the locked
+        // database state before saving any generated concept.
+        const { ctx: freshCtx } = await getAuth(req, db);
 
-      const savedConcept = await withTransaction(async (db) => {
+        if (
+          freshCtx.spoofAttemptDetected ||
+          freshCtx.session.id !== ctx.session.id ||
+          freshCtx.session.role !== ctx.session.role ||
+          freshCtx.accountStatus !== ctx.accountStatus ||
+          freshCtx.accountStatus !== 'active' ||
+          freshCtx.authMethod !== ctx.authMethod ||
+          freshCtx.sessionJti !== ctx.sessionJti ||
+          freshCtx.mfaVerified !== ctx.mfaVerified ||
+          freshCtx.aal !== ctx.aal ||
+          JSON.stringify(freshCtx.session) !==
+            JSON.stringify(ctx.session)
+        ) {
+          throw new Error('AI_AUTHORIZATION_CHANGED');
+        }
+
+
+        if (parsed.data.bookingId) {
+          const booking = db.bookings.find(
+            (b) => b.id === parsed.data.bookingId
+          );
+
+          if (!booking || !isAuthorizedForBooking(
+            booking, ctx.session, db.vendors
+          )) {
+            throw new Error('IDEMPOTENCY_FORBIDDEN');
+          }
+        }
+
+        db.conceptIdempotencyKeys = db.conceptIdempotencyKeys || {};
+        if (scopedIdempotencyKey && db.conceptIdempotencyKeys[scopedIdempotencyKey]) {
+          const existingConcept = resolveCachedConcept(
+            db,
+            db.conceptIdempotencyKeys[scopedIdempotencyKey]
+          );
+          if (existingConcept) {
+            return { concept: existingConcept, deduplicated: true };
+          }
+        }
+
+        // A cache-only operation may never create a new concept
+        // if its durable record disappears before finalization.
+        if (!proposal) {
+          throw new Error('IDEMPOTENCY_CONFLICT');
+        }
+
+        const ownedLease = flight?.durableLease;
+
+        if (scopedIdempotencyKey) {
+          if (!ownedLease) {
+            throw new Error('AI_CONCEPT_LEASE_LOST');
+          }
+
+          assertConceptLeaseOwnership(
+            db, ownedLease, scopedIdempotencyKey,
+            requestFingerprint, await clock(),
+          );
+        }
+
+        const completeOwnedLease = async () => {
+          if (scopedIdempotencyKey && ownedLease) {
+            completeConceptLease(
+              db, ownedLease, scopedIdempotencyKey,
+              requestFingerprint, await clock(),
+            );
+          }
+        };
+
         const existing = parsed.data.conceptId
           ? db.concepts.find((c) => c.id === parsed.data.conceptId)
           : undefined;
+
+        if (parsed.data.conceptId && !existing) {
+          throw new Error('CONCEPT_REVISION_MISSING');
+        }
 
         if (existing) {
           const canRevise =
@@ -2284,8 +3200,28 @@ export function createApp(options: CreateAppOptions = {}) {
           if (!canRevise) {
             throw new Error('FORBIDDEN:Cannot revise another client concept.');
           }
+          if (existing.clientApproved && existing.staffApproved && !hasPlanningClearance(ctx.session)) {
+            throw new Error(
+              'CONCEPT_LOCKED:This concept proposal has already received dual approval. Create a new concept proposal instead.',
+            );
+          }
+          if (!canAccessAttachedBooking(
+            db, existing.bookingId
+          )) {
+            throw new Error('IDEMPOTENCY_FORBIDDEN');
+          }
+
+          if (
+            parsed.data.bookingId &&
+            parsed.data.bookingId !== existing.bookingId
+          ) {
+            throw new Error('CONCEPT_BOOKING_CONFLICT');
+          }
+
           const nextVer = existing.currentVersion + 1;
           existing.currentVersion = nextVer;
+          existing.eventType = parsed.data.eventType;
+          existing.title = `${proposal.themeName} Concept`;
           existing.clientApproved = false;
           existing.staffApproved = false;
           existing.revisions.unshift({
@@ -2293,8 +3229,12 @@ export function createApp(options: CreateAppOptions = {}) {
             createdAt: new Date().toISOString(),
             ...proposal,
           });
+          if (scopedIdempotencyKey) {
+            db.conceptIdempotencyKeys[scopedIdempotencyKey] = encodeIdempotencyRecord(existing.id);
+          }
           appendAudit(db, ctx.session, 'CONCEPT_REVISED', 'DesignConcept', existing.id, `Created revision v${nextVer}`);
-          return existing;
+          await completeOwnedLease();
+          return { concept: existing, deduplicated: false };
         }
 
         const safeBookingId = parsed.data.bookingId
@@ -2303,8 +3243,15 @@ export function createApp(options: CreateAppOptions = {}) {
             ? db.bookings.find((b) => b.clientId === ctx.session.id)?.id || 'unassigned-client-concept'
             : 'public-concierge-preview';
 
+        if (!canAccessAttachedBooking(
+          db, safeBookingId
+        )) {
+          throw new Error('IDEMPOTENCY_FORBIDDEN');
+        }
+
+        const nowIso = new Date().toISOString();
         const newConcept = {
-          id: `cnc-${Date.now()}`,
+          id: `cnc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
           bookingId: safeBookingId,
           clientId:
             ctx.session.role === 'client'
@@ -2318,31 +3265,141 @@ export function createApp(options: CreateAppOptions = {}) {
           revisions: [
             {
               version: 1,
-              createdAt: new Date().toISOString(),
+              createdAt: nowIso,
               ...proposal,
             },
           ],
           clientApproved: false,
           staffApproved: false,
           isConceptualVisualization: true as const,
-          createdAt: new Date().toISOString(),
+          createdAt: nowIso,
         };
         db.concepts.unshift(newConcept);
+        if (scopedIdempotencyKey) {
+          db.conceptIdempotencyKeys[scopedIdempotencyKey] = encodeIdempotencyRecord(newConcept.id);
+        }
         appendAudit(db, ctx.session, 'CONCEPT_GENERATED', 'DesignConcept', newConcept.id, `Generated conceptual visualization (${proposal.themeName})`);
-        return newConcept;
+        await completeOwnedLease();
+        return { concept: newConcept, deduplicated: false };
       });
 
-      res.json({ concept: savedConcept });
+      // A successful non-deduplicated transaction has
+      // atomically persisted the proposal and completed its lease.
+      // Never issue a redundant lease-release transaction.
+      if (!outcome.deduplicated && flight?.durableLease) {
+        flight.durableLease = undefined;
+      }
+
+      await releaseFlight();
+
+      logStructured('info', 'ai_concept_persisted', {
+        requestId,
+        conceptId: outcome.concept.id,
+        currentVersion: outcome.concept.currentVersion,
+        eventType: outcome.concept.eventType,
+        deduplicated: outcome.deduplicated,
+        paletteCount: outcome.concept.revisions[0]?.colorPalette.length ?? 0,
+        recommendedDivisionsCount: outcome.concept.revisions[0]?.recommendedDivisions.length ?? 0,
+      });
+
+      return res.json({
+        success: true,
+        persisted: true,
+        deduplicated: outcome.deduplicated,
+        requestId,
+        concept: outcome.concept,
+      });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Concept Studio AI service error.';
-      if (msg.startsWith('FORBIDDEN:')) return res.status(403).json({ error: msg.slice(10) });
-      if (msg.startsWith('AI_TIMEOUT:')) {
-        return res.status(504).json({ error: 'AI Event Concept Studio timed out. Please try again.', code: 'AI_TIMEOUT' });
+      await releaseFlight();
+
+      if (
+        err instanceof Error &&
+        err.message === 'AI_AUTHORIZATION_CHANGED'
+      ) {
+        const message =
+          'Your session or authorization changed during generation. Sign in again before continuing.';
+
+        return res.status(403).json({
+          success: false,
+          error: message,
+          code: 'AI_AUTHORIZATION_CHANGED',
+          retryable: false,
+          requestId,
+          errorDetail: {
+            code: 'AI_AUTHORIZATION_CHANGED',
+            message,
+            retryable: false,
+          },
+        });
       }
-      if (msg.startsWith('AI_INVALID_OUTPUT:')) {
-        return res.status(502).json({ error: 'AI Event Concept Studio returned an invalid proposal. Please retry.', code: 'AI_INVALID_OUTPUT' });
+
+
+      if (err instanceof Error &&
+          ['IDEMPOTENCY_CONFLICT', 'IDEMPOTENCY_FORBIDDEN'].includes(err.message)) {
+        return sendIdempotencyError(err);
       }
-      return res.status(502).json({ error: msg, code: 'AI_PROVIDER_ERROR' });
+
+      if (err instanceof Error &&
+          err.message === 'CONCEPT_BOOKING_CONFLICT') {
+        return res.status(409).json({
+          success: false,
+          code: 'CONCEPT_BOOKING_CONFLICT',
+          error: 'The concept booking association has changed.',
+          retryable: false,
+          requestId,
+        });
+      }
+
+      if (err instanceof Error &&
+          err.message === 'CONCEPT_REVISION_MISSING') {
+        const code = 'CONCEPT_NOT_FOUND';
+        const message = 'The selected concept no longer exists.';
+
+        return res.status(404).json({
+          success: false,
+          error: message,
+          code,
+          retryable: false,
+          requestId,
+          errorDetail: { code, message, retryable: false },
+        });
+      }
+
+      if (err instanceof Error && (err.message.startsWith('FORBIDDEN:') || err.message.startsWith('CONCEPT_LOCKED:'))) {
+        return sendAiErrorResponse(res, requestId, err, 'Unable to update concept proposal.');
+      }
+      if (err instanceof Error &&
+          err.message === 'AI_CONCEPT_LEASE_LOST') {
+        const code = 'AI_SERVICE_BUSY';
+        const message = 'Proposal ownership changed. Please retry.';
+        res.setHeader('Retry-After', '3');
+
+        return res.status(503).json({
+          success: false, code, error: message,
+          retryable: true, requestId,
+          errorDetail: { code, message, retryable: true },
+        });
+      }
+
+      observability.recordAiEvent('persistenceError');
+      const dbErr = classifyDatabaseError(err);
+      logStructured('error', 'ai_concept_persistence_failed', {
+        requestId,
+        dbErrorCode: dbErr?.code ?? 'DB_ERROR',
+        httpStatus: dbErr?.httpStatus ?? 500,
+      });
+      const safeMsg =
+        'Your concept proposal was generated, but we could not save it to the database right now. Your details are preserved — please click Retry.';
+      return res.status(500).json({
+        success: false,
+        error: safeMsg,
+        code: 'AI_PERSISTENCE_FAILED',
+        retryable: true,
+        requestId,
+        errorDetail: { code: 'AI_PERSISTENCE_FAILED', message: safeMsg, retryable: true },
+      });
+    } finally {
+      await releaseFlight();
     }
   });
 
@@ -3921,7 +4978,16 @@ export function createApp(options: CreateAppOptions = {}) {
     const isStaffOrAdmin = ['event_planner', 'staff', 'admin'].includes(ctx.session.role);
     let list = db.consultations.filter((c) => {
       if (isStaffOrAdmin) return true;
-      return c.clientId === ctx.session.id || c.clientEmail.toLowerCase() === ctx.session.email.toLowerCase();
+      if (c.clientId && c.clientId === ctx.session.id) return true;
+      // Never match another authenticated user's bound clientId by email alone;
+      // allow email fallback strictly for unbound public lead records when caller email is verified.
+      const isUnboundLead = !c.clientId || c.clientId.startsWith('lead:');
+      return (
+        isUnboundLead &&
+        ctx.emailVerified &&
+        Boolean(ctx.session.email) &&
+        c.clientEmail.toLowerCase() === ctx.session.email.toLowerCase()
+      );
     });
 
     const statusFilter = typeof req.query.status === 'string' ? req.query.status.trim() : '';

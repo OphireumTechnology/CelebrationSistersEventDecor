@@ -37,15 +37,19 @@ interface PortalsWorkspaceProps {
   currentUser: UserSession;
   mfaRequired: boolean;
   mfaEnrolled?: boolean;
+  externalStagingMode?: boolean;
+  hasPendingExternalFactor?: boolean;
   authProviderReady?: boolean;
   personas: UserSession[];
   onSwitchPersona: (user: UserSession) => Promise<void>;
   onEmailLogin?: (email: string, password: string) => Promise<{ ok: boolean; error?: string }>;
   onPasswordReset?: (email: string) => Promise<{ ok: boolean; message?: string; error?: string }>;
   onVerifyMfa: (code: string) => Promise<{ ok: boolean; error?: string }>;
-  onEnrollTotp?: (recoveryCode?: string) => Promise<{
+  onEnrollTotp?: (optionsOrRecoveryCode?: string | { replaceUnverified?: boolean }) => Promise<{
     ok: boolean;
     error?: string;
+    factorId?: string;
+    qrCode?: string;
     secret?: string;
     otpauthUri?: string;
     recoveryCodes?: string[];
@@ -76,6 +80,8 @@ export function PortalsWorkspace({
   currentUser,
   mfaRequired,
   mfaEnrolled = false,
+  externalStagingMode = false,
+  hasPendingExternalFactor = false,
   authProviderReady = false,
   personas,
   onSwitchPersona,
@@ -106,6 +112,8 @@ export function PortalsWorkspace({
   const [mfaMode, setMfaMode] = useState<'totp' | 'recovery' | 'enroll'>('totp');
   const [recoveryCodeInput, setRecoveryCodeInput] = useState('');
   const [totpEnrollment, setTotpEnrollment] = useState<{
+    factorId?: string;
+    qrCode?: string;
     secret: string;
     otpauthUri: string;
     recoveryCodes: string[];
@@ -127,7 +135,7 @@ export function PortalsWorkspace({
   const [blackoutReason, setBlackoutReason] = useState('Independence Day Holiday Studio Closure');
 
   const loadWorkspaceData = useCallback(async () => {
-    if (currentUser.role === 'guest') {
+    if (currentUser.role === 'guest' || (currentUser.role === 'admin' && mfaRequired)) {
       setBookings([]);
       setVendors([]);
       setChecklists([]);
@@ -251,17 +259,21 @@ export function PortalsWorkspace({
     await loadWorkspaceData();
   };
 
-  const handleEnrollTotpClick = async () => {
+  const handleEnrollTotpClick = async (replaceUnverified = false) => {
     if (!onEnrollTotp || authSubmitting) return;
     setActionMessage(null);
     setAuthSubmitting(true);
     try {
-      const result = await onEnrollTotp();
+      const result = externalStagingMode
+        ? await onEnrollTotp({ replaceUnverified })
+        : await onEnrollTotp();
       if (!result.ok || !result.secret || !result.otpauthUri) {
         setActionMessage({ type: 'err', text: result.error || 'Unable to generate authenticator enrollment.' });
         return;
       }
       setTotpEnrollment({
+        factorId: result.factorId,
+        qrCode: result.qrCode,
         secret: result.secret,
         otpauthUri: result.otpauthUri,
         recoveryCodes: result.recoveryCodes || [],
@@ -269,7 +281,9 @@ export function PortalsWorkspace({
       setMfaMode('enroll');
       setActionMessage({
         type: 'ok',
-        text: 'TOTP secret generated. Save your single-use recovery codes, then verify with a 6-digit authenticator code.',
+        text: externalStagingMode
+          ? 'Authenticator QR code generated. Scan it in your authenticator app, then enter the 6-digit verification code below to complete AAL2 elevation.'
+          : 'TOTP secret generated. Save your single-use recovery codes, then verify with a 6-digit authenticator code.',
       });
     } finally {
       setAuthSubmitting(false);
@@ -642,18 +656,24 @@ export function PortalsWorkspace({
                 </button>
                 <div className="flex items-center justify-between text-xs pt-1">
                   <span className="text-[var(--cs-charcoal-muted)]">
-                    {authProviderReady ? 'Supabase Auth active' : 'Identity provider awaiting server configuration'}
+                    {externalStagingMode
+                      ? 'Supabase External Staging Auth active (AAL2 enforced)'
+                      : authProviderReady
+                        ? 'Supabase Auth active'
+                        : 'Identity provider awaiting server configuration'}
                   </span>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setActionMessage(null);
-                      setLoginMode('reset');
-                    }}
-                    className="text-[var(--cs-purple)] hover:underline font-medium cursor-pointer"
-                  >
-                    Forgot password?
-                  </button>
+                  {!externalStagingMode && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setActionMessage(null);
+                        setLoginMode('reset');
+                      }}
+                      className="text-[var(--cs-purple)] hover:underline font-medium cursor-pointer"
+                    >
+                      Forgot password?
+                    </button>
+                  )}
                 </div>
               </form>
             ) : (
@@ -706,7 +726,7 @@ export function PortalsWorkspace({
               </p>
             </div>
 
-            {mfaMode === 'recovery' ? (
+            {mfaMode === 'recovery' && !externalStagingMode ? (
               <form onSubmit={handleRecoverMfaSubmit} className="space-y-4">
                 <input
                   type="text"
@@ -733,9 +753,27 @@ export function PortalsWorkspace({
               </form>
             ) : (
               <form onSubmit={handleMfaSubmit} className="space-y-4">
+                {externalStagingMode && hasPendingExternalFactor && !totpEnrollment && (
+                  <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-md text-xs text-amber-900 space-y-2 text-left">
+                    <p className="font-semibold">Pending Authenticator Enrollment Detected</p>
+                    <p className="leading-relaxed">
+                      Your pending TOTP factor registration was preserved across reload (secret keys are never persisted in browser storage). Enter the 6-digit code from your authenticator app below, or start a fresh enrollment if you have not scanned the QR code yet.
+                    </p>
+                  </div>
+                )}
+
                 {totpEnrollment && (
                   <div className="p-4 bg-[var(--cs-ivory)] border border-[var(--cs-border-strong)] rounded-md space-y-2.5 text-left text-xs">
                     <p className="font-semibold text-[var(--cs-purple)]">Authenticator Setup (RFC 6238 TOTP)</p>
+                    {totpEnrollment.qrCode && totpEnrollment.qrCode.startsWith('data:image/') && (
+                      <div className="flex justify-center py-2 bg-white rounded border border-[var(--cs-border)]">
+                        <img
+                          src={totpEnrollment.qrCode}
+                          alt="Scan this QR code in your authenticator app"
+                          className="w-44 h-44 object-contain"
+                        />
+                      </div>
+                    )}
                     <div>
                       <p className="text-[11px] text-[var(--cs-charcoal-muted)]">Manual Setup Secret:</p>
                       <p className="font-mono text-xs bg-white px-2.5 py-1.5 mt-1 rounded border border-[var(--cs-border)] break-all select-all">
@@ -768,6 +806,8 @@ export function PortalsWorkspace({
                 <input
                   type="password"
                   required
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
                   value={mfaCode}
                   onChange={(e) => setMfaCode(e.target.value)}
                   placeholder="Enter 6-digit MFA code"
@@ -785,13 +825,15 @@ export function PortalsWorkspace({
                     <button
                       type="button"
                       disabled={authSubmitting}
-                      onClick={handleEnrollTotpClick}
+                      onClick={() => handleEnrollTotpClick(externalStagingMode && hasPendingExternalFactor)}
                       className="text-[var(--cs-purple)] hover:underline font-medium cursor-pointer"
                     >
-                      Enroll Authenticator App (TOTP)
+                      {externalStagingMode && hasPendingExternalFactor
+                        ? 'Restart Authenticator Setup (TOTP)'
+                        : 'Enroll Authenticator App (TOTP)'}
                     </button>
                   )}
-                  {onRecoverMfa && (
+                  {onRecoverMfa && !externalStagingMode && (
                     <button
                       type="button"
                       onClick={() => setMfaMode('recovery')}

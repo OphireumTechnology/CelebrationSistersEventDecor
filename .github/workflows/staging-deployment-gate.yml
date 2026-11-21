@@ -1,0 +1,63 @@
+name: Staging Deployment & Commit SHA Sync Gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_commit_sha:
+        description: '40-character GitHub CI-approved commit SHA to verify on Railway staging'
+        required: true
+        type: string
+      staging_url:
+        description: 'Railway staging HTTPS URL'
+        required: false
+        default: 'https://celebrationsisterseventdecor-staging-staging.up.railway.app'
+        type: string
+  workflow_run:
+    workflows: ['CI Verification & Production Hardening Checks']
+    types: [completed]
+    branches: ['ops/**', 'release/**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: staging-deploy-gate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-railway-staging:
+    name: Independent Railway SHA Sync, Health, DB & Security Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_commit_sha || github.event.workflow_run.head_sha }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run fail-closed Railway deployment & SHA verification gate
+        id: gate
+        env:
+          STAGING_URL: ${{ github.event_name == 'workflow_dispatch' && inputs.staging_url || 'https://celebrationsisterseventdecor-staging-staging.up.railway.app' }}
+          GITHUB_APPROVED_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_commit_sha || github.event.workflow_run.head_sha }}
+          RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+          RAILWAY_PROJECT_ID: ${{ vars.RAILWAY_STAGING_PROJECT_ID || '786a7d31-23a8-4154-8185-0d5f07914c24' }}
+          RAILWAY_ENVIRONMENT_ID: ${{ vars.RAILWAY_STAGING_ENVIRONMENT_ID || '0ad6480e-6259-4a1a-81f8-a4bc89869cca' }}
+          RAILWAY_SERVICE_ID: ${{ vars.RAILWAY_STAGING_SERVICE_ID || '5ba79779-aa42-4516-b294-900ef137f23c' }}
+          STAGING_ADMIN_AAL2_TOKEN: ${{ secrets.STAGING_ADMIN_AAL2_TOKEN }}
+        run: |
+          node scripts/verify-staging-deployment.mjs --output staging-deployment-certification.json
+
+      - name: Upload machine-readable staging certification artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-deployment-certification-${{ github.run_id }}
+          path: staging-deployment-certification.json
+          retention-days: 30

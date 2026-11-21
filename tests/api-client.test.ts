@@ -87,7 +87,10 @@ test('GET /api/health reports readiness, AI configuration status, and non-produc
     assert.equal(json.ok, true);
     assert.equal(json.persistence.ready, true);
     assert.equal(json.persistence.adapter, 'json-local');
-    assert.equal(json.ai.model, 'gemini-4-hydrogen');
+    assert.equal(
+      json.ai.model,
+      process.env.GEMINI_MODEL?.trim().replace(/^models\//i, '') || 'gemini-4-hydrogen',
+    );
   } finally {
     server.close();
     if (prevDbPath === undefined) delete process.env.CS_DB_PATH;

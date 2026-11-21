@@ -59,6 +59,13 @@ export interface DatabaseSchema {
   revokedSessionIds: Record<string, number>;
   bookingIdempotencyKeys: Record<string, string>;
   consultationIdempotencyKeys: Record<string, string>;
+  conceptIdempotencyKeys?: Record<string, string>;
+  conceptGenerationLeases?: Record<string, {
+    fingerprint: string;
+    ownerToken: string;
+    acquiredAt: number;
+    expiresAt: number;
+  }>;
 }
 
 function getDbPath(): string {
@@ -635,6 +642,8 @@ function buildInitialSeed(): DatabaseSchema {
     revokedSessionIds: {},
     bookingIdempotencyKeys: {},
     consultationIdempotencyKeys: {},
+    conceptIdempotencyKeys: {},
+    conceptGenerationLeases: {},
   };
 }
 
@@ -654,6 +663,8 @@ function normalizeSchema(parsed: DatabaseSchema): DatabaseSchema {
   parsed.revokedSessionIds = parsed.revokedSessionIds || {};
   parsed.bookingIdempotencyKeys = parsed.bookingIdempotencyKeys || {};
   parsed.consultationIdempotencyKeys = parsed.consultationIdempotencyKeys || {};
+  parsed.conceptIdempotencyKeys = parsed.conceptIdempotencyKeys || {};
+  parsed.conceptGenerationLeases = parsed.conceptGenerationLeases || {};
   for (const b of parsed.bookings || []) {
     if (!b.architecturalStage) {
       b.architecturalStage = LEGACY_TO_ARCH_STATUS[b.status] ?? 'INQUIRY';
@@ -713,6 +724,47 @@ export async function withTransaction<T>(fn: (db: DatabaseSchema) => Promise<T> 
   } finally {
     release();
   }
+}
+
+/**
+ * Execute a transaction with an authoritative time source.
+ * PostgreSQL uses the active locked transaction's database clock.
+ * The local JSON adapter uses the local application clock.
+ */
+export async function withClockedTransaction<T>(
+  fn: (
+    db: DatabaseSchema,
+    clock: () => Promise<number>,
+  ) => Promise<T> | T,
+): Promise<T> {
+  assertPersistenceReady();
+
+  if (getPersistenceAdapterMode() === 'postgres') {
+    let transactionClock:
+      (() => Promise<number>) | undefined;
+
+    return runPostgresTransaction(
+      buildInitialSeed,
+      normalizeSchema,
+      async (db) => {
+        if (!transactionClock) {
+          throw new Error('DATABASE_CLOCK_UNAVAILABLE');
+        }
+
+        return fn(db, transactionClock);
+      },
+      {
+        useDatabaseClock: true,
+        receiveTransactionClock(clock) {
+          transactionClock = clock;
+        },
+      },
+    );
+  }
+
+  return withTransaction((db) =>
+    fn(db, async () => Date.now()),
+  );
 }
 
 export function sanitizeUserForClient(
