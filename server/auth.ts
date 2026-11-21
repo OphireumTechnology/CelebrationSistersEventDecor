@@ -281,7 +281,9 @@ export function resolveAuthenticatedContext(
 
   const matchedUser = registeredUsers.find((u) => u.id === verified.userId);
   if (!matchedUser) {
-    return guestContext(false);
+    // A supplied authenticated credential whose account no
+    // longer exists must not become an authorized guest request.
+    return guestContext(true);
   }
 
   const accountStatus: AccountStatus = matchedUser.accountStatus ?? 'active';
