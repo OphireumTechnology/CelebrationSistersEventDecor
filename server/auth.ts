@@ -332,7 +332,8 @@ export async function resolveAuthenticatedContextAsync(
         ? {
             supabaseUrl: `https://${STAGING_AUTH_PROJECT_REF}.supabase.co`,
             useJwksOnly: true,
-            ...(providerVerifyOptions?.keyResolver ? { keyResolver: providerVerifyOptions.keyResolver } : {}),
+            keyResolver: providerVerifyOptions?.keyResolver,
+            confirmProviderEmail: providerVerifyOptions?.confirmProviderEmail,
           }
         : providerVerifyOptions;
       const claims = await verifyProviderAccessToken(rawToken, verificationOptions);

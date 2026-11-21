@@ -57,6 +57,7 @@ export interface ExternalStagingSupabaseClientLike {
 }
 
 let client: SupabaseClient | null = null;
+let providerAdminClient: SupabaseClient | null = null;
 let pendingTotpFactor: PendingFactorRecord | null = null;
 
 function readPendingFactorFromStorage(): PendingFactorRecord | null {
@@ -121,6 +122,22 @@ export function getExternalStagingMfaClient(): SupabaseClient | null {
   return client;
 }
 
+export function getProviderAdminMfaClient(expectedUrl?: string): SupabaseClient | null {
+  const url = import.meta.env.VITE_SUPABASE_URL;
+  const key = import.meta.env.VITE_SUPABASE_ANON_KEY;
+  if (!url || !key) return null;
+  if (expectedUrl && url.trim().replace(/\/+$/, '') !== expectedUrl.trim().replace(/\/+$/, '')) return null;
+  providerAdminClient ??= createClient(url, key, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: true,
+      detectSessionInUrl: false,
+      storageKey: 'celebration-provider-admin',
+    },
+  });
+  return providerAdminClient;
+}
+
 export function getPendingExternalTotpFactorId(expectedUserId?: string): string | null {
   const active = pendingTotpFactor ?? readPendingFactorFromStorage();
   if (!active) return null;
@@ -136,17 +153,20 @@ export function getPendingExternalTotpFactorId(expectedUserId?: string): string 
   return active.factorId;
 }
 
-async function assertAuthenticatedStagingAdmin(
+async function assertAuthenticatedAdministrator(
   supabase: ExternalStagingSupabaseClientLike,
+  expectedSubject?: string,
 ): Promise<string> {
   const { data: userData, error: userError } = await supabase.auth.getUser();
   const userId = userData?.user?.id;
   if (userError || !userId) {
     throw new Error('Active Supabase authentication session required. Please sign in again.');
   }
-  if (userId !== STAGING_EXTERNAL_ADMIN_UUID) {
+  if (userId !== (expectedSubject ?? STAGING_EXTERNAL_ADMIN_UUID)) {
     clearPendingExternalTotpFactor();
-    throw new Error('Authenticated staging administrator session required.');
+    throw new Error(expectedSubject
+      ? 'Authenticated administrator session required.'
+      : 'Authenticated staging administrator session required.');
   }
   return userId;
 }
@@ -157,10 +177,11 @@ async function assertAuthenticatedStagingAdmin(
  */
 export async function resolveExternalTotpFactorId(
   clientOverride?: ExternalStagingSupabaseClientLike | null,
+  expectedSubject?: string,
 ): Promise<string | null> {
   const supabase = clientOverride !== undefined ? clientOverride : getExternalStagingMfaClient();
   if (!supabase) return null;
-  const userId = await assertAuthenticatedStagingAdmin(supabase);
+  const userId = await assertAuthenticatedAdministrator(supabase, expectedSubject);
 
   const { data: factors, error } = await supabase.auth.mfa.listFactors();
   if (error || !factors) {
@@ -204,12 +225,13 @@ export async function resolveExternalTotpFactorId(
 export async function enrollExternalStagingTotp(options?: {
   replaceUnverified?: boolean;
   clientOverride?: ExternalStagingSupabaseClientLike | null;
+  expectedSubject?: string;
 }) {
   const supabase =
     options?.clientOverride !== undefined ? options.clientOverride : getExternalStagingMfaClient();
-  if (!supabase) throw new Error('External staging MFA is not configured.');
+  if (!supabase) throw new Error('Supabase MFA is not configured.');
 
-  const userId = await assertAuthenticatedStagingAdmin(supabase);
+  const userId = await assertAuthenticatedAdministrator(supabase, options?.expectedSubject);
 
   const { data: existingFactors, error: listError } = await supabase.auth.mfa.listFactors();
   if (listError) {
@@ -237,10 +259,13 @@ export async function enrollExternalStagingTotp(options?: {
     clearPendingExternalTotpFactor();
   }
 
+  const accountLabel = options?.expectedSubject
+    ? 'Celebration Sisters administrator'
+    : 'Celebration Sisters staging administrator';
   const friendlyName =
     unverifiedTotp.length > 0 && !options?.replaceUnverified
-      ? `Celebration Sisters staging admin ${Date.now().toString(36)}`
-      : 'Celebration Sisters staging administrator';
+      ? `${accountLabel} ${Date.now().toString(36)}`
+      : accountLabel;
 
   const { data, error } = await supabase.auth.mfa.enroll({
     factorType: 'totp',
@@ -270,9 +295,10 @@ export async function verifyExternalStagingTotp(
   factorId: string,
   rawCode: string,
   clientOverride?: ExternalStagingSupabaseClientLike | null,
+  expectedSubject?: string,
 ) {
   const supabase = clientOverride !== undefined ? clientOverride : getExternalStagingMfaClient();
-  if (!supabase) throw new Error('External staging MFA is not configured.');
+  if (!supabase) throw new Error('Supabase MFA is not configured.');
 
   const normalizedFactorId = factorId.trim();
   if (!normalizedFactorId) {
@@ -284,7 +310,7 @@ export async function verifyExternalStagingTotp(
     throw new Error('Enter a valid 6-digit authenticator code.');
   }
 
-  const userId = await assertAuthenticatedStagingAdmin(supabase);
+  const userId = await assertAuthenticatedAdministrator(supabase, expectedSubject);
 
   const { error } = await supabase.auth.mfa.challengeAndVerify({
     factorId: normalizedFactorId,

@@ -19,6 +19,7 @@ import {
   enrollExternalStagingTotp,
   getExternalStagingMfaClient,
   getPendingExternalTotpFactorId,
+  getProviderAdminMfaClient,
   resolveExternalTotpFactorId,
   signOutExternalStagingSession,
   verifyExternalStagingTotp,
@@ -50,6 +51,8 @@ export default function App({ initialRoute = 'home' }: { initialRoute?: AppRoute
   const [currentUser, setCurrentUser] = useState<UserSession>(DEFAULT_GUEST);
   const [mfaRequired, setMfaRequired] = useState(false);
   const [mfaEnrolled, setMfaEnrolled] = useState(false);
+  const [providerMfaSubject, setProviderMfaSubject] = useState<string | null>(null);
+  const getMfaClient = () => providerMfaSubject ? getProviderAdminMfaClient() : getExternalStagingMfaClient();
   const [hasPendingExternalFactor, setHasPendingExternalFactor] = useState(
     () => Boolean(getPendingExternalTotpFactorId()),
   );
@@ -70,7 +73,7 @@ export default function App({ initialRoute = 'home' }: { initialRoute?: AppRoute
     }
 
     let mounted = true;
-    const externalClient = getExternalStagingMfaClient();
+    const externalClient = providerMfaSubject ? getProviderAdminMfaClient() : getExternalStagingMfaClient();
 
     const syncBackendSession = async () => {
       const sessionRes = await apiFetch('/api/auth/session', { credentials: 'include' });
@@ -82,7 +85,7 @@ export default function App({ initialRoute = 'home' }: { initialRoute?: AppRoute
         if (sData.user) {
           setCurrentUser(sData.user);
           setMfaRequired(Boolean(sData.mfaRequired));
-          setMfaEnrolled(Boolean(sData.mfaEnrolled || sData.user.mfaEnrolled));
+          if (!providerMfaSubject) setMfaEnrolled(Boolean(sData.mfaEnrolled || sData.user.mfaEnrolled));
         } else {
           setCurrentUser(DEFAULT_GUEST);
           setMfaRequired(false);
@@ -158,7 +161,7 @@ export default function App({ initialRoute = 'home' }: { initialRoute?: AppRoute
       mounted = false;
       unsubscribe?.();
     };
-  }, []);
+  }, [providerMfaSubject]);
 
   const handleSwitchPersona = async (user: UserSession) => {
     const res = await apiFetch('/api/auth/switch', {
@@ -230,6 +233,40 @@ export default function App({ initialRoute = 'home' }: { initialRoute?: AppRoute
       if (!res.ok) {
         return { ok: false, error: data.error || 'Sign-in failed. Verify your email and password.' };
       }
+      if (data.providerSession) {
+        const providerClient = typeof data.providerUrl === 'string' && data.providerUrl
+          ? getProviderAdminMfaClient(data.providerUrl)
+          : null;
+        const subject = data.user?.supabaseUserId;
+        if (!providerClient || !subject || data.user?.role !== 'admin') {
+          return { ok: false, error: 'Supabase administrator MFA is not configured for this portal.' };
+        }
+        const { data: restored, error } = await providerClient.auth.setSession(data.providerSession);
+        if (error || restored.session?.user.id !== subject) {
+          await providerClient.auth.signOut({ scope: 'local' });
+          return { ok: false, error: 'Unable to establish the Supabase administrator session.' };
+        }
+
+        setApiAccessToken(restored.session.access_token);
+        const checked = await apiFetch('/api/auth/session', { credentials: 'include' });
+        const session = await checked.json().catch(() => ({}));
+        if (!checked.ok || session.authMethod !== 'supabase_jwt' ||
+          session.user?.role !== 'admin' || session.user?.supabaseUserId !== subject) {
+          setApiAccessToken(null);
+          await providerClient.auth.signOut({ scope: 'local' });
+          return { ok: false, error: 'This Supabase session is not authorized for administrator access.' };
+        }
+
+        const { data: factors } = await providerClient.auth.mfa.listFactors();
+        if (factors?.totp.length === 0) await resolveExternalTotpFactorId(providerClient, subject).catch(() => null);
+        setApiCsrfToken(null);
+        setCurrentUser(session.user);
+        setMfaRequired(session.aal !== 'aal2');
+        setMfaEnrolled(Boolean(factors?.totp.length));
+        setHasPendingExternalFactor(Boolean(getPendingExternalTotpFactorId(subject)));
+        setProviderMfaSubject(subject);
+        return { ok: true };
+      }
       if (data.token) {
         setApiAccessToken(data.token);
       }
@@ -262,20 +299,24 @@ export default function App({ initialRoute = 'home' }: { initialRoute?: AppRoute
   };
 
   const handleVerifyMfa = async (code: string): Promise<{ ok: boolean; error?: string }> => {
-    const externalClient = getExternalStagingMfaClient();
+    const externalClient = getMfaClient();
     if (externalClient) {
       try {
-        const factorId = await resolveExternalTotpFactorId();
+        const factorId = await resolveExternalTotpFactorId(externalClient, providerMfaSubject ?? undefined);
         if (!factorId) {
           return { ok: false, error: 'Enroll an authenticator before verifying MFA.' };
         }
-        const verified = await verifyExternalStagingTotp(factorId, code);
+        const verified = await verifyExternalStagingTotp(
+          factorId, code, externalClient, providerMfaSubject ?? undefined,
+        );
         setApiAccessToken(verified.accessToken);
         setHasPendingExternalFactor(false);
 
         const sessionRes = await apiFetch('/api/auth/session', { credentials: 'include' });
         const sData = await sessionRes.json().catch(() => ({}));
-        if (!sessionRes.ok || !sData.mfaVerified || sData.aal !== 'aal2' || !sData.user) {
+        if (!sessionRes.ok || sData.authMethod !== 'supabase_jwt' || !sData.mfaVerified ||
+          sData.aal !== 'aal2' || sData.user?.role !== 'admin' ||
+          sData.user?.supabaseUserId !== verified.userId) {
           return {
             ok: false,
             error:
@@ -313,13 +354,18 @@ export default function App({ initialRoute = 'home' }: { initialRoute?: AppRoute
   const handleEnrollTotp = async (
     optionsOrRecoveryCode?: string | { replaceUnverified?: boolean },
   ): Promise<TotpEnrollmentResult> => {
-    if (getExternalStagingMfaClient()) {
+    const externalClient = getMfaClient();
+    if (externalClient) {
       try {
         const replaceUnverified =
           typeof optionsOrRecoveryCode === 'object'
             ? Boolean(optionsOrRecoveryCode?.replaceUnverified)
             : false;
-        const factor = await enrollExternalStagingTotp({ replaceUnverified });
+        const factor = await enrollExternalStagingTotp({
+          replaceUnverified,
+          clientOverride: externalClient,
+          expectedSubject: providerMfaSubject ?? undefined,
+        });
         setHasPendingExternalFactor(true);
         return {
           ok: true,
@@ -384,9 +430,14 @@ export default function App({ initialRoute = 'home' }: { initialRoute?: AppRoute
 
   const handleLogout = async () => {
     try {
-      await signOutExternalStagingSession();
       await apiFetch('/api/auth/logout', { method: 'POST', credentials: 'include' }).catch(() => null);
+      if (providerMfaSubject) {
+        await getProviderAdminMfaClient()?.auth.signOut({ scope: 'local' });
+      } else {
+        await signOutExternalStagingSession();
+      }
     } finally {
+      setProviderMfaSubject(null);
       clearPendingExternalTotpFactor();
       setHasPendingExternalFactor(false);
       setApiAccessToken(null);
@@ -467,6 +518,7 @@ export default function App({ initialRoute = 'home' }: { initialRoute?: AppRoute
             mfaRequired={mfaRequired}
             mfaEnrolled={mfaEnrolled}
             externalStagingMode={externalStagingMode}
+            providerMfaMode={Boolean(providerMfaSubject)}
             hasPendingExternalFactor={hasPendingExternalFactor}
             authProviderReady={authProviderReady}
             personas={personas}

@@ -28,3 +28,8 @@ export async function verifyStagingExternalAdminJwt(
   const verified = await verify(token, {supabaseUrl:`https://${STAGING_AUTH_PROJECT_REF}.supabase.co`});
   return Boolean(verified && authorizedStagingAdmin(verified, STAGING_AUTH_ISSUER, env));
 }
+
+/** Production Railway requires provider MFA. Isolated environments can test it explicitly. */
+export function providerAdminMfaRequired(env: Record<string, string | undefined>): boolean {
+  return env.RAILWAY_ENVIRONMENT_NAME === 'production' || env.SUPABASE_ADMIN_MFA_REQUIRED === 'true';
+}
