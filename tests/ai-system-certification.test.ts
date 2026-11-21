@@ -3258,3 +3258,98 @@ test('AI-TRANSPORT-04: short remaining deadline bounds provider attempt', async 
     setGeminiSleepForTests(null);
   }
 });
+
+test('AI-REPAIR-01: Attempt 1 uses full configured timeout budget instead of prematurely aborting at 72%', async () => {
+  const { generateConceptProposal } = await import('../server/gemini.ts');
+
+  let calls = 0;
+  setGeminiExecutorForTests(async () => {
+    calls += 1;
+    // Simulate a slow-but-valid Gemini response taking ~82% of a 300ms timeout window
+    await new Promise((resolve) => setTimeout(resolve, 240));
+    return { text: JSON.stringify(SAMPLE_WEDDING_PROPOSAL) };
+  });
+
+  try {
+    const proposal = await generateConceptProposal(TRANSPORT_TEST_INPUT, {
+      timeoutMs: 320,
+      maxRetries: 2,
+    });
+    assert.equal(calls, 1);
+    assert.equal(proposal.themeName, SAMPLE_WEDDING_PROPOSAL.themeName);
+  } finally {
+    setGeminiExecutorForTests(null);
+  }
+});
+
+test('AI-REPAIR-02: resolveThinkingLevelForModel enforces safe per-model ThinkingLevel defaults and overrides', async () => {
+  const { resolveThinkingLevelForModel } = await import('../server/gemini.ts');
+
+  assert.equal(resolveThinkingLevelForModel('gemini-3.5-flash-lite', ''), 'MINIMAL');
+  assert.equal(resolveThinkingLevelForModel('gemini-3.8-flash', ''), 'LOW');
+  assert.equal(resolveThinkingLevelForModel('gemini-4-hydrogen', ''), 'LOW');
+  assert.equal(resolveThinkingLevelForModel('gemini-4-hydrogen', 'MINIMAL'), 'LOW');
+  assert.equal(resolveThinkingLevelForModel('gemini-3.8-flash', 'MEDIUM'), 'MEDIUM');
+  assert.equal(resolveThinkingLevelForModel('gemini-3.5-flash-lite', 'LOW'), 'LOW');
+  assert.equal(resolveThinkingLevelForModel('gemini-2.5-pro', ''), 'DEFAULT');
+});
+
+test('AI-REPAIR-03: CONCEPT_LEASE_TTL_MS is certified to 180_000ms (2x MAX_GEMINI_TIMEOUT_MS)', async () => {
+  const { MAX_GEMINI_TIMEOUT_MS } = await import('../server/gemini.ts');
+  assert.equal(CONCEPT_LEASE_TTL_MS, 180_000);
+  assert.equal(CONCEPT_LEASE_TTL_MS, MAX_GEMINI_TIMEOUT_MS * 2);
+});
+
+test('AI-REPAIR-04: Concept Studio responseSchema requires centerpieceDesign, venueStyling, and guestExperience and persists all 15 elements', async () => {
+  const { generateConceptProposal } = await import('../server/gemini.ts');
+
+  let capturedRequired: string[] = [];
+  const full15ElementProposal = {
+    ...SAMPLE_WEDDING_PROPOSAL,
+    centerpieceDesign: 'Tiered champagne-gold candelabras with low ivory rose compotes preserving clear table sightlines.',
+    venueStyling: 'Floor-to-ceiling sheer ivory column drapery framing royal-purple velvet cocktail vignettes.',
+    guestExperience: 'Live string quartet champagne welcome, wax-sealed escort cards, and late-evening espresso lounge.',
+  };
+
+  setGeminiExecutorForTests(async (params) => {
+    const schema = params.config.responseSchema as { required?: string[] } | undefined;
+    capturedRequired = Array.isArray(schema?.required) ? schema.required : [];
+    return { text: JSON.stringify(full15ElementProposal) };
+  });
+
+  try {
+    const proposal = await generateConceptProposal(TRANSPORT_TEST_INPUT, {
+      timeoutMs: 5000,
+      maxRetries: 0,
+    });
+    assert.ok(capturedRequired.includes('centerpieceDesign'));
+    assert.ok(capturedRequired.includes('venueStyling'));
+    assert.ok(capturedRequired.includes('guestExperience'));
+    assert.equal(proposal.centerpieceDesign, full15ElementProposal.centerpieceDesign);
+    assert.equal(proposal.venueStyling, full15ElementProposal.venueStyling);
+    assert.equal(proposal.guestExperience, full15ElementProposal.guestExperience);
+  } finally {
+    setGeminiExecutorForTests(null);
+  }
+});
+
+test('AI-REPAIR-05: /ready and /api/health expose thinkingLevel and abortSignalSupported AI diagnostics', async () => {
+  const env = await startIsolatedServer();
+  try {
+    const [readyRes, healthRes] = await Promise.all([
+      fetch(`${env.baseUrl}/ready`),
+      fetch(`${env.baseUrl}/api/health`),
+    ]);
+    assert.equal(readyRes.status, 200);
+    assert.equal(healthRes.status, 200);
+    const readyBody = (await readyRes.json()) as { ai?: { thinkingLevel?: string; abortSignalSupported?: boolean } };
+    const healthBody = (await healthRes.json()) as { ai?: { thinkingLevel?: string; abortSignalSupported?: boolean } };
+    assert.ok(typeof readyBody.ai?.thinkingLevel === 'string' && readyBody.ai.thinkingLevel.length > 0);
+    assert.equal(readyBody.ai?.abortSignalSupported, true);
+    assert.ok(typeof healthBody.ai?.thinkingLevel === 'string' && healthBody.ai.thinkingLevel.length > 0);
+    assert.equal(healthBody.ai?.abortSignalSupported, true);
+  } finally {
+    await env.cleanup();
+  }
+});
+

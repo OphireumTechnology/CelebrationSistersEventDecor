@@ -226,11 +226,31 @@ export function getConfiguredGeminiMaxRetries(): number {
   return DEFAULT_GEMINI_MAX_RETRIES;
 }
 
+export type ResolvedThinkingLevel = 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | 'DEFAULT';
+
+export function resolveThinkingLevelForModel(
+  model: string,
+  rawOverride?: string | null,
+): ResolvedThinkingLevel {
+  if (!/^gemini-(3|4)/i.test(model)) {
+    return 'DEFAULT';
+  }
+  const supportsMinimal = /flash-lite/i.test(model);
+  const override = (rawOverride ?? process.env.GEMINI_THINKING_LEVEL ?? '').trim().toUpperCase();
+  if (override === 'MINIMAL' && supportsMinimal) return 'MINIMAL';
+  if (override === 'LOW') return 'LOW';
+  if (override === 'MEDIUM') return 'MEDIUM';
+  if (override === 'HIGH') return 'HIGH';
+  return supportsMinimal ? 'MINIMAL' : 'LOW';
+}
+
 export interface GeminiConfigDiagnostics {
   configured: boolean;
   model: string;
   modelSource: 'env' | 'default';
   modelWarning?: string;
+  thinkingLevel: ResolvedThinkingLevel;
+  abortSignalSupported: true;
   timeoutMs: number;
   conciergeTimeoutMs: number;
   conceptTimeoutMs: number;
@@ -248,6 +268,8 @@ export function getGeminiConfigStatus(): GeminiConfigDiagnostics {
     model: normalized.model,
     modelSource: normalized.source,
     ...(normalized.warning ? { modelWarning: normalized.warning } : {}),
+    thinkingLevel: resolveThinkingLevelForModel(normalized.model),
+    abortSignalSupported: true,
     timeoutMs: getConfiguredGeminiTimeoutMs(),
     conciergeTimeoutMs: getConfiguredGeminiTimeoutMs('/api/ai/concierge'),
     conceptTimeoutMs: getConfiguredGeminiTimeoutMs('/api/ai/concept-studio'),
@@ -257,6 +279,48 @@ export function getGeminiConfigStatus(): GeminiConfigDiagnostics {
       conceptStudio: CONCEPT_MAX_OUTPUT_TOKENS,
     },
   };
+}
+
+export interface GeminiModelProbeResult {
+  available: boolean;
+  model: string;
+  displayName?: string;
+  errorCode?: AiErrorCode;
+  latencyMs: number;
+}
+
+export async function probeGeminiModelAvailability(
+  modelOverride?: string,
+  timeoutMs = 8_000,
+): Promise<GeminiModelProbeResult> {
+  const model = normalizeGeminiModelName(modelOverride ?? process.env.GEMINI_MODEL).model;
+  const startedAt = Date.now();
+  try {
+    const ai = getAiClient(model);
+    const info = await withTimeout(
+      (signal) =>
+        ai.models.get({
+          model,
+          config: { abortSignal: signal },
+        }),
+      timeoutMs,
+      'Gemini model availability probe',
+    );
+    return {
+      available: true,
+      model,
+      displayName: typeof info?.displayName === 'string' ? info.displayName : undefined,
+      latencyMs: Date.now() - startedAt,
+    };
+  } catch (err) {
+    const classified = classifyGeminiProviderError(err, model, 1);
+    return {
+      available: false,
+      model,
+      errorCode: classified.code,
+      latencyMs: Date.now() - startedAt,
+    };
+  }
 }
 
 function getAiClient(model: string): GoogleGenAI {
@@ -328,6 +392,10 @@ async function withTimeout<T>(
     const pending = typeof operation === 'function'
       ? Promise.resolve().then(() => operation(controller.signal))
       : operation;
+
+    // Prevent unhandled promise rejections if the aborted transport rejects
+    // after timeoutPromise has already settled the race.
+    pending.catch(() => {});
 
     return await Promise.race([pending, timeoutPromise]);
   } finally {
@@ -668,14 +736,23 @@ function computeRetryDelayMs(attempt: number, retryAfterSeconds?: number): numbe
 }
 
 function buildThinkingConfigForModel(model: string): Record<string, unknown> {
-  if (/^gemini-(3|4)/i.test(model)) {
-    return {
-      thinkingConfig: {
-        thinkingLevel: ThinkingLevel.LOW,
-      },
-    };
+  const level = resolveThinkingLevelForModel(model);
+  if (level === 'DEFAULT') {
+    return {};
   }
-  return {};
+  const enumLevel =
+    level === 'MINIMAL'
+      ? ThinkingLevel.MINIMAL
+      : level === 'MEDIUM'
+        ? ThinkingLevel.MEDIUM
+        : level === 'HIGH'
+          ? ThinkingLevel.HIGH
+          : ThinkingLevel.LOW;
+  return {
+    thinkingConfig: {
+      thinkingLevel: enumLevel,
+    },
+  };
 }
 
 async function executeGeminiWithRetry<T>(params: {
@@ -705,11 +782,14 @@ async function executeGeminiWithRetry<T>(params: {
   const requestId = params.context?.requestId;
   const deploymentSha = getDeploymentSha();
 
+  const thinkingLevel = resolveThinkingLevelForModel(model);
+
   logStructured('info', 'ai_request_started', {
     requestId,
     endpoint: params.endpoint,
     deploymentSha,
     model,
+    thinkingLevel,
     overallTimeoutMs,
     maxRetries,
   });
@@ -754,11 +834,10 @@ async function executeGeminiWithRetry<T>(params: {
       break;
     }
 
-    const attemptsRemainingAfterThis = maxRetries - (attempt - 1);
-    const attemptTimeoutMs =
-      attemptsRemainingAfterThis > 0
-        ? Math.min(remainingBudgetMs, Math.max(2_000, Math.floor(remainingBudgetMs * 0.72)))
-        : remainingBudgetMs;
+    // Use the full remaining request budget per attempt because AI_TIMEOUT is not
+    // retried automatically, whereas retryable transient errors (429/503/5xx/network)
+    // fail rapidly and leave the remaining budget intact for subsequent retries.
+    const attemptTimeoutMs = remainingBudgetMs;
 
     try {
       const response = await withTimeout(
@@ -894,9 +973,12 @@ export interface ConceptStudioOutput {
   visionSummary: string;
   colorPalette: { name: string; hex: string; usage: string }[];
   floralConcept: string;
+  centerpieceDesign?: string;
   tableArrangement: string;
   stageBackdrop: string;
   lightingPlan: string;
+  venueStyling?: string;
+  guestExperience?: string;
   recommendedDivisions: string[];
 }
 
@@ -936,9 +1018,12 @@ const conceptOutputSchema = z.object({
     .min(2)
     .max(6),
   floralConcept: z.string().trim().min(10).max(1000),
+  centerpieceDesign: z.string().trim().min(10).max(1000).optional(),
   tableArrangement: z.string().trim().min(10).max(1000),
   stageBackdrop: z.string().trim().min(10).max(1000),
   lightingPlan: z.string().trim().min(10).max(1000),
+  venueStyling: z.string().trim().min(10).max(1000).optional(),
+  guestExperience: z.string().trim().min(10).max(1000).optional(),
   recommendedDivisions: z.array(z.string().trim().min(2).max(120)).min(1).max(6),
 });
 
@@ -1068,7 +1153,7 @@ CRITICAL RULES:
 - Provide 3 to 5 accurate, harmonious 6-digit HEX color codes (#RRGGBB) aligned with the requested palette.
 - Recommend 2 to 4 relevant Celebration Sisters service divisions from the official 12 divisions:
   Wedding Planning and Design; Luxury Event Decoration and Styling; Corporate Events; Birthday Celebrations; Baby Showers and Gender Reveals; Anniversaries and Private Events; Balloon Garlands and Custom Installations; Event Rentals and Logistics; Photo Booths and Guest Experiences; Event Lighting and Production; DJ, Entertainment and Hosting; Custom Event Concepts and Full Production.
-- Keep each narrative field vivid, practical, and concise (2 to 3 sentences).
+- Keep each narrative field vivid, practical, and concise (2 to 3 sentences), explicitly covering floralConcept, centerpieceDesign, tableArrangement, stageBackdrop, lightingPlan, venueStyling, and guestExperience.
 - This is strictly a conceptual visualization subject to human creative director and client approval; NEVER include fabricated pricing or guaranteed inventory counts.`;
 
   const prompt = `Design an authentic luxury conceptual event mood board proposal for:
@@ -1110,9 +1195,12 @@ CRITICAL RULES:
             },
           },
           floralConcept: { type: Type.STRING },
+          centerpieceDesign: { type: Type.STRING },
           tableArrangement: { type: Type.STRING },
           stageBackdrop: { type: Type.STRING },
           lightingPlan: { type: Type.STRING },
+          venueStyling: { type: Type.STRING },
+          guestExperience: { type: Type.STRING },
           recommendedDivisions: {
             type: Type.ARRAY,
             items: { type: Type.STRING },
@@ -1123,9 +1211,12 @@ CRITICAL RULES:
           'visionSummary',
           'colorPalette',
           'floralConcept',
+          'centerpieceDesign',
           'tableArrangement',
           'stageBackdrop',
           'lightingPlan',
+          'venueStyling',
+          'guestExperience',
           'recommendedDivisions',
         ],
       },
@@ -1141,9 +1232,12 @@ CRITICAL RULES:
       usage: s.usage,
     })),
     floralConcept: data.floralConcept,
+    ...(data.centerpieceDesign ? { centerpieceDesign: data.centerpieceDesign } : {}),
     tableArrangement: data.tableArrangement,
     stageBackdrop: data.stageBackdrop,
     lightingPlan: data.lightingPlan,
+    ...(data.venueStyling ? { venueStyling: data.venueStyling } : {}),
+    ...(data.guestExperience ? { guestExperience: data.guestExperience } : {}),
     recommendedDivisions: data.recommendedDivisions,
   };
 }

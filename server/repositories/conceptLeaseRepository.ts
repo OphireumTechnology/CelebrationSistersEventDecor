@@ -7,9 +7,10 @@ import {
 
 type LeaseState = Awaited<ReturnType<typeof readDb>>;
 
-// Provisional lease duration covering the known provider
-// retry window. Final runtime budget certification is required.
-export const CONCEPT_LEASE_TTL_MS = 600_000;
+// Certified lease duration covering 2x MAX_GEMINI_TIMEOUT_MS (90_000ms)
+// so in-flight provider calls remain protected across replicas without
+// locking out timed-out idempotency keys for an excessive 10-minute window.
+export const CONCEPT_LEASE_TTL_MS = 180_000;
 export const MAX_DURABLE_CONCEPT_LEASES = 256;
 
 export type ConceptLease = {

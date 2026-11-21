@@ -282,9 +282,12 @@ export interface ConceptRevision {
   visionSummary: string;
   colorPalette: { name: string; hex: string; usage: string }[];
   floralConcept: string;
+  centerpieceDesign?: string;
   tableArrangement: string;
   stageBackdrop: string;
   lightingPlan: string;
+  venueStyling?: string;
+  guestExperience?: string;
   recommendedDivisions: string[];
 }
 

@@ -155,6 +155,8 @@ function IdentityScopedAIStudioWorkspace({
   const moodBoardRef = useRef<HTMLDivElement | null>(null);
   const conceptSubmitInFlightRef = useRef(false);
   const conciergeSubmitInFlightRef = useRef(false);
+  const conceptRequestSeqRef = useRef(0);
+  const conciergeRequestSeqRef = useRef(0);
 
   // Load persisted concepts ONLY when authenticated user identity changes (never on selectedConceptId change!)
   useEffect(() => {
@@ -240,6 +242,7 @@ function IdentityScopedAIStudioWorkspace({
     if (!trimmed || conciergeLoading || conciergeSubmitInFlightRef.current) return;
 
     conciergeSubmitInFlightRef.current = true;
+    const requestSeq = ++conciergeRequestSeqRef.current;
     const isRetry = messageOverride !== undefined;
     const priorHistory = messages;
     const optimisticMessages: ConciergeMsg[] = isRetry
@@ -259,7 +262,7 @@ function IdentityScopedAIStudioWorkspace({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        timeoutMs: 65_000,
+        timeoutMs: 70_000,
         body: JSON.stringify({
           sessionId,
           clientName: currentUser.role !== 'guest' ? currentUser.name : undefined,
@@ -267,6 +270,8 @@ function IdentityScopedAIStudioWorkspace({
           history: priorHistory,
         }),
       });
+
+      if (requestSeq !== conciergeRequestSeqRef.current) return;
 
       if (!res.ok) {
         const parsedErr = await parseApiErrorResponse(
@@ -418,6 +423,8 @@ function IdentityScopedAIStudioWorkspace({
       requestBody,
     ]);
 
+    const requestSeq = ++conceptRequestSeqRef.current;
+
     const idempotencyKey =
       isRetry &&
       pendingIdempotencyKey?.fingerprint === fingerprint
@@ -437,15 +444,18 @@ function IdentityScopedAIStudioWorkspace({
           'Idempotency-Key': idempotencyKey,
         },
         credentials: 'include',
-        timeoutMs: 70_000,
+        timeoutMs: 75_000,
         body: requestBody,
       });
+
+      if (requestSeq !== conceptRequestSeqRef.current) return;
 
       if (!res.ok) {
         const parsedErr = await parseApiErrorResponse(
           res,
           'Unable to generate concept proposal right now. Your inputs are preserved — please try again.',
         );
+        if (requestSeq !== conceptRequestSeqRef.current) return;
         if (parsedErr.status === 401 || parsedErr.status === 403) {
           setConcepts([]);
           setSelectedConceptId('');
@@ -471,6 +481,13 @@ function IdentityScopedAIStudioWorkspace({
             requestId: parsedErr.requestId,
           });
           return;
+        }
+        // On provider/request timeout, the backend intentionally retains the timed-out
+        // idempotency lease to block automatic duplicate replays across replicas.
+        // Clearing pendingIdempotencyKey allows an explicit manual Retry click to issue
+        // a fresh Idempotency-Key instead of looping on 503 AI_SERVICE_BUSY.
+        if (parsedErr.code === 'AI_TIMEOUT' || parsedErr.code === 'REQUEST_TIMEOUT') {
+          setPendingIdempotencyKey(null);
         }
 
         const status: StudioStatus =
@@ -1286,6 +1303,19 @@ function IdentityScopedAIStudioWorkspace({
                           {activeRevision.floralConcept}
                         </p>
                       </div>
+                      {activeRevision.centerpieceDesign && (
+                        <div className="p-4 rounded-xl border border-[var(--cs-border)]">
+                          <p className="text-xs font-semibold uppercase tracking-wider text-[var(--cs-purple)] mb-1.5">
+                            Centerpiece Design
+                          </p>
+                          <p
+                            data-testid="concept-centerpiece-design"
+                            className="text-sm text-[var(--cs-charcoal-light)] leading-relaxed"
+                          >
+                            {activeRevision.centerpieceDesign}
+                          </p>
+                        </div>
+                      )}
                       <div className="p-4 rounded-xl border border-[var(--cs-border)]">
                         <p className="text-xs font-semibold uppercase tracking-wider text-[var(--cs-purple)] mb-1.5">
                           Table Arrangement
@@ -1319,6 +1349,32 @@ function IdentityScopedAIStudioWorkspace({
                           {activeRevision.lightingPlan}
                         </p>
                       </div>
+                      {activeRevision.venueStyling && (
+                        <div className="p-4 rounded-xl border border-[var(--cs-border)]">
+                          <p className="text-xs font-semibold uppercase tracking-wider text-[var(--cs-purple)] mb-1.5">
+                            Venue Styling
+                          </p>
+                          <p
+                            data-testid="concept-venue-styling"
+                            className="text-sm text-[var(--cs-charcoal-light)] leading-relaxed"
+                          >
+                            {activeRevision.venueStyling}
+                          </p>
+                        </div>
+                      )}
+                      {activeRevision.guestExperience && (
+                        <div className="p-4 rounded-xl border border-[var(--cs-border)] sm:col-span-2">
+                          <p className="text-xs font-semibold uppercase tracking-wider text-[var(--cs-purple)] mb-1.5">
+                            Proposed Guest Experience
+                          </p>
+                          <p
+                            data-testid="concept-guest-experience"
+                            className="text-sm text-[var(--cs-charcoal-light)] leading-relaxed"
+                          >
+                            {activeRevision.guestExperience}
+                          </p>
+                        </div>
+                      )}
                     </div>
 
                     {/* Recommended Service Divisions */}
