@@ -9,3 +9,6 @@ data/backups/
 *.log
 .env*
 !.env.example
+
+# Local PostgreSQL audit reports (may expose schema metadata)
+audit-output/
